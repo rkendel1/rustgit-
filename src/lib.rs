@@ -1,11 +1,11 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
@@ -74,6 +74,73 @@ pub enum Language {
     Go,
     Python,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RuntimeType {
+    Node,
+    Rust,
+    Go,
+    Python,
+    Static,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoClass {
+    StaticSite,
+    NodeApp,
+    FullStackNode,
+    RustBinary,
+    PythonApp,
+    Monorepo,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphStrategy {
+    Linear,
+    Parallelized,
+    MultiStage,
+    MonorepoSegmented,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFingerprint {
+    pub repo_hash: String,
+    pub lockfile_hash: Option<String>,
+    pub dependency_hash: Option<String>,
+    pub language_signature: String,
+    pub framework_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryClassification {
+    pub class: RepoClass,
+    pub confidence: f32,
+    pub primary_runtime: RuntimeType,
+    pub secondary_runtimes: Vec<RuntimeType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAffinity {
+    pub preferred_provider: String,
+    pub fallback_providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionProfile {
+    pub fingerprint: RepositoryFingerprint,
+    pub classification: RepositoryClassification,
+    pub recommended_graph_strategy: GraphStrategy,
+    pub runtime_affinity: RuntimeAffinity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoDelta {
+    pub added_files: Vec<String>,
+    pub removed_files: Vec<String>,
+    pub modified_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,14 +295,30 @@ impl ExecutionGraph {
     }
 
     pub fn compute_cache_keys(&self) -> HashMap<String, String> {
+        self.compute_cache_keys_with_fingerprint(None)
+    }
+
+    pub fn compute_cache_keys_with_fingerprint(
+        &self,
+        fingerprint: Option<&RepositoryFingerprint>,
+    ) -> HashMap<String, String> {
         self.nodes
             .iter()
-            .map(|node| (node.id.clone(), CacheKeyEngine::compute_node_key(node, self)))
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    CacheKeyEngine::compute_node_key(node, self, fingerprint),
+                )
+            })
             .collect()
     }
 
-    pub fn with_cache_keys(mut self) -> Self {
-        let keys = self.compute_cache_keys();
+    pub fn with_cache_keys(self) -> Self {
+        self.with_cache_keys_for(None)
+    }
+
+    pub fn with_cache_keys_for(mut self, fingerprint: Option<&RepositoryFingerprint>) -> Self {
+        let keys = self.compute_cache_keys_with_fingerprint(fingerprint);
         for node in &mut self.nodes {
             node.cache_key = keys.get(&node.id).cloned();
         }
@@ -254,12 +337,15 @@ pub struct BuildIntelligence {
     pub scripts: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryAnalysis {
     pub root: PathBuf,
     pub framework: Framework,
     pub language: Language,
     pub dependency_files: Vec<PathBuf>,
+    pub fingerprint: RepositoryFingerprint,
+    pub classification: RepositoryClassification,
+    pub execution_profile: ExecutionProfile,
     pub build_intelligence: BuildIntelligence,
     pub execution_graph: ExecutionGraph,
 }
@@ -347,7 +433,11 @@ impl CacheKeyEngine {
     /// Computes a deterministic cache key for one node by hashing:
     /// node type, command, immediate graph position, graph/repository hash,
     /// and an environment fingerprint stable for a given runtime configuration.
-    pub fn compute_node_key(node: &ExecutionNode, graph: &ExecutionGraph) -> String {
+    pub fn compute_node_key(
+        node: &ExecutionNode,
+        graph: &ExecutionGraph,
+        fingerprint: Option<&RepositoryFingerprint>,
+    ) -> String {
         let mut incoming = graph
             .edges
             .iter()
@@ -364,7 +454,9 @@ impl CacheKeyEngine {
             .collect::<Vec<_>>();
         outgoing.sort();
 
-        let repo_hash = graph.cache_key();
+        let repo_hash = fingerprint
+            .map(|value| value.repo_hash.clone())
+            .unwrap_or_else(|| graph.cache_key());
         let env_hash = hash_key(&format!(
             "{}|{}|{}",
             std::env::consts::OS,
@@ -419,7 +511,7 @@ pub struct Workspace {
     pub resource_quotas: ResourceQuotas,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionContext {
     pub workspace_id: String,
     pub repo_path: String,
@@ -828,32 +920,122 @@ impl WasmWorkspace for WorkspaceManager {
     }
 }
 
-pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
-    let mut dependency_files = vec![];
+#[derive(Default)]
+struct RepositoryRegistryState {
+    profiles: HashMap<String, ExecutionProfile>,
+    snapshots: HashMap<String, HashMap<String, String>>,
+    deltas: HashMap<String, RepoDelta>,
+}
 
+pub struct RepositoryRegistry;
+
+static REPOSITORY_REGISTRY: OnceLock<Mutex<RepositoryRegistryState>> = OnceLock::new();
+
+impl RepositoryRegistry {
+    pub fn get_or_compute(repo_reference: &str) -> ExecutionProfile {
+        let root = Path::new(repo_reference);
+        if !root.exists() {
+            return Self::default_profile(repo_reference);
+        }
+
+        let snapshot = collect_repository_snapshot(root);
+        let (framework, language, package_content) = infer_framework_and_language(root);
+        Self::compute_and_cache_profile(
+            repo_reference,
+            snapshot,
+            framework,
+            language,
+            &package_content,
+        )
+    }
+
+    fn compute_and_cache_profile(
+        repo_reference: &str,
+        snapshot: HashMap<String, String>,
+        framework: Framework,
+        language: Language,
+        package_content: &str,
+    ) -> ExecutionProfile {
+        let fingerprint = build_repository_fingerprint(&snapshot, framework, language);
+
+        let mut state = REPOSITORY_REGISTRY
+            .get_or_init(|| Mutex::new(RepositoryRegistryState::default()))
+            .lock()
+            .expect("repository registry lock poisoned");
+
+        if let Some(existing) = state.profiles.get(repo_reference) {
+            if existing.fingerprint == fingerprint {
+                return existing.clone();
+            }
+        }
+
+        let classification = classify_repository(framework, &snapshot, &package_content);
+        let runtime_affinity = runtime_affinity_for_classification(&classification);
+        let recommended_graph_strategy = graph_strategy_for_classification(classification.class);
+        let profile = ExecutionProfile {
+            fingerprint,
+            classification,
+            recommended_graph_strategy,
+            runtime_affinity,
+        };
+
+        let delta = state
+            .snapshots
+            .get(repo_reference)
+            .map(|previous| diff_repo_snapshots(previous, &snapshot))
+            .unwrap_or_default();
+        state
+            .snapshots
+            .insert(repo_reference.to_string(), snapshot);
+        state.deltas.insert(repo_reference.to_string(), delta);
+        state
+            .profiles
+            .insert(repo_reference.to_string(), profile.clone());
+
+        profile
+    }
+
+    pub fn latest_delta(repo_reference: &str) -> Option<RepoDelta> {
+        REPOSITORY_REGISTRY
+            .get_or_init(|| Mutex::new(RepositoryRegistryState::default()))
+            .lock()
+            .expect("repository registry lock poisoned")
+            .deltas
+            .get(repo_reference)
+            .cloned()
+    }
+
+    fn default_profile(repo_url: &str) -> ExecutionProfile {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: hash_key(repo_url),
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "unknown".to_string(),
+            framework_signature: Some("unknown".to_string()),
+        };
+        let classification = RepositoryClassification {
+            class: RepoClass::Unknown,
+            confidence: 0.0,
+            primary_runtime: RuntimeType::Unknown,
+            secondary_runtimes: vec![],
+        };
+        ExecutionProfile {
+            fingerprint,
+            classification: classification.clone(),
+            recommended_graph_strategy: graph_strategy_for_classification(classification.class),
+            runtime_affinity: runtime_affinity_for_classification(&classification),
+        }
+    }
+}
+
+fn infer_framework_and_language(root: &Path) -> (Framework, Language, String) {
     let package_json = root.join("package.json");
     let cargo_toml = root.join("Cargo.toml");
     let go_mod = root.join("go.mod");
     let requirements = root.join("requirements.txt");
     let pyproject = root.join("pyproject.toml");
-
-    if package_json.exists() {
-        dependency_files.push(package_json.clone());
-    }
-    if cargo_toml.exists() {
-        dependency_files.push(cargo_toml.clone());
-    }
-    if go_mod.exists() {
-        dependency_files.push(go_mod.clone());
-    }
-    if requirements.exists() {
-        dependency_files.push(requirements.clone());
-    }
-    if pyproject.exists() {
-        dependency_files.push(pyproject.clone());
-    }
-
     let package_content = fs::read_to_string(&package_json).unwrap_or_default();
+
     let framework = if package_mentions_dependency(&package_content, "next")
         || package_mentions_dependency(&package_content, "nextjs")
     {
@@ -880,12 +1062,6 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         Framework::Unknown
     };
 
-    if framework == Framework::Unknown {
-        return Err(RuntimeError::UnsupportedRepository(
-            "unable to infer execution strategy".to_string(),
-        ));
-    }
-
     let language = match framework {
         Framework::React
         | Framework::Vue
@@ -906,6 +1082,379 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         Framework::Python => Language::Python,
         _ => Language::Unknown,
     };
+
+    (framework, language, package_content)
+}
+
+fn collect_repository_snapshot(root: &Path) -> HashMap<String, String> {
+    let mut entries = HashMap::new();
+    let patterns = read_gitignore_patterns(root);
+    collect_repository_snapshot_inner(root, root, &patterns, &mut entries);
+    entries
+}
+
+fn collect_repository_snapshot_inner(
+    root: &Path,
+    current: &Path,
+    patterns: &[String],
+    entries: &mut HashMap<String, String>,
+) {
+    let Ok(read_dir) = fs::read_dir(current) else {
+        return;
+    };
+
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        if relative_str == ".git" || relative_str.starts_with(".git/") {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        if should_ignore_path(&relative_str, patterns) {
+            continue;
+        }
+        if is_dir {
+            collect_repository_snapshot_inner(root, &path, patterns, entries);
+        } else if let Ok(bytes) = fs::read(&path) {
+            entries.insert(relative_str, hash_bytes(&bytes));
+        }
+    }
+}
+
+fn read_gitignore_patterns(root: &Path) -> Vec<String> {
+    let gitignore = root.join(".gitignore");
+    fs::read_to_string(gitignore)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn should_ignore_path(relative: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        let normalized = pattern.trim_start_matches("./").trim_start_matches('/');
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized.ends_with('/') {
+            let prefix = normalized.trim_end_matches('/');
+            if relative == prefix || relative.starts_with(&format!("{prefix}/")) {
+                return true;
+            }
+            continue;
+        }
+        if let Some(extension) = normalized.strip_prefix("*.") {
+            if relative.ends_with(&format!(".{extension}")) {
+                return true;
+            }
+            continue;
+        }
+        if normalized.contains('/') {
+            if relative == normalized || relative.starts_with(&format!("{normalized}/")) {
+                return true;
+            }
+            continue;
+        }
+        if relative == normalized
+            || relative
+                .split('/')
+                .any(|segment| segment == normalized)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn build_repository_fingerprint(
+    snapshot: &HashMap<String, String>,
+    framework: Framework,
+    language: Language,
+) -> RepositoryFingerprint {
+    let mut normalized = snapshot
+        .iter()
+        .map(|(path, content_hash)| format!("{path}:{content_hash}"))
+        .collect::<Vec<_>>();
+    normalized.sort();
+
+    let lockfile_hash = aggregate_hash_by_filenames(
+        snapshot,
+        &[
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "Cargo.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "go.sum",
+        ],
+    );
+    let dependency_hash = aggregate_hash_by_filenames(
+        snapshot,
+        &[
+            "package.json",
+            "Cargo.toml",
+            "pyproject.toml",
+            "requirements.txt",
+            "go.mod",
+        ],
+    );
+
+    RepositoryFingerprint {
+        repo_hash: hash_key(&normalized.join("|")),
+        lockfile_hash,
+        dependency_hash,
+        language_signature: language_signature(snapshot, language),
+        framework_signature: Some(format!("{framework:?}")),
+    }
+}
+
+fn aggregate_hash_by_filenames(
+    snapshot: &HashMap<String, String>,
+    file_names: &[&str],
+) -> Option<String> {
+    let names: HashSet<&str> = file_names.iter().copied().collect();
+    let mut selected = snapshot
+        .iter()
+        .filter(|(path, _)| {
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| names.contains(name))
+                .unwrap_or(false)
+        })
+        .map(|(path, hash)| format!("{path}:{hash}"))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return None;
+    }
+    selected.sort();
+    Some(hash_key(&selected.join("|")))
+}
+
+fn language_signature(snapshot: &HashMap<String, String>, primary: Language) -> String {
+    let mut langs = vec![format!("{primary:?}")];
+    if snapshot.keys().any(|path| path.ends_with(".rs")) {
+        langs.push("Rust".to_string());
+    }
+    if snapshot.keys().any(|path| path.ends_with(".go")) {
+        langs.push("Go".to_string());
+    }
+    if snapshot.keys().any(|path| {
+        path.ends_with(".py") || path_has_filename(path, "pyproject.toml")
+    }) {
+        langs.push("Python".to_string());
+    }
+    if snapshot.keys().any(|path| path.ends_with(".js")) {
+        langs.push("JavaScript".to_string());
+    }
+    if snapshot.keys().any(|path| path.ends_with(".ts") || path.ends_with(".tsx")) {
+        langs.push("TypeScript".to_string());
+    }
+    langs.sort();
+    langs.dedup();
+    langs.join("+")
+}
+
+fn classify_repository(
+    framework: Framework,
+    snapshot: &HashMap<String, String>,
+    package_content: &str,
+) -> RepositoryClassification {
+    let package_json_count = snapshot
+        .keys()
+        .filter(|path| path.ends_with("package.json"))
+        .count();
+    let monorepo = snapshot.contains_key("pnpm-workspace.yaml")
+        || snapshot.contains_key("turbo.json")
+        || package_json_count > 1;
+
+    let (class, confidence) = if monorepo {
+        (RepoClass::Monorepo, 0.95)
+    } else {
+        match framework {
+            Framework::NextJs => (RepoClass::FullStackNode, 0.95),
+            Framework::Node | Framework::React | Framework::Vue | Framework::Svelte | Framework::Vite => {
+                (RepoClass::NodeApp, 0.9)
+            }
+            Framework::Rust => (RepoClass::RustBinary, 0.92),
+            Framework::Python => (RepoClass::PythonApp, 0.9),
+            Framework::StaticWeb => (RepoClass::StaticSite, 0.88),
+            Framework::Unknown => (RepoClass::Unknown, 0.2),
+            Framework::Go => (RepoClass::Unknown, 0.4),
+        }
+    };
+
+    let primary_runtime = runtime_for_framework(framework);
+    let mut secondary_runtimes = vec![];
+    if monorepo {
+        if snapshot.keys().any(|path| path.ends_with("Cargo.toml")) {
+            secondary_runtimes.push(RuntimeType::Rust);
+        }
+        if snapshot
+            .keys()
+            .any(|path| {
+                path_has_filename(path, "requirements.txt")
+                    || path_has_filename(path, "pyproject.toml")
+            })
+        {
+            secondary_runtimes.push(RuntimeType::Python);
+        }
+        if snapshot.keys().any(|path| path.ends_with("go.mod")) {
+            secondary_runtimes.push(RuntimeType::Go);
+        }
+    } else if class == RepoClass::FullStackNode
+        && package_mentions_dependency(package_content, "react")
+    {
+        secondary_runtimes.push(RuntimeType::Node);
+    }
+    secondary_runtimes.sort();
+    secondary_runtimes.dedup();
+
+    RepositoryClassification {
+        class,
+        confidence,
+        primary_runtime,
+        secondary_runtimes,
+    }
+}
+
+fn graph_strategy_for_classification(class: RepoClass) -> GraphStrategy {
+    match class {
+        RepoClass::Monorepo => GraphStrategy::MonorepoSegmented,
+        RepoClass::FullStackNode => GraphStrategy::MultiStage,
+        RepoClass::NodeApp | RepoClass::PythonApp | RepoClass::RustBinary => {
+            GraphStrategy::Parallelized
+        }
+        RepoClass::StaticSite | RepoClass::Unknown => GraphStrategy::Linear,
+    }
+}
+
+fn runtime_affinity_for_classification(classification: &RepositoryClassification) -> RuntimeAffinity {
+    match classification.primary_runtime {
+        RuntimeType::Node => RuntimeAffinity {
+            preferred_provider: "NodeRuntimeProvider".to_string(),
+            fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+        },
+        RuntimeType::Rust => RuntimeAffinity {
+            preferred_provider: "RustRuntimeProvider".to_string(),
+            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+        },
+        RuntimeType::Python => RuntimeAffinity {
+            preferred_provider: "PythonExecutionProvider".to_string(),
+            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+        },
+        RuntimeType::Go => RuntimeAffinity {
+            preferred_provider: "GoExecutionProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        },
+        RuntimeType::Static => RuntimeAffinity {
+            preferred_provider: "StaticRuntimeProvider".to_string(),
+            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+        },
+        RuntimeType::Unknown => RuntimeAffinity {
+            preferred_provider: "NodeRuntimeProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        },
+    }
+}
+
+fn runtime_for_framework(framework: Framework) -> RuntimeType {
+    match framework {
+        Framework::Node
+        | Framework::Vite
+        | Framework::React
+        | Framework::Vue
+        | Framework::Svelte
+        | Framework::NextJs => RuntimeType::Node,
+        Framework::Rust => RuntimeType::Rust,
+        Framework::Go => RuntimeType::Go,
+        Framework::Python => RuntimeType::Python,
+        Framework::StaticWeb => RuntimeType::Static,
+        Framework::Unknown => RuntimeType::Unknown,
+    }
+}
+
+fn path_has_filename(path: &str, expected_file_name: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == expected_file_name)
+        .unwrap_or(false)
+}
+
+fn diff_repo_snapshots(
+    previous: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> RepoDelta {
+    let mut added_files = current
+        .keys()
+        .filter(|path| !previous.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut removed_files = previous
+        .keys()
+        .filter(|path| !current.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut modified_files = current
+        .iter()
+        .filter_map(|(path, hash)| {
+            previous
+                .get(path)
+                .filter(|previous_hash| *previous_hash != hash)
+                .map(|_| path.clone())
+        })
+        .collect::<Vec<_>>();
+
+    added_files.sort();
+    removed_files.sort();
+    modified_files.sort();
+
+    RepoDelta {
+        added_files,
+        removed_files,
+        modified_files,
+    }
+}
+
+pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
+    let mut dependency_files = vec![];
+
+    let package_json = root.join("package.json");
+    let cargo_toml = root.join("Cargo.toml");
+    let go_mod = root.join("go.mod");
+    let requirements = root.join("requirements.txt");
+    let pyproject = root.join("pyproject.toml");
+
+    if package_json.exists() {
+        dependency_files.push(package_json.clone());
+    }
+    if cargo_toml.exists() {
+        dependency_files.push(cargo_toml.clone());
+    }
+    if go_mod.exists() {
+        dependency_files.push(go_mod.clone());
+    }
+    if requirements.exists() {
+        dependency_files.push(requirements.clone());
+    }
+    if pyproject.exists() {
+        dependency_files.push(pyproject.clone());
+    }
+
+    let (framework, language, package_content) = infer_framework_and_language(root);
+
+    if framework == Framework::Unknown {
+        return Err(RuntimeError::UnsupportedRepository(
+            "unable to infer execution strategy".to_string(),
+        ));
+    }
 
     let scripts = parse_package_scripts(&package_content);
     let package_manager = if root.join("pnpm-lock.yaml").exists() {
@@ -949,15 +1498,28 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         scripts,
     };
 
+    let repo_reference = root.to_string_lossy().to_string();
+    let snapshot = collect_repository_snapshot(root);
+    let execution_profile = RepositoryRegistry::compute_and_cache_profile(
+        &repo_reference,
+        snapshot,
+        framework,
+        language,
+        &package_content,
+    );
     let mut analysis = RepositoryAnalysis {
         root: root.to_path_buf(),
         framework,
         language,
         dependency_files,
+        fingerprint: execution_profile.fingerprint.clone(),
+        classification: execution_profile.classification.clone(),
+        execution_profile,
         build_intelligence,
         execution_graph: ExecutionGraph::default(),
     };
-    analysis.execution_graph = BuildPlanner::build_graph(&analysis).with_cache_keys();
+    analysis.execution_graph = BuildPlanner::build_graph(&analysis)
+        .with_cache_keys_for(Some(&analysis.fingerprint));
 
     Ok(analysis)
 }
@@ -1432,6 +1994,15 @@ fn hash_key(input: &str) -> String {
     format!("{state:x}")
 }
 
+fn hash_bytes(input: &[u8]) -> String {
+    let mut state: u64 = 14695981039346656037;
+    for byte in input {
+        state ^= *byte as u64;
+        state = state.wrapping_mul(1099511628211);
+    }
+    format!("{state:x}")
+}
+
 fn ports_for_framework(framework: Framework) -> Vec<PortInfo> {
     match framework {
         Framework::Node
@@ -1830,6 +2401,90 @@ mod tests {
         let second = graph.compute_cache_keys();
 
         assert_ne!(first.get("build"), second.get("build"));
+    }
+
+    #[test]
+    fn cache_key_engine_changes_with_repository_fingerprint() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+            }],
+            edges: vec![],
+        };
+        let first = graph.compute_cache_keys_with_fingerprint(Some(&RepositoryFingerprint {
+            repo_hash: "repo-a".to_string(),
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "Rust".to_string(),
+            framework_signature: Some("Rust".to_string()),
+        }));
+        let second = graph.compute_cache_keys_with_fingerprint(Some(&RepositoryFingerprint {
+            repo_hash: "repo-b".to_string(),
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "Rust".to_string(),
+            framework_signature: Some("Rust".to_string()),
+        }));
+
+        assert_ne!(first.get("build"), second.get("build"));
+    }
+
+    #[test]
+    fn repository_registry_classifies_and_tracks_repo_delta() {
+        let repo = temp_dir("registry-monorepo");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0","react":"18.2.0"}}"#,
+        )
+        .expect("write package manifest");
+        fs::write(repo.join("pnpm-workspace.yaml"), "packages:\n  - apps/*\n")
+            .expect("write workspace manifest");
+        fs::create_dir_all(repo.join("apps/web")).expect("create apps dir");
+        fs::write(repo.join("apps/web/package.json"), r#"{"name":"web"}"#)
+            .expect("write nested package manifest");
+
+        let profile = RepositoryRegistry::get_or_compute(repo.to_string_lossy().as_ref());
+        assert_eq!(profile.classification.class, RepoClass::Monorepo);
+        assert_eq!(
+            profile.recommended_graph_strategy,
+            GraphStrategy::MonorepoSegmented
+        );
+
+        fs::write(
+            repo.join("apps/web/package.json"),
+            r#"{"name":"web","private":true}"#,
+        )
+        .expect("modify nested package manifest");
+        let _ = RepositoryRegistry::get_or_compute(repo.to_string_lossy().as_ref());
+        let delta = RepositoryRegistry::latest_delta(repo.to_string_lossy().as_ref())
+            .expect("delta should be available");
+        assert!(delta
+            .modified_files
+            .iter()
+            .any(|path| path == "apps/web/package.json"));
+    }
+
+    #[test]
+    fn analyze_repository_emits_execution_profile() {
+        let repo = temp_dir("analysis-profile");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"react":"18.0.0"}}"#,
+        )
+        .expect("write package.json");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert!(!analysis.fingerprint.repo_hash.is_empty());
+        assert_eq!(analysis.classification.class, RepoClass::NodeApp);
+        assert_eq!(
+            analysis.execution_profile.runtime_affinity.preferred_provider,
+            "NodeRuntimeProvider"
+        );
     }
 
     #[test]
