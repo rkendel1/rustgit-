@@ -263,7 +263,7 @@ impl WorkspaceManager {
         }
 
         if looks_like_local_path(repo_url) {
-            copy_directory_filtered(Path::new(repo_url), destination, Some(&self.root))?;
+            copy_directory(Path::new(repo_url), destination)?;
         } else {
             let status = Command::new("git")
                 .arg("clone")
@@ -426,15 +426,17 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     }
 
     let package_content = fs::read_to_string(&package_json).unwrap_or_default();
-    let framework = if package_content.contains("next") {
+    let framework = if package_mentions_dependency(&package_content, "next")
+        || package_mentions_dependency(&package_content, "nextjs")
+    {
         Framework::NextJs
-    } else if package_content.contains("svelte") {
+    } else if package_mentions_dependency(&package_content, "svelte") {
         Framework::Svelte
-    } else if package_content.contains("vue") {
+    } else if package_mentions_dependency(&package_content, "vue") {
         Framework::Vue
-    } else if package_content.contains("react") {
+    } else if package_mentions_dependency(&package_content, "react") {
         Framework::React
-    } else if package_content.contains("vite") {
+    } else if package_mentions_dependency(&package_content, "vite") {
         Framework::Vite
     } else if package_json.exists() {
         Framework::Node
@@ -457,7 +459,9 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         | Framework::Node
         | Framework::Vite
         | Framework::NextJs => {
-            if package_content.contains("typescript") || root.join("tsconfig.json").exists() {
+            if package_mentions_dependency(&package_content, "typescript")
+                || root.join("tsconfig.json").exists()
+            {
                 Language::TypeScript
             } else {
                 Language::JavaScript
@@ -706,8 +710,9 @@ fn looks_like_local_path(repo_url: &str) -> bool {
     repo_url.starts_with('/') || repo_url.starts_with("./") || repo_url.starts_with("../")
 }
 
+/// Generates a stable cache key using the standard FNV-1a 64-bit basis and prime constants.
 fn hash_key(input: &str) -> String {
-    let mut state: u64 = 1469598103934665603;
+    let mut state: u64 = 14695981039346656037;
     for byte in input.bytes() {
         state ^= byte as u64;
         state = state.wrapping_mul(1099511628211);
@@ -716,14 +721,6 @@ fn hash_key(input: &str) -> String {
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
-    copy_directory_filtered(source, destination, None)
-}
-
-fn copy_directory_filtered(
-    source: &Path,
-    destination: &Path,
-    excluded_prefix: Option<&Path>,
-) -> Result<()> {
     if !source.exists() {
         return Err(RuntimeError::InvalidPath(source.display().to_string()));
     }
@@ -731,22 +728,63 @@ fn copy_directory_filtered(
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let entry_path = entry.path();
-        if let Some(excluded) = excluded_prefix {
-            if entry_path.starts_with(excluded) {
-                continue;
-            }
+        if destination.starts_with(&entry_path) {
+            continue;
         }
         let target = destination.join(entry.file_name());
 
         if entry.file_type()?.is_dir() {
             fs::create_dir_all(&target)?;
-            copy_directory_filtered(&entry_path, &target, excluded_prefix)?;
+            copy_directory(&entry_path, &target)?;
         } else {
             fs::copy(&entry_path, &target)?;
         }
     }
 
     Ok(())
+}
+
+/// Checks if `dependency` exists under package.json `dependencies` or `devDependencies`.
+fn package_mentions_dependency(content: &str, dependency: &str) -> bool {
+    dependency_in_object(content, "dependencies", dependency)
+        || dependency_in_object(content, "devDependencies", dependency)
+}
+
+/// Extracts an object block by key and checks whether it contains a quoted dependency key.
+fn dependency_in_object(content: &str, object_key: &str, dependency: &str) -> bool {
+    let key = format!("\"{object_key}\"");
+    let dep = format!("\"{dependency}\"");
+
+    let Some(mut index) = content.find(&key) else {
+        return false;
+    };
+    index += key.len();
+
+    let Some(open_brace_offset) = content[index..].find('{') else {
+        return false;
+    };
+    let mut cursor = index + open_brace_offset + 1;
+    let mut depth: usize = 1;
+
+    while cursor < content.len() && depth > 0 {
+        let ch = content.as_bytes()[cursor] as char;
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                break;
+            }
+        }
+        cursor += 1;
+    }
+
+    if depth != 0 || cursor <= index + open_brace_offset + 1 {
+        return false;
+    }
+
+    let dependency_block = &content[(index + open_brace_offset + 1)..cursor];
+    dependency_block.contains(&dep)
 }
 
 fn collect_files(
@@ -777,7 +815,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "rustgit-wasm-runtime-{}-{}",
+            "rustgit_wasm_runtime-{}-{}",
             name,
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
