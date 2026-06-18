@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde_json::Value;
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -98,12 +99,143 @@ pub struct PortInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionPlan {
-    pub framework: Framework,
-    pub build_steps: Vec<String>,
-    pub run_command: String,
-    pub cache_key: String,
-    pub ports: Vec<PortInfo>,
+pub struct ExecutionNode {
+    pub id: String,
+    pub node_type: ExecutionNodeType,
+    pub command: Option<String>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionEdge {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionNodeType {
+    InstallDependencies,
+    Build,
+    DevServer,
+    Test,
+    StaticServe,
+    CustomCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionGraph {
+    pub nodes: Vec<ExecutionNode>,
+    pub edges: Vec<ExecutionEdge>,
+}
+
+impl ExecutionGraph {
+    pub fn ordered_node_ids(&self) -> Vec<String> {
+        let mut indegree: HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), 0usize))
+            .collect();
+        let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+
+        for edge in &self.edges {
+            if let Some(count) = indegree.get_mut(edge.to.as_str()) {
+                *count += 1;
+            }
+            adjacency
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
+        }
+
+        let mut ready: BTreeSet<&str> = indegree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        for id in ready.iter().copied() {
+            queue.push_back(id);
+        }
+        ready.clear();
+
+        let mut ordered = Vec::with_capacity(self.nodes.len());
+        while let Some(id) = queue.pop_front() {
+            ordered.push(id.to_string());
+
+            if let Some(next_ids) = adjacency.get(id) {
+                for next in next_ids {
+                    if let Some(next_degree) = indegree.get_mut(next) {
+                        *next_degree = next_degree.saturating_sub(1);
+                        if *next_degree == 0 {
+                            ready.insert(next);
+                        }
+                    }
+                }
+            }
+
+            for next in ready.iter().copied() {
+                queue.push_back(next);
+            }
+            ready.clear();
+        }
+
+        if ordered.len() == self.nodes.len() {
+            ordered
+        } else {
+            let mut fallback = self
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            fallback.sort();
+            fallback
+        }
+    }
+
+    pub fn primary_run_command(&self) -> Option<String> {
+        let preferred = [
+            ExecutionNodeType::DevServer,
+            ExecutionNodeType::StaticServe,
+            ExecutionNodeType::CustomCommand,
+        ];
+
+        for kind in preferred {
+            if let Some(command) = self
+                .nodes
+                .iter()
+                .find(|node| node.node_type == kind)
+                .and_then(|node| node.command.clone())
+            {
+                return Some(command);
+            }
+        }
+
+        self.nodes.iter().find_map(|node| node.command.clone())
+    }
+
+    pub fn cache_key(&self) -> String {
+        let mut normalized = self.ordered_node_ids();
+        let mut edges = self
+            .edges
+            .iter()
+            .map(|edge| format!("{}->{}", edge.from, edge.to))
+            .collect::<Vec<_>>();
+        edges.sort();
+        normalized.extend(edges);
+        hash_key(&normalized.join("|"))
+    }
+}
+
+pub type FrameworkType = Framework;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIntelligence {
+    pub framework: FrameworkType,
+    pub package_manager: Option<String>,
+    pub build_tooling: Vec<String>,
+    pub entrypoints: Vec<String>,
+    pub scripts: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +244,8 @@ pub struct RepositoryAnalysis {
     pub framework: Framework,
     pub language: Language,
     pub dependency_files: Vec<PathBuf>,
-    pub execution_plan: ExecutionPlan,
+    pub build_intelligence: BuildIntelligence,
+    pub execution_graph: ExecutionGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +294,12 @@ pub struct ExecutionContext {
     pub workspace_id: String,
     pub repo_path: String,
     pub analysis: RepositoryAnalysis,
-    pub execution_plan: ExecutionPlan,
+    pub execution_graph: ExecutionGraph,
     pub resources: ResourceQuotas,
     pub network: NetworkPolicy,
 }
+
+pub struct BuildPlanner;
 
 /// Provider contract for deterministic workspace execution.
 ///
@@ -419,13 +554,15 @@ impl WasmWorkspace for WorkspaceManager {
                 workspace_id: id.clone(),
                 repo_path: repository_root.to_string_lossy().to_string(),
                 analysis: analysis.clone(),
-                execution_plan: analysis.execution_plan.clone(),
+                execution_graph: analysis.execution_graph.clone(),
                 resources: workspace.resource_quotas.clone(),
                 network: workspace.network_policy.clone(),
             };
             logs.push(format!(
                 "planned execution command: {}",
-                ctx.execution_plan.run_command
+                ctx.execution_graph
+                    .primary_run_command()
+                    .unwrap_or_else(|| "none".to_string())
             ));
 
             Self::transition_state(&mut workspace, WorkspaceState::Starting)?;
@@ -434,7 +571,7 @@ impl WasmWorkspace for WorkspaceManager {
 
             Self::transition_state(&mut workspace, WorkspaceState::Running)?;
             workspace.framework = ctx.analysis.framework;
-            workspace.ports = ctx.execution_plan.ports.clone();
+            workspace.ports = ports_for_framework(ctx.analysis.framework);
             workspace.network_policy = ctx.network.clone();
             workspace.resource_quotas = ctx.resources.clone();
 
@@ -573,6 +710,12 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         Framework::Unknown
     };
 
+    if framework == Framework::Unknown {
+        return Err(RuntimeError::UnsupportedRepository(
+            "unable to infer execution strategy".to_string(),
+        ));
+    }
+
     let language = match framework {
         Framework::React
         | Framework::Vue
@@ -594,87 +737,282 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         _ => Language::Unknown,
     };
 
-    let execution_plan = execution_plan_for(root, framework)?;
+    let scripts = parse_package_scripts(&package_content);
+    let package_manager = if root.join("pnpm-lock.yaml").exists() {
+        Some("pnpm".to_string())
+    } else if root.join("yarn.lock").exists() {
+        Some("yarn".to_string())
+    } else if package_json.exists() {
+        Some("npm".to_string())
+    } else if cargo_toml.exists() {
+        Some("cargo".to_string())
+    } else if go_mod.exists() {
+        Some("go".to_string())
+    } else if requirements.exists() || pyproject.exists() {
+        Some("pip".to_string())
+    } else {
+        None
+    };
 
-    Ok(RepositoryAnalysis {
+    let build_tooling = match framework {
+        Framework::Node
+        | Framework::Vite
+        | Framework::React
+        | Framework::Vue
+        | Framework::Svelte
+        | Framework::NextJs => vec!["node".to_string(), "npm".to_string()],
+        Framework::Rust => vec!["cargo".to_string()],
+        Framework::Go => vec!["go".to_string()],
+        Framework::Python => vec!["python".to_string(), "pip".to_string()],
+        Framework::StaticWeb => vec!["serve".to_string()],
+        Framework::Unknown => vec![],
+    };
+
+    let build_intelligence = BuildIntelligence {
+        framework,
+        package_manager,
+        build_tooling,
+        entrypoints: ports_for_framework(framework)
+            .iter()
+            .map(|port| format!("{}://0.0.0.0:{}{}", port.protocol, port.port, port.route))
+            .collect(),
+        scripts,
+    };
+
+    let mut analysis = RepositoryAnalysis {
         root: root.to_path_buf(),
         framework,
         language,
         dependency_files,
-        execution_plan,
-    })
+        build_intelligence,
+        execution_graph: ExecutionGraph::default(),
+    };
+    analysis.execution_graph = BuildPlanner::build_graph(&analysis);
+
+    Ok(analysis)
 }
 
-pub fn execution_plan_for(root: &Path, framework: Framework) -> Result<ExecutionPlan> {
-    let plan = match framework {
-        Framework::React
-        | Framework::Vue
-        | Framework::Svelte
-        | Framework::Vite
-        | Framework::Node
-        | Framework::NextJs => ExecutionPlan {
-            framework,
-            build_steps: vec!["npm ci".to_string(), "npm run build".to_string()],
-            run_command: "npm run dev -- --host 0.0.0.0".to_string(),
-            cache_key: hash_key(&format!("{}-{:?}", root.display(), framework)),
-            ports: vec![PortInfo {
-                port: 3000,
-                protocol: "http".to_string(),
-                route: "/".to_string(),
-            }],
-        },
-        Framework::Rust => ExecutionPlan {
-            framework,
-            build_steps: vec!["cargo build".to_string()],
-            run_command: "cargo run".to_string(),
-            cache_key: hash_key(&format!("{}-rust", root.display())),
-            ports: vec![PortInfo {
-                port: 8080,
-                protocol: "http".to_string(),
-                route: "/".to_string(),
-            }],
-        },
-        Framework::Go => ExecutionPlan {
-            framework,
-            build_steps: vec!["go build ./...".to_string()],
-            run_command: "go run .".to_string(),
-            cache_key: hash_key(&format!("{}-go", root.display())),
-            ports: vec![PortInfo {
-                port: 8080,
-                protocol: "http".to_string(),
-                route: "/".to_string(),
-            }],
-        },
-        Framework::Python => ExecutionPlan {
-            framework,
-            build_steps: vec!["python -m pip install -r requirements.txt".to_string()],
-            run_command: "python -m app".to_string(),
-            cache_key: hash_key(&format!("{}-py", root.display())),
-            ports: vec![PortInfo {
-                port: 8000,
-                protocol: "http".to_string(),
-                route: "/".to_string(),
-            }],
-        },
-        Framework::StaticWeb => ExecutionPlan {
-            framework,
-            build_steps: vec![],
-            run_command: "serve .".to_string(),
-            cache_key: hash_key(&format!("{}-static", root.display())),
-            ports: vec![PortInfo {
-                port: 4173,
-                protocol: "http".to_string(),
-                route: "/".to_string(),
-            }],
-        },
-        Framework::Unknown => {
-            return Err(RuntimeError::UnsupportedRepository(
-                "unable to infer execution strategy".to_string(),
-            ))
-        }
-    };
+impl BuildPlanner {
+    pub fn build_graph(analysis: &RepositoryAnalysis) -> ExecutionGraph {
+        let framework = analysis.framework;
+        let scripts = &analysis.build_intelligence.scripts;
+        let package_manager = analysis
+            .build_intelligence
+            .package_manager
+            .as_deref()
+            .unwrap_or("npm");
 
-    Ok(plan)
+        let js_script = |name: &str, fallback: &str| -> String {
+            if scripts.contains_key(name) {
+                match package_manager {
+                    "pnpm" => format!("pnpm run {name}"),
+                    "yarn" => format!("yarn {name}"),
+                    _ => format!("npm run {name}"),
+                }
+            } else {
+                fallback.to_string()
+            }
+        };
+
+        let js_install = match package_manager {
+            "pnpm" => "pnpm install --frozen-lockfile".to_string(),
+            "yarn" => "yarn install --frozen-lockfile".to_string(),
+            _ => "npm ci".to_string(),
+        };
+        let js_build_fallback = match package_manager {
+            "pnpm" => "pnpm run build".to_string(),
+            "yarn" => "yarn build".to_string(),
+            _ => "npm run build".to_string(),
+        };
+        let js_dev_fallback = match package_manager {
+            "pnpm" => "pnpm run dev -- --host 0.0.0.0".to_string(),
+            "yarn" => "yarn dev --host 0.0.0.0".to_string(),
+            _ => "npm run dev -- --host 0.0.0.0".to_string(),
+        };
+        let js_test_fallback = match package_manager {
+            "pnpm" => "pnpm run test".to_string(),
+            "yarn" => "yarn test".to_string(),
+            _ => "npm test".to_string(),
+        };
+
+        match framework {
+            Framework::React
+            | Framework::Vue
+            | Framework::Svelte
+            | Framework::Vite
+            | Framework::Node
+            | Framework::NextJs => {
+                let install = ExecutionNode {
+                    id: "install".to_string(),
+                    node_type: ExecutionNodeType::InstallDependencies,
+                    command: Some(js_install),
+                    inputs: vec![
+                        "package.json".to_string(),
+                        "package-lock.json|yarn.lock|pnpm-lock.yaml".to_string(),
+                    ],
+                    outputs: vec!["node_modules".to_string()],
+                };
+                let build = ExecutionNode {
+                    id: "build".to_string(),
+                    node_type: ExecutionNodeType::Build,
+                    command: Some(js_script("build", &js_build_fallback)),
+                    inputs: vec!["node_modules".to_string()],
+                    outputs: vec![if framework == Framework::NextJs {
+                        ".next".to_string()
+                    } else {
+                        "dist".to_string()
+                    }],
+                };
+                let dev = ExecutionNode {
+                    id: "dev".to_string(),
+                    node_type: ExecutionNodeType::DevServer,
+                    command: Some(js_script("dev", &js_dev_fallback)),
+                    inputs: build.outputs.clone(),
+                    outputs: vec!["http://0.0.0.0:3000/".to_string()],
+                };
+                let test = ExecutionNode {
+                    id: "test".to_string(),
+                    node_type: ExecutionNodeType::Test,
+                    command: Some(js_script("test", &js_test_fallback)),
+                    inputs: vec!["node_modules".to_string()],
+                    outputs: vec!["test-report".to_string()],
+                };
+                ExecutionGraph {
+                    nodes: vec![install, build, dev, test],
+                    edges: vec![
+                        ExecutionEdge {
+                            from: "install".to_string(),
+                            to: "build".to_string(),
+                        },
+                        ExecutionEdge {
+                            from: "install".to_string(),
+                            to: "test".to_string(),
+                        },
+                        ExecutionEdge {
+                            from: "build".to_string(),
+                            to: "dev".to_string(),
+                        },
+                    ],
+                }
+            }
+            Framework::Rust => ExecutionGraph {
+                nodes: vec![
+                    ExecutionNode {
+                        id: "build".to_string(),
+                        node_type: ExecutionNodeType::Build,
+                        command: Some("cargo build".to_string()),
+                        inputs: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
+                        outputs: vec!["target".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "dev".to_string(),
+                        node_type: ExecutionNodeType::DevServer,
+                        command: Some("cargo run".to_string()),
+                        inputs: vec!["target".to_string()],
+                        outputs: vec!["http://0.0.0.0:8080/".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "test".to_string(),
+                        node_type: ExecutionNodeType::Test,
+                        command: Some("cargo test".to_string()),
+                        inputs: vec!["target".to_string()],
+                        outputs: vec!["test-report".to_string()],
+                    },
+                ],
+                edges: vec![
+                    ExecutionEdge {
+                        from: "build".to_string(),
+                        to: "dev".to_string(),
+                    },
+                    ExecutionEdge {
+                        from: "build".to_string(),
+                        to: "test".to_string(),
+                    },
+                ],
+            },
+            Framework::Go => ExecutionGraph {
+                nodes: vec![
+                    ExecutionNode {
+                        id: "build".to_string(),
+                        node_type: ExecutionNodeType::Build,
+                        command: Some("go build ./...".to_string()),
+                        inputs: vec!["go.mod".to_string(), "go.sum".to_string()],
+                        outputs: vec!["go-build-cache".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "dev".to_string(),
+                        node_type: ExecutionNodeType::DevServer,
+                        command: Some("go run .".to_string()),
+                        inputs: vec!["go-build-cache".to_string()],
+                        outputs: vec!["http://0.0.0.0:8080/".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "test".to_string(),
+                        node_type: ExecutionNodeType::Test,
+                        command: Some("go test ./...".to_string()),
+                        inputs: vec!["go-build-cache".to_string()],
+                        outputs: vec!["test-report".to_string()],
+                    },
+                ],
+                edges: vec![
+                    ExecutionEdge {
+                        from: "build".to_string(),
+                        to: "dev".to_string(),
+                    },
+                    ExecutionEdge {
+                        from: "build".to_string(),
+                        to: "test".to_string(),
+                    },
+                ],
+            },
+            Framework::Python => ExecutionGraph {
+                nodes: vec![
+                    ExecutionNode {
+                        id: "install".to_string(),
+                        node_type: ExecutionNodeType::InstallDependencies,
+                        command: Some("python -m pip install -r requirements.txt".to_string()),
+                        inputs: vec!["requirements.txt|pyproject.toml".to_string()],
+                        outputs: vec!["site-packages".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "dev".to_string(),
+                        node_type: ExecutionNodeType::DevServer,
+                        command: Some("python -m app".to_string()),
+                        inputs: vec!["site-packages".to_string()],
+                        outputs: vec!["http://0.0.0.0:8000/".to_string()],
+                    },
+                    ExecutionNode {
+                        id: "test".to_string(),
+                        node_type: ExecutionNodeType::Test,
+                        command: Some("python -m pytest".to_string()),
+                        inputs: vec!["site-packages".to_string()],
+                        outputs: vec!["test-report".to_string()],
+                    },
+                ],
+                edges: vec![
+                    ExecutionEdge {
+                        from: "install".to_string(),
+                        to: "dev".to_string(),
+                    },
+                    ExecutionEdge {
+                        from: "install".to_string(),
+                        to: "test".to_string(),
+                    },
+                ],
+            },
+            Framework::StaticWeb => ExecutionGraph {
+                nodes: vec![ExecutionNode {
+                    id: "serve".to_string(),
+                    node_type: ExecutionNodeType::StaticServe,
+                    command: Some("serve .".to_string()),
+                    inputs: vec!["index.html".to_string()],
+                    outputs: vec!["http://0.0.0.0:4173/".to_string()],
+                }],
+                edges: vec![],
+            },
+            Framework::Unknown => ExecutionGraph::default(),
+        }
+    }
 }
 
 pub struct VirtualFileSystem {
@@ -778,7 +1116,7 @@ impl ExecutionProvider for NodeRuntimeProvider {
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
-            pid_hint: format!("node:{}", ctx.execution_plan.cache_key),
+            pid_hint: format!("node:{}", ctx.execution_graph.cache_key()),
         })
     }
 
@@ -805,7 +1143,7 @@ impl ExecutionProvider for RustRuntimeProvider {
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
-            pid_hint: format!("rust:{}", ctx.execution_plan.cache_key),
+            pid_hint: format!("rust:{}", ctx.execution_graph.cache_key()),
         })
     }
 
@@ -832,7 +1170,7 @@ impl ExecutionProvider for StaticRuntimeProvider {
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
-            pid_hint: format!("static:{}", ctx.execution_plan.cache_key),
+            pid_hint: format!("static:{}", ctx.execution_graph.cache_key()),
         })
     }
 
@@ -897,6 +1235,37 @@ fn hash_key(input: &str) -> String {
         state = state.wrapping_mul(1099511628211);
     }
     format!("{state:x}")
+}
+
+fn ports_for_framework(framework: Framework) -> Vec<PortInfo> {
+    match framework {
+        Framework::Node
+        | Framework::Vite
+        | Framework::React
+        | Framework::Vue
+        | Framework::Svelte
+        | Framework::NextJs => vec![PortInfo {
+            port: 3000,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::Rust | Framework::Go => vec![PortInfo {
+            port: 8080,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::Python => vec![PortInfo {
+            port: 8000,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::StaticWeb => vec![PortInfo {
+            port: 4173,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::Unknown => vec![],
+    }
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
@@ -966,6 +1335,27 @@ fn dependency_in_object(content: &str, object_key: &str, dependency: &str) -> bo
     dependency_block.contains(&dep)
 }
 
+fn parse_package_scripts(content: &str) -> HashMap<String, String> {
+    let Ok(package_json) = serde_json::from_str::<Value>(content) else {
+        return HashMap::new();
+    };
+
+    package_json
+        .get("scripts")
+        .and_then(Value::as_object)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|(name, command)| {
+                    command
+                        .as_str()
+                        .map(|command| (name.clone(), command.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn collect_files(
     root: &Path,
     current: &Path,
@@ -1018,8 +1408,90 @@ mod tests {
         assert_eq!(analysis.framework, Framework::React);
         assert_eq!(analysis.language, Language::JavaScript);
         assert_eq!(
-            analysis.execution_plan.run_command,
-            "npm run dev -- --host 0.0.0.0"
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("npm run dev -- --host 0.0.0.0")
+        );
+        assert_eq!(
+            analysis.build_intelligence.package_manager.as_deref(),
+            Some("npm")
+        );
+    }
+
+    #[test]
+    fn js_graph_contains_deterministic_dependencies() {
+        let repo = temp_dir("js-graph");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"build":"vite build","dev":"vite"},"dependencies":{"vite":"5.0.0"}}"#,
+        )
+        .expect("write package.json");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        let ordered = graph.ordered_node_ids();
+        assert_eq!(ordered.first().map(String::as_str), Some("install"));
+        assert_eq!(ordered.get(1).map(String::as_str), Some("build"));
+        assert!(ordered.contains(&"dev".to_string()));
+        assert!(ordered.contains(&"test".to_string()));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "build")
+                .and_then(|node| node.command.as_deref()),
+            Some("npm run build")
+        );
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "install" && edge.to == "build"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "install" && edge.to == "test"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "build" && edge.to == "dev"));
+        assert!(!graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "test" && edge.to == "dev"));
+        assert_eq!(
+            graph.primary_run_command().as_deref(),
+            Some("npm run dev")
+        );
+    }
+
+    #[test]
+    fn js_graph_uses_detected_package_manager_commands() {
+        let repo = temp_dir("js-pnpm-graph");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"vite":"5.0.0"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'")
+            .expect("write pnpm lockfile");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        assert_eq!(analysis.build_intelligence.package_manager.as_deref(), Some("pnpm"));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "install")
+                .and_then(|node| node.command.as_deref()),
+            Some("pnpm install --frozen-lockfile")
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "build")
+                .and_then(|node| node.command.as_deref()),
+            Some("pnpm run build")
         );
     }
 

@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "wasm-workspace-cli"
 path = "src/bin/wasm_workspace_cli.rs"
+
+[dependencies]
+serde_json = "1.0"
