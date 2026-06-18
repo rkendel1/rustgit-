@@ -286,7 +286,12 @@ pub struct ArtifactStore {
 impl ArtifactStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let _ = fs::create_dir_all(&root);
+        if let Err(err) = fs::create_dir_all(&root) {
+            eprintln!(
+                "failed to create artifact store root {}: {err}; check directory permissions and disk space",
+                root.display()
+            );
+        }
         Self { root }
     }
 
@@ -305,7 +310,13 @@ impl ArtifactStore {
     pub fn put(&self, artifact: ExecutionArtifact) {
         let path = self.path_for(&artifact.key);
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create artifact parent directory {}: {err}; artifact caching will be skipped for this execution",
+                    parent.display()
+                );
+                return;
+            }
         }
         let payload = json!({
             "key": artifact.key,
@@ -313,7 +324,12 @@ impl ArtifactStore {
             "path": artifact.path,
             "created_at": artifact.created_at,
         });
-        let _ = fs::write(path, payload.to_string());
+        if let Err(err) = fs::write(&path, payload.to_string()) {
+            eprintln!(
+                "failed to write artifact metadata {}: {err}; this node output will not be cached and future runs may miss cache reuse",
+                path.display()
+            );
+        }
     }
 
     pub fn exists(&self, key: &str) -> bool {
@@ -328,6 +344,9 @@ impl ArtifactStore {
 pub struct CacheKeyEngine;
 
 impl CacheKeyEngine {
+    /// Computes a deterministic cache key for one node by hashing:
+    /// node type, command, immediate graph position, graph/repository hash,
+    /// and an environment fingerprint stable for a given runtime configuration.
     pub fn compute_node_key(node: &ExecutionNode, graph: &ExecutionGraph) -> String {
         let mut incoming = graph
             .edges
@@ -350,6 +369,7 @@ impl CacheKeyEngine {
             "{}|{}|{}",
             std::env::consts::OS,
             std::env::consts::ARCH,
+            // Optional cache namespace partitioning (for example dev/staging/prod).
             std::env::var("RUSTGIT_RUNTIME_ENV").unwrap_or_default()
         ));
 
@@ -506,8 +526,11 @@ impl ExecutionEngine {
         }
     }
 
+    /// Ensures each node has artifact metadata recorded unless a matching cache key already exists.
     fn prime_artifacts(&self, ctx: &ExecutionContext) -> Result<()> {
         let keys = ctx.execution_graph.compute_cache_keys();
+        // ArtifactStore persists metadata under the runtime root; this path tracks
+        // workspace-local node output locations referenced by those metadata records.
         let artifacts_root = Path::new(&ctx.repo_path).join(".rustgit").join("artifacts");
         fs::create_dir_all(&artifacts_root)?;
 
