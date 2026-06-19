@@ -82,10 +82,28 @@ pub enum Framework {
     React,
     Vue,
     Svelte,
+    SvelteKit,
     NextJs,
+    Nuxt,
+    Astro,
+    Remix,
+    Express,
+    NestJs,
     Rust,
+    Axum,
+    Actix,
+    Rocket,
+    Leptos,
     Go,
+    Gin,
+    Fiber,
+    Echo,
     Python,
+    Flask,
+    FastApi,
+    Django,
+    Streamlit,
+    Gradio,
     Unknown,
 }
 
@@ -2471,12 +2489,33 @@ fn infer_framework_and_language(root: &Path) -> (Framework, Language, String) {
     let go_mod = root.join("go.mod");
     let requirements = root.join("requirements.txt");
     let pyproject = root.join("pyproject.toml");
+    let manage_py = root.join("manage.py");
     let package_content = fs::read_to_string(&package_json).unwrap_or_default();
+    let cargo_content = fs::read_to_string(&cargo_toml).unwrap_or_default();
+    let go_mod_content = fs::read_to_string(&go_mod).unwrap_or_default();
+    let requirements_content = fs::read_to_string(&requirements).unwrap_or_default();
+    let pyproject_content = fs::read_to_string(&pyproject).unwrap_or_default();
 
     let framework = if package_mentions_dependency(&package_content, "next")
         || package_mentions_dependency(&package_content, "nextjs")
     {
         Framework::NextJs
+    } else if package_mentions_dependency(&package_content, "nuxt") {
+        Framework::Nuxt
+    } else if package_mentions_dependency(&package_content, "@sveltejs/kit") {
+        Framework::SvelteKit
+    } else if package_mentions_dependency(&package_content, "astro") {
+        Framework::Astro
+    } else if package_mentions_dependency(&package_content, "@remix-run/dev")
+        || package_mentions_dependency(&package_content, "@remix-run/node")
+    {
+        Framework::Remix
+    } else if package_mentions_dependency(&package_content, "@nestjs/core")
+        || package_mentions_dependency(&package_content, "@nestjs/common")
+    {
+        Framework::NestJs
+    } else if package_mentions_dependency(&package_content, "express") {
+        Framework::Express
     } else if package_mentions_dependency(&package_content, "svelte") {
         Framework::Svelte
     } else if package_mentions_dependency(&package_content, "vue") {
@@ -2485,6 +2524,43 @@ fn infer_framework_and_language(root: &Path) -> (Framework, Language, String) {
         Framework::React
     } else if package_mentions_dependency(&package_content, "vite") {
         Framework::Vite
+    } else if text_mentions_dependency(&cargo_content, "axum") {
+        Framework::Axum
+    } else if text_mentions_dependency(&cargo_content, "actix-web")
+        || text_mentions_dependency(&cargo_content, "actix")
+    {
+        Framework::Actix
+    } else if text_mentions_dependency(&cargo_content, "rocket") {
+        Framework::Rocket
+    } else if text_mentions_dependency(&cargo_content, "leptos") {
+        Framework::Leptos
+    } else if text_mentions_dependency(&go_mod_content, "gin-gonic/gin") {
+        Framework::Gin
+    } else if text_mentions_dependency(&go_mod_content, "gofiber/fiber") {
+        Framework::Fiber
+    } else if text_mentions_dependency(&go_mod_content, "labstack/echo") {
+        Framework::Echo
+    } else if manage_py.exists()
+        || text_mentions_dependency(&requirements_content, "django")
+        || text_mentions_dependency(&pyproject_content, "django")
+    {
+        Framework::Django
+    } else if text_mentions_dependency(&requirements_content, "fastapi")
+        || text_mentions_dependency(&pyproject_content, "fastapi")
+    {
+        Framework::FastApi
+    } else if text_mentions_dependency(&requirements_content, "flask")
+        || text_mentions_dependency(&pyproject_content, "flask")
+    {
+        Framework::Flask
+    } else if text_mentions_dependency(&requirements_content, "streamlit")
+        || text_mentions_dependency(&pyproject_content, "streamlit")
+    {
+        Framework::Streamlit
+    } else if text_mentions_dependency(&requirements_content, "gradio")
+        || text_mentions_dependency(&pyproject_content, "gradio")
+    {
+        Framework::Gradio
     } else if package_json.exists() {
         Framework::Node
     } else if cargo_toml.exists() {
@@ -2503,9 +2579,15 @@ fn infer_framework_and_language(root: &Path) -> (Framework, Language, String) {
         Framework::React
         | Framework::Vue
         | Framework::Svelte
+        | Framework::SvelteKit
         | Framework::Node
         | Framework::Vite
-        | Framework::NextJs => {
+        | Framework::NextJs
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Express
+        | Framework::NestJs => {
             if package_mentions_dependency(&package_content, "typescript")
                 || root.join("tsconfig.json").exists()
             {
@@ -2514,9 +2596,18 @@ fn infer_framework_and_language(root: &Path) -> (Framework, Language, String) {
                 Language::JavaScript
             }
         }
-        Framework::Rust => Language::Rust,
-        Framework::Go => Language::Go,
-        Framework::Python => Language::Python,
+        Framework::Rust
+        | Framework::Axum
+        | Framework::Actix
+        | Framework::Rocket
+        | Framework::Leptos => Language::Rust,
+        Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => Language::Go,
+        Framework::Python
+        | Framework::Flask
+        | Framework::FastApi
+        | Framework::Django
+        | Framework::Streamlit
+        | Framework::Gradio => Language::Python,
         _ => Language::Unknown,
     };
 
@@ -2720,12 +2811,27 @@ fn classify_repository(
             | Framework::React
             | Framework::Vue
             | Framework::Svelte
-            | Framework::Vite => (RepoClass::NodeApp, 0.9),
-            Framework::Rust => (RepoClass::RustBinary, 0.92),
-            Framework::Python => (RepoClass::PythonApp, 0.9),
+            | Framework::SvelteKit
+            | Framework::Vite
+            | Framework::Nuxt
+            | Framework::Astro
+            | Framework::Remix
+            | Framework::Express
+            | Framework::NestJs => (RepoClass::NodeApp, 0.9),
+            Framework::Rust | Framework::Axum | Framework::Actix | Framework::Rocket | Framework::Leptos => {
+                (RepoClass::RustBinary, 0.92)
+            }
+            Framework::Python
+            | Framework::Flask
+            | Framework::FastApi
+            | Framework::Django
+            | Framework::Streamlit
+            | Framework::Gradio => (RepoClass::PythonApp, 0.9),
             Framework::StaticWeb => (RepoClass::StaticSite, 0.88),
             Framework::Unknown => (RepoClass::Unknown, 0.2),
-            Framework::Go => (RepoClass::Unknown, 0.4),
+            Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => {
+                (RepoClass::Unknown, 0.4)
+            }
         }
     };
 
@@ -2831,10 +2937,25 @@ fn runtime_for_framework(framework: Framework) -> RuntimeType {
         | Framework::React
         | Framework::Vue
         | Framework::Svelte
-        | Framework::NextJs => RuntimeType::Node,
-        Framework::Rust => RuntimeType::Rust,
-        Framework::Go => RuntimeType::Go,
-        Framework::Python => RuntimeType::Python,
+        | Framework::SvelteKit
+        | Framework::NextJs
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Express
+        | Framework::NestJs => RuntimeType::Node,
+        Framework::Rust
+        | Framework::Axum
+        | Framework::Actix
+        | Framework::Rocket
+        | Framework::Leptos => RuntimeType::Rust,
+        Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => RuntimeType::Go,
+        Framework::Python
+        | Framework::Flask
+        | Framework::FastApi
+        | Framework::Django
+        | Framework::Streamlit
+        | Framework::Gradio => RuntimeType::Python,
         Framework::StaticWeb => RuntimeType::Static,
         Framework::Unknown => RuntimeType::Unknown,
     }
@@ -2891,6 +3012,10 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     let go_mod = root.join("go.mod");
     let requirements = root.join("requirements.txt");
     let pyproject = root.join("pyproject.toml");
+    let pipfile = root.join("Pipfile");
+    let pipfile_lock = root.join("Pipfile.lock");
+    let poetry_lock = root.join("poetry.lock");
+    let uv_lock = root.join("uv.lock");
 
     if package_json.exists() {
         dependency_files.push(package_json.clone());
@@ -2907,6 +3032,18 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     if pyproject.exists() {
         dependency_files.push(pyproject.clone());
     }
+    if pipfile.exists() {
+        dependency_files.push(pipfile.clone());
+    }
+    if pipfile_lock.exists() {
+        dependency_files.push(pipfile_lock.clone());
+    }
+    if poetry_lock.exists() {
+        dependency_files.push(poetry_lock.clone());
+    }
+    if uv_lock.exists() {
+        dependency_files.push(uv_lock.clone());
+    }
 
     let (framework, language, package_content) = infer_framework_and_language(root);
 
@@ -2917,16 +3054,31 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     }
 
     let scripts = parse_package_scripts(&package_content);
-    let package_manager = if root.join("pnpm-lock.yaml").exists() {
+    let pyproject_content = fs::read_to_string(&pyproject).unwrap_or_default();
+    let package_manager = if root.join("pnpm-lock.yaml").exists()
+        || package_manager_declares(&package_content, "pnpm")
+    {
         Some("pnpm".to_string())
-    } else if root.join("yarn.lock").exists() {
+    } else if root.join("yarn.lock").exists() || package_manager_declares(&package_content, "yarn")
+    {
         Some("yarn".to_string())
+    } else if root.join("bun.lockb").exists()
+        || root.join("bun.lock").exists()
+        || package_manager_declares(&package_content, "bun")
+    {
+        Some("bun".to_string())
     } else if package_json.exists() {
         Some("npm".to_string())
     } else if cargo_toml.exists() {
         Some("cargo".to_string())
     } else if go_mod.exists() {
         Some("go".to_string())
+    } else if poetry_lock.exists() || pyproject_content.contains("[tool.poetry]") {
+        Some("poetry".to_string())
+    } else if uv_lock.exists() || pyproject_content.contains("[tool.uv]") {
+        Some("uv".to_string())
+    } else if pipfile.exists() || pipfile_lock.exists() {
+        Some("pipenv".to_string())
     } else if requirements.exists() || pyproject.exists() {
         Some("pip".to_string())
     } else {
@@ -2939,10 +3091,37 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         | Framework::React
         | Framework::Vue
         | Framework::Svelte
-        | Framework::NextJs => vec!["node".to_string(), "npm".to_string()],
-        Framework::Rust => vec!["cargo".to_string()],
-        Framework::Go => vec!["go".to_string()],
-        Framework::Python => vec!["python".to_string(), "pip".to_string()],
+        | Framework::SvelteKit
+        | Framework::NextJs
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Express
+        | Framework::NestJs => vec![
+            "node".to_string(),
+            package_manager
+                .clone()
+                .unwrap_or_else(|| "npm".to_string()),
+        ],
+        Framework::Rust
+        | Framework::Axum
+        | Framework::Actix
+        | Framework::Rocket
+        | Framework::Leptos => vec!["cargo".to_string()],
+        Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => {
+            vec!["go".to_string()]
+        }
+        Framework::Python
+        | Framework::Flask
+        | Framework::FastApi
+        | Framework::Django
+        | Framework::Streamlit
+        | Framework::Gradio => vec![
+            "python".to_string(),
+            package_manager
+                .clone()
+                .unwrap_or_else(|| "pip".to_string()),
+        ],
         Framework::StaticWeb => vec!["serve".to_string()],
         Framework::Unknown => vec![],
     };
@@ -2999,6 +3178,7 @@ impl BuildPlanner {
                 match package_manager {
                     "pnpm" => format!("pnpm run {name}"),
                     "yarn" => format!("yarn {name}"),
+                    "bun" => format!("bun run {name}"),
                     _ => format!("npm run {name}"),
                 }
             } else {
@@ -3009,31 +3189,80 @@ impl BuildPlanner {
         let js_install = match package_manager {
             "pnpm" => "pnpm install --frozen-lockfile".to_string(),
             "yarn" => "yarn install --frozen-lockfile".to_string(),
+            "bun" => "bun install --frozen-lockfile".to_string(),
             _ => "npm ci".to_string(),
         };
         let js_build_fallback = match package_manager {
             "pnpm" => "pnpm run build".to_string(),
             "yarn" => "yarn build".to_string(),
+            "bun" => "bun run build".to_string(),
             _ => "npm run build".to_string(),
         };
         let js_dev_fallback = match package_manager {
             "pnpm" => "pnpm run dev -- --host 0.0.0.0".to_string(),
             "yarn" => "yarn dev --host 0.0.0.0".to_string(),
+            "bun" => "bun run dev -- --host 0.0.0.0".to_string(),
             _ => "npm run dev -- --host 0.0.0.0".to_string(),
         };
         let js_test_fallback = match package_manager {
             "pnpm" => "pnpm run test".to_string(),
             "yarn" => "yarn test".to_string(),
+            "bun" => "bun test".to_string(),
             _ => "npm test".to_string(),
+        };
+        let py_install = match package_manager {
+            "poetry" => "poetry install".to_string(),
+            "uv" => "uv sync".to_string(),
+            "pipenv" => "pipenv install --dev".to_string(),
+            _ => "python -m pip install -r requirements.txt".to_string(),
+        };
+        let py_test = match package_manager {
+            "poetry" => "poetry run pytest".to_string(),
+            "uv" => "uv run pytest".to_string(),
+            "pipenv" => "pipenv run pytest".to_string(),
+            _ => "python -m pytest".to_string(),
+        };
+        let fastapi_app_path = if analysis.root.join("main.py").exists() {
+            "main:app"
+        } else if analysis.root.join("app.py").exists() {
+            "app:app"
+        } else {
+            "main:app"
+        };
+        let streamlit_entry = if analysis.root.join("streamlit_app.py").exists() {
+            "streamlit_app.py"
+        } else if analysis.root.join("main.py").exists() {
+            "main.py"
+        } else {
+            "app.py"
+        };
+        let py_dev = match framework {
+            Framework::FastApi => {
+                format!("uvicorn {fastapi_app_path} --host 0.0.0.0 --port 8000")
+            }
+            Framework::Django => "python manage.py runserver 0.0.0.0:8000".to_string(),
+            Framework::Flask => "flask run --host 0.0.0.0 --port 8000".to_string(),
+            Framework::Streamlit => {
+                format!(
+                    "streamlit run {streamlit_entry} --server.address 0.0.0.0 --server.port 8501"
+                )
+            }
+            _ => "python -m app".to_string(),
         };
 
         match framework {
             Framework::React
             | Framework::Vue
             | Framework::Svelte
+            | Framework::SvelteKit
             | Framework::Vite
             | Framework::Node
-            | Framework::NextJs => {
+            | Framework::NextJs
+            | Framework::Nuxt
+            | Framework::Astro
+            | Framework::Remix
+            | Framework::Express
+            | Framework::NestJs => {
                 let install = ExecutionNode {
                     id: "install".to_string(),
                     node_type: ExecutionNodeType::InstallDependencies,
@@ -3095,7 +3324,11 @@ impl BuildPlanner {
                     ],
                 }
             }
-            Framework::Rust => ExecutionGraph {
+            Framework::Rust
+            | Framework::Axum
+            | Framework::Actix
+            | Framework::Rocket
+            | Framework::Leptos => ExecutionGraph {
                 nodes: vec![
                     ExecutionNode {
                         id: "build".to_string(),
@@ -3136,7 +3369,8 @@ impl BuildPlanner {
                     },
                 ],
             },
-            Framework::Go => ExecutionGraph {
+            Framework::Go | Framework::Gin | Framework::Fiber | Framework::Echo => {
+                ExecutionGraph {
                 nodes: vec![
                     ExecutionNode {
                         id: "build".to_string(),
@@ -3176,13 +3410,19 @@ impl BuildPlanner {
                         to: "test".to_string(),
                     },
                 ],
-            },
-            Framework::Python => ExecutionGraph {
+            }
+            }
+            Framework::Python
+            | Framework::Flask
+            | Framework::FastApi
+            | Framework::Django
+            | Framework::Streamlit
+            | Framework::Gradio => ExecutionGraph {
                 nodes: vec![
                     ExecutionNode {
                         id: "install".to_string(),
                         node_type: ExecutionNodeType::InstallDependencies,
-                        command: Some("python -m pip install -r requirements.txt".to_string()),
+                        command: Some(py_install),
                         execution_mode: ExecutionMode::Native,
                         inputs: vec!["requirements.txt|pyproject.toml".to_string()],
                         outputs: vec!["site-packages".to_string()],
@@ -3191,7 +3431,7 @@ impl BuildPlanner {
                     ExecutionNode {
                         id: "dev".to_string(),
                         node_type: ExecutionNodeType::DevServer,
-                        command: Some("python -m app".to_string()),
+                        command: Some(py_dev),
                         execution_mode: ExecutionMode::Native,
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["http://0.0.0.0:8000/".to_string()],
@@ -3200,7 +3440,7 @@ impl BuildPlanner {
                     ExecutionNode {
                         id: "test".to_string(),
                         node_type: ExecutionNodeType::Test,
-                        command: Some("python -m pytest".to_string()),
+                        command: Some(py_test),
                         execution_mode: ExecutionMode::Hybrid,
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["test-report".to_string()],
@@ -3473,7 +3713,13 @@ impl ExecutionProvider for NodeRuntimeProvider {
                 | Framework::React
                 | Framework::Vue
                 | Framework::Svelte
+                | Framework::SvelteKit
                 | Framework::NextJs
+                | Framework::Nuxt
+                | Framework::Astro
+                | Framework::Remix
+                | Framework::Express
+                | Framework::NestJs
         )
     }
 
@@ -3509,7 +3755,14 @@ impl ExecutionProvider for RustRuntimeProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        ctx.analysis.framework == Framework::Rust
+        matches!(
+            ctx.analysis.framework,
+            Framework::Rust
+                | Framework::Axum
+                | Framework::Actix
+                | Framework::Rocket
+                | Framework::Leptos
+        )
     }
 
     fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
@@ -3774,22 +4027,53 @@ fn hash_bytes(input: &[u8]) -> String {
 
 fn ports_for_framework(framework: Framework) -> Vec<PortInfo> {
     match framework {
+        Framework::Vite => vec![PortInfo {
+            port: 5173,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
         Framework::Node
-        | Framework::Vite
         | Framework::React
         | Framework::Vue
         | Framework::Svelte
-        | Framework::NextJs => vec![PortInfo {
+        | Framework::SvelteKit
+        | Framework::NextJs
+        | Framework::Nuxt
+        | Framework::Astro
+        | Framework::Remix
+        | Framework::Express
+        | Framework::NestJs => vec![PortInfo {
             port: 3000,
             protocol: "http".to_string(),
             route: "/".to_string(),
         }],
-        Framework::Rust | Framework::Go => vec![PortInfo {
+        Framework::Rust
+        | Framework::Axum
+        | Framework::Actix
+        | Framework::Rocket
+        | Framework::Leptos
+        | Framework::Go
+        | Framework::Gin
+        | Framework::Fiber
+        | Framework::Echo => vec![PortInfo {
             port: 8080,
             protocol: "http".to_string(),
             route: "/".to_string(),
         }],
-        Framework::Python => vec![PortInfo {
+        Framework::Streamlit => vec![PortInfo {
+            port: 8501,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::Gradio => vec![PortInfo {
+            port: 7860,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        }],
+        Framework::Python
+        | Framework::Flask
+        | Framework::FastApi
+        | Framework::Django => vec![PortInfo {
             port: 8000,
             protocol: "http".to_string(),
             route: "/".to_string(),
@@ -3831,6 +4115,35 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
 fn package_mentions_dependency(content: &str, dependency: &str) -> bool {
     dependency_in_object(content, "dependencies", dependency)
         || dependency_in_object(content, "devDependencies", dependency)
+}
+
+fn text_mentions_dependency(content: &str, dependency: &str) -> bool {
+    let haystack = content.to_ascii_lowercase();
+    let needle = dependency.to_ascii_lowercase();
+    if haystack.is_empty() || needle.is_empty() {
+        return false;
+    }
+
+    let is_token_char = |byte: u8| byte.is_ascii_alphanumeric() || b"-_./@".contains(&byte);
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > haystack_bytes.len() {
+        return false;
+    }
+
+    for start in 0..=(haystack_bytes.len() - needle_bytes.len()) {
+        if &haystack_bytes[start..start + needle_bytes.len()] != needle_bytes {
+            continue;
+        }
+        let left_ok = start == 0 || !is_token_char(haystack_bytes[start - 1]);
+        let right_index = start + needle_bytes.len();
+        let right_ok = right_index == haystack_bytes.len() || !is_token_char(haystack_bytes[right_index]);
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Extracts an object block by key and checks whether it contains a quoted dependency key.
@@ -3889,6 +4202,18 @@ fn parse_package_scripts(content: &str) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn package_manager_declares(content: &str, package_manager: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    let compact: String = content
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    compact.contains(&format!("\"packagemanager\":\"{}@", package_manager))
 }
 
 fn collect_files(
@@ -4008,6 +4333,64 @@ mod tests {
     }
 
     #[test]
+    fn detects_nuxt_framework_from_package_json() {
+        let repo = temp_dir("nuxt-detect");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"nuxt":"3.0.0"}}"#,
+        )
+        .expect("write package.json");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::Nuxt);
+        assert_eq!(analysis.language, Language::JavaScript);
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("npm run dev -- --host 0.0.0.0")
+        );
+    }
+
+    #[test]
+    fn detects_axum_framework_from_cargo_toml() {
+        let repo = temp_dir("axum-detect");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='axum-app'\nversion='0.1.0'\n[dependencies]\naxum='0.7'\n",
+        )
+        .expect("write Cargo.toml");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::Axum);
+        assert_eq!(analysis.language, Language::Rust);
+        assert_eq!(analysis.build_intelligence.entrypoints, vec!["http://0.0.0.0:8080/"]);
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("cargo run")
+        );
+    }
+
+    #[test]
+    fn detects_fastapi_framework_with_uv_package_manager() {
+        let repo = temp_dir("fastapi-detect");
+        fs::write(repo.join("requirements.txt"), "fastapi==0.115.0\n").expect("write requirements");
+        fs::write(repo.join("app.py"), "from fastapi import FastAPI\napp = FastAPI()\n")
+            .expect("write app.py");
+        fs::write(repo.join("uv.lock"), "version = 1").expect("write uv lock");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::FastApi);
+        assert_eq!(analysis.language, Language::Python);
+        assert_eq!(
+            analysis.build_intelligence.package_manager.as_deref(),
+            Some("uv")
+        );
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("uvicorn app:app --host 0.0.0.0 --port 8000")
+        );
+    }
+
+    #[test]
     fn js_graph_contains_deterministic_dependencies() {
         let repo = temp_dir("js-graph");
         fs::write(
@@ -4105,6 +4488,54 @@ mod tests {
                 .and_then(|node| node.command.as_deref()),
             Some("pnpm run build")
         );
+    }
+
+    #[test]
+    fn js_graph_uses_bun_commands_when_bun_lockfile_exists() {
+        let repo = temp_dir("js-bun-graph");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"vite":"5.0.0"},"scripts":{"dev":"vite"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(repo.join("bun.lockb"), "bun-lock").expect("write bun lockfile");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let graph = &analysis.execution_graph;
+        assert_eq!(
+            analysis.build_intelligence.package_manager.as_deref(),
+            Some("bun")
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "install")
+                .and_then(|node| node.command.as_deref()),
+            Some("bun install --frozen-lockfile")
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "dev")
+                .and_then(|node| node.command.as_deref()),
+            Some("bun run dev")
+        );
+    }
+
+    #[test]
+    fn vite_framework_uses_vite_default_port() {
+        let repo = temp_dir("vite-port");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"vite":"5.0.0"}}"#,
+        )
+        .expect("write package.json");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::Vite);
+        assert_eq!(analysis.build_intelligence.entrypoints, vec!["http://0.0.0.0:5173/"]);
     }
 
     #[test]
