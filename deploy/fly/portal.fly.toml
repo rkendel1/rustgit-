@@ -1,0 +1,12 @@
+app = "trythissoftware-portal"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NEXT_PUBLIC_API_URL = "https://api.trythissoftware.com"
+  NEXT_PUBLIC_BASE_DOMAIN = "trythissoftware.com"
+
+[http_service]
+  internal_port = 3000
+  force_https = true

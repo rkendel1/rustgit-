@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "DDockit",
+  "name": "TryThisSoftware",
   "version": "1.0.0",
-  "description": "Run GitHub repositories instantly with DDockit",
+  "description": "Run GitHub repositories instantly with TryThisSoftware",
   "permissions": [
     "storage",
     "activeTab",
@@ -13,7 +13,7 @@
   "host_permissions": [
     "https://github.com/*",
     "https://api.github.com/*",
-    "https://*.ddockit.dev/*"
+    "https://*.trythissoftware.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js"

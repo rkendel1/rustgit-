@@ -1,0 +1,11 @@
+app = "trythissoftware-workspaces"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BASE_DOMAIN = "trythissoftware.com"
+
+[http_service]
+  internal_port = 8080
+  force_https = true

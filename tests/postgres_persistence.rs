@@ -87,7 +87,7 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
     })?;
 
     store.insert_url_allocation(&EidbUrlAllocationRecord {
-        workspace_url: "https://workspace-1.ddockit.dev".to_string(),
+        workspace_url: "https://workspace-1.trythissoftware.com".to_string(),
         execution_id: "exec-1".to_string(),
         created_at: 11,
         released_at: None,
@@ -116,7 +116,7 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
         execution_history_endpoint_with_store("exec-1", &store)?;
     assert_eq!(execution_history_path, "/executions/exec-1/history");
     assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
-    assert!(execution_history_body.contains("workspace-1.ddockit.dev"));
+    assert!(execution_history_body.contains("workspace-1.trythissoftware.com"));
 
     let (healing_path, healing_body) = repository_healing_history_endpoint_with_store("repo-eidb", &store)?;
     assert_eq!(healing_path, "/repositories/repo-eidb/healing");

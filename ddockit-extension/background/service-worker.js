@@ -1,7 +1,7 @@
-const API_BASE_URL = "https://api.ddockit.dev";
+const API_BASE_URL = "https://api.trythissoftware.com";
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log("DDockit installed");
+  console.log("TryThisSoftware extension installed");
 });
 
 chrome.action.onClicked.addListener(async (tab) => {
@@ -67,7 +67,7 @@ async function launchRepository(payload) {
   });
 
   if (!response.ok) {
-    throw new Error(`DDockit launch failed (${response.status})`);
+    throw new Error(`TryThisSoftware launch failed (${response.status})`);
   }
 
   const data = await response.json();
@@ -76,7 +76,7 @@ async function launchRepository(payload) {
     await chrome.notifications.create({
       type: "basic",
       iconUrl: "assets/icon128.png",
-      title: "DDockit run started",
+      title: "TryThisSoftware run started",
       message: `Workspace ready: ${data.workspace_url}`
     });
   }

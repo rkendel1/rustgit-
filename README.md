@@ -15,10 +15,10 @@ A Rust foundation for a Gitpod-compatible WebAssembly workspace runtime.
 
 ## Dual Surface Experience (DSE)
 
-DDockit is modeled as one product with two entry surfaces:
+TryThisSoftware is modeled as one product with two entry surfaces:
 
 - **GitHub Overlay Extension** (activation surface): discover repositories on GitHub and launch runs quickly.
-- **DDockit Portal** (management surface): monitor workspaces, executions, logs, URLs, and agents.
+- **TryThisSoftware Portal** (management surface): monitor workspaces, executions, logs, URLs, and agents.
 
 Both surfaces route through the same backend primitives:
 
@@ -28,7 +28,7 @@ Both surfaces route through the same backend primitives:
 
 Surface UI contracts are rendered through a shared Surface Rendering System (SRS):
 
-- Shared DDockit design system component model
+- Shared TryThisSoftware design system component model
 - Shared component registry for contract-to-component mapping
 - Unified renderer output for Portal shell and GitHub overlay shell
 
@@ -57,6 +57,27 @@ Migrations are stored in `./migrations`:
 
 - `DATABASE_URL` (required for runtime Postgres initialization)
 - `RUSTGIT_EIDB_TEST_DATABASE_URL` (optional, used by integration tests in `tests/postgres_persistence.rs`)
+
+## Production deployment and domain mapping
+
+The production domain hierarchy is now unified under `trythissoftware.com`:
+
+- Portal: `https://trythissoftware.com`
+- API / extension backend: `https://api.trythissoftware.com`
+- Workspace runtime: `https://workspace-{id}.trythissoftware.com`
+
+Fly.io app configs are checked in under `deploy/fly/`:
+
+- `api.fly.toml` (`trythissoftware-api`)
+- `portal.fly.toml` (`trythissoftware-portal`)
+- `workspaces.fly.toml` (`trythissoftware-workspaces`)
+
+Required runtime environment variables:
+
+- API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`
+- Portal: `NEXT_PUBLIC_API_URL=https://api.trythissoftware.com`, `NEXT_PUBLIC_BASE_DOMAIN=trythissoftware.com`
+
+Store API credentials/secrets (`DATABASE_URL`, `REDIS_URL`, GitHub OAuth secrets, `JWT_SECRET`) as Fly secrets (`fly secrets set ...`) instead of committing them to Fly config files.
 
 ### Local initialization example
 

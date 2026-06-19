@@ -14,11 +14,11 @@ function ensureButton() {
   button.id = BUTTON_ID;
   button.type = "button";
   button.className = "ddockit-button";
-  button.textContent = "Run with DDockit";
+  button.textContent = "Run with TryThisSoftware";
   button.addEventListener("click", async () => {
     const payload = window.__ddockitRepositoryContext;
     if (!payload?.owner || !payload?.repo) {
-      console.warn("DDockit repository context unavailable on this page.");
+      console.warn("TryThisSoftware repository context unavailable on this page.");
       return;
     }
     await chrome.runtime.sendMessage({ type: "DDOCKIT_OPEN_SIDEPANEL" });

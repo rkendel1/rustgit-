@@ -1,4 +1,4 @@
-const API_BASE_URL = "https://api.ddockit.dev";
+const API_BASE_URL = "https://api.trythissoftware.com";
 
 export async function launchExecution(payload) {
   const response = await fetch(`${API_BASE_URL}/api/v1/executions`, {
@@ -10,7 +10,7 @@ export async function launchExecution(payload) {
   });
 
   if (!response.ok) {
-    throw new Error(`DDockit API error: ${response.status}`);
+    throw new Error(`TryThisSoftware API error: ${response.status}`);
   }
 
   return response.json();

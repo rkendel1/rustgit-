@@ -36,7 +36,7 @@ const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
-const CJVF_CANONICAL_HOST: &str = "app.ddockit.dev";
+const CJVF_CANONICAL_HOST: &str = "trythissoftware.com";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 const LOCAL_AGENT_LOCK_POISONED: &str =
@@ -3266,7 +3266,7 @@ impl DistributedExecutionAgent {
             .strip_prefix("workspace-")
             .unwrap_or(workspace_id);
         let sanitized = ExecutionRouter::sanitized_workspace_id(normalized_workspace_id);
-        format!("https://workspace-{sanitized}.ddockit.dev")
+        format!("https://workspace-{sanitized}.trythissoftware.com")
     }
 }
 
@@ -4164,7 +4164,7 @@ pub struct ExecutionIdentity {
 
 impl ExecutionIdentity {
     pub fn canonical_url_for(execution_id: &str) -> ExecutionUrl {
-        format!("https://app.ddockit.dev/e/{execution_id}")
+        format!("https://trythissoftware.com/e/{execution_id}")
     }
 }
 
@@ -4217,11 +4217,11 @@ pub struct WorkspaceUrl(pub String);
 
 impl WorkspaceUrl {
     pub fn wildcard(workspace_id: &str) -> Self {
-        Self(format!("workspace-{workspace_id}.ddockit.app"))
+        Self(format!("workspace-{workspace_id}.trythissoftware.com"))
     }
 
     pub fn path(workspace_id: &str) -> Self {
-        Self(format!("ddockit.app/w/{workspace_id}"))
+        Self(format!("trythissoftware.com/w/{workspace_id}"))
     }
 }
 
@@ -5122,7 +5122,7 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
         json!({
             "execution_id": execution_id,
             "status": "starting",
-            "workspace_url": format!("https://workspace-{workspace_slug}.ddockit.dev")
+            "workspace_url": format!("https://workspace-{workspace_slug}.trythissoftware.com")
         })
         .to_string(),
     )
@@ -11286,22 +11286,22 @@ fn current_unix_epoch_secs() -> u64 {
 fn parse_workspace_id(request_target: &str) -> Option<String> {
     if let Some(id) = request_target
         .strip_prefix("workspace-")
-        .and_then(|value| value.strip_suffix(".ddockit.app"))
+        .and_then(|value| value.strip_suffix(".trythissoftware.com"))
     {
         return Some(id.to_string());
     }
 
     request_target
-        .strip_prefix("ddockit.app/w/")
+        .strip_prefix("trythissoftware.com/w/")
         .or_else(|| request_target.strip_prefix("/w/"))
         .map(|id| id.to_string())
 }
 
 fn parse_execution_id(request_target: &str) -> Option<String> {
     let raw = request_target
-        .strip_prefix("https://app.ddockit.dev/e/")
-        .or_else(|| request_target.strip_prefix("http://app.ddockit.dev/e/"))
-        .or_else(|| request_target.strip_prefix("app.ddockit.dev/e/"))
+        .strip_prefix("https://trythissoftware.com/e/")
+        .or_else(|| request_target.strip_prefix("http://trythissoftware.com/e/"))
+        .or_else(|| request_target.strip_prefix("trythissoftware.com/e/"))
         .or_else(|| request_target.strip_prefix("/e/"))
         .or_else(|| request_target.strip_prefix("e/"))?;
     let normalized = raw.split(['?', '#']).next()?.trim_matches('/').to_string();
@@ -12619,7 +12619,7 @@ dependencies:
         );
         assert_eq!(
             selection.trace_url,
-            "https://app.ddockit.dev/e/ws-router-preferred"
+            "https://trythissoftware.com/e/ws-router-preferred"
         );
     }
 
@@ -12681,7 +12681,7 @@ dependencies:
         );
         assert_eq!(
             handle.trace_url.as_deref(),
-            Some("https://app.ddockit.dev/e/ws-router-fallback")
+            Some("https://trythissoftware.com/e/ws-router-fallback")
         );
     }
 
@@ -13390,7 +13390,7 @@ dependencies:
         let router = WorkspaceRouter;
 
         let route = router
-            .route_request(&registry, &proxy, "workspace-a1b2.ddockit.app")
+            .route_request(&registry, &proxy, "workspace-a1b2.trythissoftware.com")
             .expect("route for stable host should resolve");
         assert_eq!(route.worker_id, "worker-3");
         assert_eq!(route.target, "http://worker-3:3012");
@@ -13398,7 +13398,7 @@ dependencies:
             registry
                 .get("a1b2")
                 .map(|record| record.assigned_url.clone()),
-            Some(WorkspaceUrl("workspace-a1b2.ddockit.app".to_string()))
+            Some(WorkspaceUrl("workspace-a1b2.trythissoftware.com".to_string()))
         );
     }
 
@@ -13459,7 +13459,7 @@ dependencies:
         assert_eq!(heartbeat.status, AgentStatus::Idle);
         assert_eq!(
             agent.stable_workspace_url("workspace-abc"),
-            "https://workspace-abc.ddockit.dev"
+            "https://workspace-abc.trythissoftware.com"
         );
     }
 
@@ -13624,11 +13624,11 @@ dependencies:
         });
 
         let route = gateway
-            .route_request("https://app.ddockit.dev/e/abc123", None)
+            .route_request("https://trythissoftware.com/e/abc123", None)
             .expect("canonical route should resolve");
         assert_eq!(route.execution_id, "abc123");
         assert_eq!(route.runtime_url, "http://worker-a:3000");
-        assert_eq!(route.canonical_url, "https://app.ddockit.dev/e/abc123");
+        assert_eq!(route.canonical_url, "https://trythissoftware.com/e/abc123");
         assert_eq!(route.tier, ExecutionTier::LocalMachine);
     }
 
@@ -13654,22 +13654,22 @@ dependencies:
             &mut trace,
             "exec-42",
             ExecutionTier::DDockitCloud,
-            "https://cloud.ddockit.dev/runtime/42",
+            "https://cloud.trythissoftware.com/runtime/42",
         );
         assert!(rebound);
 
         let identity = resolver
             .get("exec-42")
             .expect("identity should remain bound");
-        assert_eq!(identity.canonical_url, "https://app.ddockit.dev/e/exec-42");
-        assert_eq!(identity.current_url, "https://cloud.ddockit.dev/runtime/42");
+        assert_eq!(identity.canonical_url, "https://trythissoftware.com/e/exec-42");
+        assert_eq!(identity.current_url, "https://cloud.trythissoftware.com/runtime/42");
         assert_eq!(identity.current_tier, ExecutionTier::DDockitCloud);
         assert!(trace.events.contains(&TraceEvent::ExecutionMigrated {
             from: ExecutionTier::LocalMachine,
             to: ExecutionTier::DDockitCloud
         }));
         assert!(trace.events.contains(&TraceEvent::UrlRebound {
-            new_endpoint: "https://cloud.ddockit.dev/runtime/42".to_string()
+            new_endpoint: "https://cloud.trythissoftware.com/runtime/42".to_string()
         }));
     }
 
@@ -13692,7 +13692,7 @@ dependencies:
         });
 
         let route = gateway
-            .route_request("https://app.ddockit.dev/e/exec-affinity", Some("session-7"))
+            .route_request("https://trythissoftware.com/e/exec-affinity", Some("session-7"))
             .expect("session-bound canonical route should resolve");
         assert_eq!(route.runtime_url, "http://worker-affinity:3010");
         assert_eq!(
@@ -13700,7 +13700,7 @@ dependencies:
             Some("RustRuntimeProvider")
         );
         assert!(gateway
-            .route_request("https://app.ddockit.dev/e/other-exec", Some("session-7"))
+            .route_request("https://trythissoftware.com/e/other-exec", Some("session-7"))
             .is_none());
     }
 
@@ -14646,7 +14646,7 @@ services:
             created_at: 12,
         });
         database.record_url_allocation(EidbUrlAllocationRecord {
-            workspace_url: "https://workspace-1.ddockit.dev".to_string(),
+            workspace_url: "https://workspace-1.trythissoftware.com".to_string(),
             execution_id: "exec-1".to_string(),
             created_at: 11,
             released_at: None,
@@ -14667,7 +14667,7 @@ services:
             execution_history_endpoint("exec-1", &database);
         assert_eq!(execution_history_path, "/executions/exec-1/history");
         assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
-        assert!(execution_history_body.contains("workspace-1.ddockit.dev"));
+        assert!(execution_history_body.contains("workspace-1.trythissoftware.com"));
 
         let (healing_path, healing_body) =
             repository_healing_history_endpoint("repo-eidb", &database);

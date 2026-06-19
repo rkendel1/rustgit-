@@ -8,5 +8,5 @@ chrome.storage.local.get(["ddockitAuth", "ddockitDeaConnected"], (state) => {
 });
 
 openPortalButton.addEventListener("click", () => {
-  chrome.tabs.create({ url: "https://portal.ddockit.dev" });
+  chrome.tabs.create({ url: "https://trythissoftware.com" });
 });
