@@ -10,7 +10,7 @@
 - ArtifactStore is checked for existing outputs
 - CacheKeyEngine computes node keys
 - ExecutionGraph is generated via BuildPlanner
-- ExecutionProvider is selected via can_handle()
+- ExecutionRouter selects runtime ownership
 - Provider executes node
 - RepositoryAnalysis is produced by repository analyzer
 - Result is stored in ArtifactStore
