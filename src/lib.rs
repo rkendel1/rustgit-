@@ -28,6 +28,8 @@ const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
+const EXECUTION_IMAGE_VERSION: &str = "v1";
+const UNKNOWN_SIGNATURE: &str = "unknown";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 const LOCAL_AGENT_LOCK_POISONED: &str =
@@ -157,6 +159,278 @@ pub struct RepositoryFingerprint {
     pub dependency_hash: Option<String>,
     pub language_signature: String,
     pub framework_signature: Option<String>,
+}
+
+pub type LanguageKind = Language;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionImage {
+    pub image_id: String,
+    pub runtime: RuntimeKind,
+    pub language: LanguageKind,
+    pub framework: Option<String>,
+    pub version: String,
+    pub base_layers: Vec<String>,
+    pub preinstalled_dependencies: bool,
+    pub cache_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionImageMatch {
+    pub image: ExecutionImage,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionImageRegistry {
+    images: HashMap<String, ExecutionImage>,
+    repo_image_bindings: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionMatchEngine;
+
+impl ExecutionMatchEngine {
+    pub fn match_repository(fingerprint: &RepositoryFingerprint) -> ExecutionImageMatch {
+        let framework = fingerprint
+            .framework_signature
+            .as_deref()
+            .unwrap_or(UNKNOWN_SIGNATURE)
+            .to_ascii_lowercase();
+        let language = fingerprint.language_signature.to_ascii_lowercase();
+
+        let (runtime, confidence) = if framework.contains("nextjs") {
+            (RuntimeType::Node, 97)
+        } else if framework.contains("fastapi") {
+            (RuntimeType::Python, 95)
+        } else if framework.contains("django") {
+            (RuntimeType::Python, 93)
+        } else if framework.contains("rust") {
+            (RuntimeType::Rust, 94)
+        } else if framework.contains("vite") || framework.contains("react") {
+            (RuntimeType::Node, 92)
+        } else if language.contains("rust") {
+            (RuntimeType::Rust, 90)
+        } else if language.contains("python") {
+            (RuntimeType::Python, 89)
+        } else if language.contains("javascript") || language.contains("typescript") {
+            (RuntimeType::Node, 88)
+        } else {
+            (RuntimeType::Unknown, 40)
+        };
+
+        let image_id = format!(
+            "{}-{}-warm-v1",
+            runtime_type_to_agent_label(runtime),
+            framework_tag(&framework)
+        );
+        let version = EXECUTION_IMAGE_VERSION.to_string();
+        let cache_key = hash_key(&format!(
+            "{}:{}:{}:{}",
+            image_id, fingerprint.repo_hash, fingerprint.language_signature, version
+        ));
+        let base_layers = vec![
+            format!("runtime:{}", runtime_type_to_agent_label(runtime)),
+            format!("language:{}", language_tag(&language)),
+            format!("framework:{}", framework_tag(&framework)),
+        ];
+
+        ExecutionImageMatch {
+            image: ExecutionImage {
+                image_id,
+                runtime,
+                language: language_kind_from_signature(&language),
+                framework: (framework != UNKNOWN_SIGNATURE).then_some(framework),
+                version,
+                base_layers,
+                preinstalled_dependencies: true,
+                cache_key,
+            },
+            confidence,
+        }
+    }
+}
+
+impl ExecutionImageRegistry {
+    pub fn register_image(&mut self, image: ExecutionImage) {
+        self.images.insert(image.image_id.clone(), image);
+    }
+
+    pub fn image_for_repo(&self, repo_id: &str) -> Option<&ExecutionImage> {
+        let image_id = self.repo_image_bindings.get(repo_id)?;
+        self.images.get(image_id)
+    }
+
+    pub fn get(&self, image_id: &str) -> Option<&ExecutionImage> {
+        self.images.get(image_id)
+    }
+
+    pub fn resolve_for_fingerprint(
+        &mut self,
+        repo_id: &str,
+        fingerprint: &RepositoryFingerprint,
+    ) -> ExecutionImageMatch {
+        if let Some(image) = self.image_for_repo(repo_id).cloned() {
+            return ExecutionImageMatch {
+                image,
+                confidence: 100,
+            };
+        }
+
+        let matched = ExecutionMatchEngine::match_repository(fingerprint);
+        self.register_image(matched.image.clone());
+        self.repo_image_bindings
+            .insert(repo_id.to_string(), matched.image.image_id.clone());
+        matched
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmContainerState {
+    Cold,
+    Warming,
+    WarmIdle,
+    Assigned,
+    Running,
+    ReturnedToPool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmPoolType {
+    Cloud,
+    LocalDea,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCacheLayer {
+    pub cache_key: String,
+    pub image_id: String,
+    pub fingerprint_hash: String,
+    pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmPoolEntry {
+    pub image_id: String,
+    pub pool_type: WarmPoolType,
+    pub warm_count: u32,
+    pub idle_count: u32,
+    pub assigned_count: u32,
+    pub state: WarmContainerState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WarmPoolStatus {
+    pub total_images: usize,
+    pub warm_containers: u32,
+    pub idle_containers: u32,
+    pub assigned_containers: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WarmPoolManager {
+    pools: HashMap<String, WarmPoolEntry>,
+    caches: HashMap<String, ExecutionCacheLayer>,
+}
+
+impl WarmPoolManager {
+    pub fn prewarm(&mut self, image: &ExecutionImage, pool_type: WarmPoolType, count: u32) {
+        let entry = self
+            .pools
+            .entry(image.image_id.clone())
+            .or_insert_with(|| WarmPoolEntry {
+                image_id: image.image_id.clone(),
+                pool_type,
+                warm_count: 0,
+                idle_count: 0,
+                assigned_count: 0,
+                state: WarmContainerState::Cold,
+            });
+        entry.pool_type = pool_type;
+        entry.warm_count = entry.warm_count.saturating_add(count);
+        entry.idle_count = entry.idle_count.saturating_add(count);
+        entry.state = WarmContainerState::WarmIdle;
+    }
+
+    pub fn allocate(&mut self, image_id: &str) -> bool {
+        let Some(entry) = self.pools.get_mut(image_id) else {
+            return false;
+        };
+        if entry.idle_count == 0 {
+            return false;
+        }
+        entry.idle_count -= 1;
+        entry.assigned_count = entry.assigned_count.saturating_add(1);
+        entry.state = WarmContainerState::Assigned;
+        true
+    }
+
+    pub fn mark_running(&mut self, image_id: &str) -> bool {
+        let Some(entry) = self.pools.get_mut(image_id) else {
+            return false;
+        };
+        if entry.assigned_count == 0 {
+            return false;
+        }
+        entry.state = WarmContainerState::Running;
+        true
+    }
+
+    pub fn release(&mut self, image_id: &str) -> bool {
+        let Some(entry) = self.pools.get_mut(image_id) else {
+            return false;
+        };
+        if entry.assigned_count == 0 {
+            return false;
+        }
+        entry.assigned_count -= 1;
+        entry.idle_count = entry.idle_count.saturating_add(1);
+        entry.state = WarmContainerState::ReturnedToPool;
+        true
+    }
+
+    pub fn bind_cache_layer(
+        &mut self,
+        fingerprint: &RepositoryFingerprint,
+        image: &ExecutionImage,
+    ) {
+        let key = warm_cache_binding_key(&fingerprint.repo_hash, &image.image_id);
+        self.caches
+            .entry(key.clone())
+            .or_insert(ExecutionCacheLayer {
+                cache_key: key,
+                image_id: image.image_id.clone(),
+                fingerprint_hash: fingerprint.repo_hash.clone(),
+                artifacts: cache_artifacts_for_image(image),
+            });
+    }
+
+    pub fn status(&self) -> WarmPoolStatus {
+        let mut status = WarmPoolStatus::default();
+        status.total_images = self.pools.len();
+        for entry in self.pools.values() {
+            status.warm_containers = status.warm_containers.saturating_add(entry.warm_count);
+            status.idle_containers = status.idle_containers.saturating_add(entry.idle_count);
+            status.assigned_containers = status
+                .assigned_containers
+                .saturating_add(entry.assigned_count);
+        }
+        status
+    }
+
+    pub fn get(&self, image_id: &str) -> Option<&WarmPoolEntry> {
+        self.pools.get(image_id)
+    }
+
+    pub fn has_cache_layer(
+        &self,
+        fingerprint: &RepositoryFingerprint,
+        image: &ExecutionImage,
+    ) -> bool {
+        let key = warm_cache_binding_key(&fingerprint.repo_hash, &image.image_id);
+        self.caches.contains_key(&key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -615,6 +889,8 @@ pub struct ExecutionNode {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub cache_key: Option<String>,
+    pub runtime: Option<ExecutionImage>,
+    pub cache_binding: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1176,8 +1452,22 @@ impl ExecutionGraph {
 
     pub fn with_cache_keys_for(mut self, fingerprint: Option<&RepositoryFingerprint>) -> Self {
         let keys = self.compute_cache_keys_with_fingerprint(fingerprint);
+        let fingerprint_binding = fingerprint
+            .map(|entry| entry.repo_hash.as_str())
+            .unwrap_or("no-fingerprint");
         for node in &mut self.nodes {
             node.cache_key = keys.get(&node.id).cloned();
+            node.cache_binding = node
+                .cache_key
+                .as_deref()
+                .map(|key| warm_cache_binding_key(fingerprint_binding, key));
+        }
+        self
+    }
+
+    pub fn with_execution_image(mut self, image: &ExecutionImage) -> Self {
+        for node in &mut self.nodes {
+            node.runtime = Some(image.clone());
         }
         self
     }
@@ -1206,6 +1496,8 @@ pub struct RepositoryAnalysis {
     pub execution_profile: ExecutionProfile,
     pub build_intelligence: BuildIntelligence,
     pub execution_graph: ExecutionGraph,
+    pub execution_image: ExecutionImage,
+    pub image_match_confidence: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1592,12 +1884,10 @@ impl DistributedExecutionAgent {
 
     pub fn assign_execution(&mut self, signed_graph: &SignedExecutionGraph) -> Result<()> {
         if !self.verify_graph(signed_graph) {
-            return Err(RuntimeError::CommandFailed(
-                format!(
-                    "distributed execution agent `{}` rejected unsigned execution graph",
-                    self.identity.agent_id
-                ),
-            ));
+            return Err(RuntimeError::CommandFailed(format!(
+                "distributed execution agent `{}` rejected unsigned execution graph",
+                self.identity.agent_id
+            )));
         }
         self.status = AgentStatus::AssignedExecution;
         self.active_executions = self.active_executions.saturating_add(1);
@@ -2876,6 +3166,11 @@ pub struct WorkspaceMetrics {
     pub migration_count: u64,
     pub router_latency: f64,
     pub worker_utilization: f64,
+    pub warm_pool_hits: u64,
+    pub cold_start_fallbacks: u64,
+    pub image_match_confidence: f64,
+    pub cache_hit_ratio: f64,
+    pub execution_start_latency: f64,
 }
 
 impl Default for WorkspaceMetrics {
@@ -2887,6 +3182,11 @@ impl Default for WorkspaceMetrics {
             migration_count: 0,
             router_latency: 0.0,
             worker_utilization: 0.0,
+            warm_pool_hits: 0,
+            cold_start_fallbacks: 0,
+            image_match_confidence: 0.0,
+            cache_hit_ratio: 0.0,
+            execution_start_latency: 0.0,
         }
     }
 }
@@ -2894,19 +3194,80 @@ impl Default for WorkspaceMetrics {
 impl WorkspaceMetrics {
     pub fn render_prometheus(&self) -> String {
         format!(
-            "# HELP active_workspaces Number of active workspaces\n# TYPE active_workspaces gauge\nactive_workspaces {}\n# HELP failed_workspaces Number of failed workspaces\n# TYPE failed_workspaces gauge\nfailed_workspaces {}\n# HELP workspace_restarts Total workspace restarts\n# TYPE workspace_restarts counter\nworkspace_restarts {}\n# HELP migration_count Total workspace migrations\n# TYPE migration_count counter\nmigration_count {}\n# HELP router_latency Workspace router latency in milliseconds\n# TYPE router_latency gauge\nrouter_latency {}\n# HELP worker_utilization Worker utilization ratio\n# TYPE worker_utilization gauge\nworker_utilization {}\n",
+            "# HELP active_workspaces Number of active workspaces\n# TYPE active_workspaces gauge\nactive_workspaces {}\n# HELP failed_workspaces Number of failed workspaces\n# TYPE failed_workspaces gauge\nfailed_workspaces {}\n# HELP workspace_restarts Total workspace restarts\n# TYPE workspace_restarts counter\nworkspace_restarts {}\n# HELP migration_count Total workspace migrations\n# TYPE migration_count counter\nmigration_count {}\n# HELP router_latency Workspace router latency in milliseconds\n# TYPE router_latency gauge\nrouter_latency {}\n# HELP worker_utilization Worker utilization ratio\n# TYPE worker_utilization gauge\nworker_utilization {}\n# HELP warm_pool_hits Number of warm pool hits\n# TYPE warm_pool_hits counter\nwarm_pool_hits {}\n# HELP cold_start_fallbacks Number of cold start fallbacks\n# TYPE cold_start_fallbacks counter\ncold_start_fallbacks {}\n# HELP image_match_confidence Mean execution image match confidence\n# TYPE image_match_confidence gauge\nimage_match_confidence {}\n# HELP cache_hit_ratio Warm execution cache hit ratio\n# TYPE cache_hit_ratio gauge\ncache_hit_ratio {}\n# HELP execution_start_latency Execution start latency in milliseconds\n# TYPE execution_start_latency gauge\nexecution_start_latency {}\n",
             self.active_workspaces,
             self.failed_workspaces,
             self.workspace_restarts,
             self.migration_count,
             self.router_latency,
-            self.worker_utilization
+            self.worker_utilization,
+            self.warm_pool_hits,
+            self.cold_start_fallbacks,
+            self.image_match_confidence,
+            self.cache_hit_ratio,
+            self.execution_start_latency
         )
     }
 }
 
 pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
     ("/metrics".to_string(), metrics.render_prometheus())
+}
+
+pub fn execution_image_endpoint(
+    repo_id: &str,
+    registry: &mut ExecutionImageRegistry,
+    fingerprint: &RepositoryFingerprint,
+) -> (String, String) {
+    let matched = registry.resolve_for_fingerprint(repo_id, fingerprint);
+    let framework = matched.image.framework.clone().unwrap_or_default();
+    (
+        format!("/execution-image/{repo_id}"),
+        json!({
+            "repo_id": repo_id,
+            "framework": framework,
+            "runtime": runtime_type_to_agent_label(matched.image.runtime),
+            "image": matched.image.image_id,
+            "confidence": matched.confidence
+        })
+        .to_string(),
+    )
+}
+
+pub fn warm_pool_status_endpoint(manager: &WarmPoolManager) -> (String, String) {
+    let status = manager.status();
+    (
+        "/warm-pool/status".to_string(),
+        json!({
+            "total_images": status.total_images,
+            "warm_containers": status.warm_containers,
+            "idle_containers": status.idle_containers,
+            "assigned_containers": status.assigned_containers
+        })
+        .to_string(),
+    )
+}
+
+pub fn warm_pool_prewarm_endpoint(
+    manager: &mut WarmPoolManager,
+    image: &ExecutionImage,
+    pool_type: WarmPoolType,
+    count: u32,
+) -> (String, String) {
+    manager.prewarm(image, pool_type, count);
+    (
+        "/warm-pool/prewarm".to_string(),
+        json!({
+            "image_id": image.image_id,
+            "pool": match pool_type {
+                WarmPoolType::Cloud => "cloud",
+                WarmPoolType::LocalDea => "local-dea",
+                WarmPoolType::External => "external",
+            },
+            "requested": count
+        })
+        .to_string(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2921,7 +3282,11 @@ impl WorkspaceRouter {
         registry.get(workspace_id).cloned()
     }
 
-    pub fn resolve_worker(&self, registry: &WorkspaceRegistry, workspace_id: &str) -> Option<WorkerId> {
+    pub fn resolve_worker(
+        &self,
+        registry: &WorkspaceRegistry,
+        workspace_id: &str,
+    ) -> Option<WorkerId> {
         registry
             .get(workspace_id)
             .and_then(|record| record.assigned_worker.clone())
@@ -3530,6 +3895,8 @@ struct RepositoryRegistryState {
 pub struct RepositoryRegistry;
 
 static REPOSITORY_REGISTRY: OnceLock<Mutex<RepositoryRegistryState>> = OnceLock::new();
+static EXECUTION_IMAGE_REGISTRY: OnceLock<Mutex<ExecutionImageRegistry>> = OnceLock::new();
+static WARM_POOL_MANAGER: OnceLock<Mutex<WarmPoolManager>> = OnceLock::new();
 
 impl RepositoryRegistry {
     pub fn get_or_compute(repo_reference: &str) -> ExecutionProfile {
@@ -4320,6 +4687,11 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         language,
         &package_content,
     );
+    let image_match = EXECUTION_IMAGE_REGISTRY
+        .get_or_init(|| Mutex::new(ExecutionImageRegistry::default()))
+        .lock()
+        .expect("execution image registry lock poisoned")
+        .resolve_for_fingerprint(&repo_reference, &execution_profile.fingerprint);
     let mut analysis = RepositoryAnalysis {
         root: root.to_path_buf(),
         framework,
@@ -4331,9 +4703,20 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         execution_profile,
         build_intelligence,
         execution_graph: ExecutionGraph::default(),
+        execution_image: image_match.image.clone(),
+        image_match_confidence: image_match.confidence,
     };
-    analysis.execution_graph =
-        BuildPlanner::build_graph(&analysis).with_cache_keys_for(Some(&analysis.fingerprint));
+    analysis.execution_graph = BuildPlanner::build_graph(&analysis)
+        .with_cache_keys_for(Some(&analysis.fingerprint))
+        .with_execution_image(&analysis.execution_image);
+    {
+        let mut warm_pool = WARM_POOL_MANAGER
+            .get_or_init(|| Mutex::new(WarmPoolManager::default()))
+            .lock()
+            .expect("warm pool manager lock poisoned");
+        warm_pool.prewarm(&analysis.execution_image, WarmPoolType::LocalDea, 1);
+        warm_pool.bind_cache_layer(&analysis.fingerprint, &analysis.execution_image);
+    }
 
     Ok(analysis)
 }
@@ -4455,6 +4838,8 @@ impl BuildPlanner {
                     ],
                     outputs: vec!["node_modules".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 };
                 let build = ExecutionNode {
                     id: "build".to_string(),
@@ -4468,6 +4853,8 @@ impl BuildPlanner {
                         "dist".to_string()
                     }],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 };
                 let dev = ExecutionNode {
                     id: "dev".to_string(),
@@ -4477,6 +4864,8 @@ impl BuildPlanner {
                     inputs: build.outputs.clone(),
                     outputs: vec!["http://0.0.0.0:3000/".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 };
                 let test = ExecutionNode {
                     id: "test".to_string(),
@@ -4486,6 +4875,8 @@ impl BuildPlanner {
                     inputs: vec!["node_modules".to_string()],
                     outputs: vec!["test-report".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 };
                 ExecutionGraph {
                     nodes: vec![install, build, dev, test],
@@ -4519,6 +4910,8 @@ impl BuildPlanner {
                         inputs: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
                         outputs: vec!["target".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -4528,6 +4921,8 @@ impl BuildPlanner {
                         inputs: vec!["target".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -4537,6 +4932,8 @@ impl BuildPlanner {
                         inputs: vec!["target".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                 ],
                 edges: vec![
@@ -4560,6 +4957,8 @@ impl BuildPlanner {
                         inputs: vec!["go.mod".to_string(), "go.sum".to_string()],
                         outputs: vec!["go-build-cache".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -4569,6 +4968,8 @@ impl BuildPlanner {
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["http://0.0.0.0:8080/".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -4578,6 +4979,8 @@ impl BuildPlanner {
                         inputs: vec!["go-build-cache".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                 ],
                 edges: vec![
@@ -4606,6 +5009,8 @@ impl BuildPlanner {
                         inputs: vec!["requirements.txt|pyproject.toml".to_string()],
                         outputs: vec!["site-packages".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "dev".to_string(),
@@ -4615,6 +5020,8 @@ impl BuildPlanner {
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["http://0.0.0.0:8000/".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "test".to_string(),
@@ -4624,6 +5031,8 @@ impl BuildPlanner {
                         inputs: vec!["site-packages".to_string()],
                         outputs: vec!["test-report".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                 ],
                 edges: vec![
@@ -4647,6 +5056,8 @@ impl BuildPlanner {
                         inputs: vec!["index.html".to_string(), "src".to_string()],
                         outputs: vec!["pkg/app_bg.wasm".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                     ExecutionNode {
                         id: "serve".to_string(),
@@ -4656,6 +5067,8 @@ impl BuildPlanner {
                         inputs: vec!["pkg/app_bg.wasm".to_string()],
                         outputs: vec!["http://0.0.0.0:4173/".to_string()],
                         cache_key: None,
+                        runtime: None,
+                        cache_binding: None,
                     },
                 ],
                 edges: vec![ExecutionEdge {
@@ -4684,6 +5097,8 @@ impl BuildPlanner {
                 inputs: vec!["workspace-manifests".to_string()],
                 outputs: vec!["workspace-dependencies".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             });
         }
 
@@ -4695,6 +5110,8 @@ impl BuildPlanner {
             inputs: vec!["workspace-dependencies".to_string()],
             outputs: vec!["workspace-build-cache".to_string()],
             cache_key: None,
+            runtime: None,
+            cache_binding: None,
         });
         if nodes.iter().any(|node| node.id == "install") {
             edges.push(ExecutionEdge {
@@ -4721,6 +5138,8 @@ impl BuildPlanner {
                 inputs: vec!["workspace-build-cache".to_string()],
                 outputs: vec![format!("{}-build-output", service.id)],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             });
             edges.push(ExecutionEdge {
                 from: "shared-build".to_string(),
@@ -4744,6 +5163,8 @@ impl BuildPlanner {
                     .map(|port| format!("tcp://0.0.0.0:{port}"))
                     .collect(),
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             });
             edges.push(ExecutionEdge {
                 from: build_id,
@@ -4835,6 +5256,9 @@ impl Default for RestApiSpec {
                 "GET /workspaces/{id}/logs",
                 "GET /workspaces/{id}/ports",
                 "GET /workspaces/{id}/filesystem/*path",
+                "GET /execution-image/{repo_id}",
+                "GET /warm-pool/status",
+                "POST /warm-pool/prewarm",
             ],
         }
     }
@@ -5479,6 +5903,74 @@ fn hash_bytes(input: &[u8]) -> String {
         state = state.wrapping_mul(1099511628211);
     }
     format!("{state:x}")
+}
+
+fn cache_artifacts_for_image(image: &ExecutionImage) -> Vec<String> {
+    let mut artifacts = vec!["build-artifacts".to_string()];
+    match image.runtime {
+        RuntimeType::Node => {
+            artifacts.push("node_modules".to_string());
+            artifacts.push("pnpm-store".to_string());
+        }
+        RuntimeType::Python => {
+            artifacts.push("pip-cache".to_string());
+            artifacts.push("site-packages".to_string());
+        }
+        RuntimeType::Rust => {
+            artifacts.push("cargo-registry".to_string());
+            artifacts.push("target-cache".to_string());
+            artifacts.push("wasm-modules".to_string());
+        }
+        RuntimeType::Wasm => {
+            artifacts.push("wasm-modules".to_string());
+        }
+        RuntimeType::Go => {
+            artifacts.push("go-mod-cache".to_string());
+        }
+        RuntimeType::Static | RuntimeType::Unknown => {}
+    }
+    artifacts
+}
+
+fn framework_tag(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return UNKNOWN_SIGNATURE.to_string();
+    }
+    trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn language_tag(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        UNKNOWN_SIGNATURE.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn language_kind_from_signature(language: &str) -> LanguageKind {
+    match language {
+        value if value.contains("typescript") => Language::TypeScript,
+        value if value.contains("javascript") => Language::JavaScript,
+        value if value.contains("rust") => Language::Rust,
+        value if value.contains("go") => Language::Go,
+        value if value.contains("python") => Language::Python,
+        _ => Language::Unknown,
+    }
+}
+
+fn warm_cache_binding_key(repo_hash: &str, image_id: &str) -> String {
+    hash_key(&format!("{repo_hash}:{image_id}"))
 }
 
 fn runtime_type_to_agent_label(runtime: RuntimeType) -> &'static str {
@@ -6259,11 +6751,7 @@ fn parse_execution_id(request_target: &str) -> Option<String> {
         .or_else(|| request_target.strip_prefix("app.ddockit.dev/e/"))
         .or_else(|| request_target.strip_prefix("/e/"))
         .or_else(|| request_target.strip_prefix("e/"))?;
-    let normalized = raw
-        .split(['?', '#'])
-        .next()?
-        .trim_matches('/')
-        .to_string();
+    let normalized = raw.split(['?', '#']).next()?.trim_matches('/').to_string();
     (!normalized.is_empty()).then_some(normalized)
 }
 
@@ -6313,6 +6801,7 @@ mod tests {
             },
             wasm_compatibility: compatibility,
         };
+        let image_match = ExecutionMatchEngine::match_repository(&fingerprint);
         RepositoryAnalysis {
             root: PathBuf::from("/tmp/repo"),
             framework,
@@ -6330,6 +6819,8 @@ mod tests {
                 scripts: HashMap::new(),
             },
             execution_graph: graph,
+            execution_image: image_match.image,
+            image_match_confidence: image_match.confidence,
         }
     }
 
@@ -6782,6 +7273,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         };
@@ -6803,6 +7296,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         };
@@ -6950,6 +7445,8 @@ mod tests {
                     inputs: vec!["Cargo.toml".to_string()],
                     outputs: vec!["target".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
                 ExecutionNode {
                     id: "wasm-test".to_string(),
@@ -6959,6 +7456,8 @@ mod tests {
                     inputs: vec!["target".to_string()],
                     outputs: vec!["report".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
             ],
             edges: vec![ExecutionEdge {
@@ -7043,6 +7542,8 @@ mod tests {
                     inputs: vec!["Cargo.toml".to_string()],
                     outputs: vec!["target".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
                 ExecutionNode {
                     id: "test".to_string(),
@@ -7052,6 +7553,8 @@ mod tests {
                     inputs: vec!["target".to_string()],
                     outputs: vec!["report".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
             ],
             edges: vec![ExecutionEdge {
@@ -7211,6 +7714,8 @@ mod tests {
                 inputs: vec!["src".to_string()],
                 outputs: vec!["pkg".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         };
@@ -7260,6 +7765,8 @@ mod tests {
                 inputs: vec!["src".to_string()],
                 outputs: vec!["pkg".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         };
@@ -7347,6 +7854,8 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             cache_key: None,
+            runtime: None,
+            cache_binding: None,
         };
 
         match ExecutionRouter::route(&node, &profile) {
@@ -7369,6 +7878,8 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         }
@@ -7420,6 +7931,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         }
@@ -7480,6 +7993,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         }
@@ -7588,6 +8103,8 @@ mod tests {
             inputs: vec![],
             outputs: vec![],
             cache_key: None,
+            runtime: None,
+            cache_binding: None,
         };
         let graph = ExecutionGraph {
             nodes: vec![node.clone()],
@@ -7634,6 +8151,8 @@ mod tests {
             inputs: vec![],
             outputs: vec!["pkg".to_string()],
             cache_key: None,
+            runtime: None,
+            cache_binding: None,
         };
         let graph = ExecutionGraph {
             nodes: vec![node],
@@ -7679,6 +8198,8 @@ mod tests {
                     inputs: vec!["src".to_string()],
                     outputs: vec!["pkg/app_bg.wasm".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
                 ExecutionNode {
                     id: "serve".to_string(),
@@ -7688,6 +8209,8 @@ mod tests {
                     inputs: vec!["pkg/app_bg.wasm".to_string()],
                     outputs: vec!["http://0.0.0.0:4173/".to_string()],
                     cache_key: None,
+                    runtime: None,
+                    cache_binding: None,
                 },
             ],
             edges: vec![ExecutionEdge {
@@ -7731,6 +8254,8 @@ mod tests {
             inputs: vec![],
             outputs: vec!["pkg".to_string()],
             cache_key: None,
+            runtime: None,
+            cache_binding: None,
         };
         let graph = ExecutionGraph {
             nodes: vec![node],
@@ -7773,6 +8298,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         };
@@ -8027,6 +8554,8 @@ mod tests {
                 inputs: vec!["package.json".to_string()],
                 outputs: vec!["dist".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         }
@@ -8077,6 +8606,8 @@ mod tests {
                 inputs: vec!["Cargo.toml".to_string()],
                 outputs: vec!["target".to_string()],
                 cache_key: None,
+                runtime: None,
+                cache_binding: None,
             }],
             edges: vec![],
         }
@@ -8151,14 +8682,7 @@ mod tests {
         let mut leases = ExecutionLeaseRegistry::default();
         leases.assign("z9y8", "worker-a", 1, 5);
         let recovery = WorkspaceRecoveryManager;
-        assert!(recovery.migrate(
-            &mut registry,
-            &mut leases,
-            "z9y8",
-            "worker-b",
-            10,
-            10
-        ));
+        assert!(recovery.migrate(&mut registry, &mut leases, "z9y8", "worker-b", 10, 10));
 
         let record = registry.get("z9y8").expect("workspace should exist");
         assert_eq!(record.assigned_worker.as_deref(), Some("worker-b"));
@@ -8214,11 +8738,10 @@ mod tests {
         );
         assert!(rebound);
 
-        let identity = resolver.get("exec-42").expect("identity should remain bound");
-        assert_eq!(
-            identity.canonical_url,
-            "https://app.ddockit.dev/e/exec-42"
-        );
+        let identity = resolver
+            .get("exec-42")
+            .expect("identity should remain bound");
+        assert_eq!(identity.canonical_url, "https://app.ddockit.dev/e/exec-42");
         assert_eq!(identity.current_url, "https://cloud.ddockit.dev/runtime/42");
         assert_eq!(identity.current_tier, ExecutionTier::DDockitCloud);
         assert!(trace.events.contains(&TraceEvent::ExecutionMigrated {
@@ -8297,10 +8820,102 @@ mod tests {
             migration_count: 3,
             router_latency: 1.5,
             worker_utilization: 0.72,
+            warm_pool_hits: 44,
+            cold_start_fallbacks: 2,
+            image_match_confidence: 96.5,
+            cache_hit_ratio: 0.91,
+            execution_start_latency: 3.4,
         };
         let (path, body) = metrics_endpoint(&metrics);
         assert_eq!(path, "/metrics");
         assert!(body.contains("active_workspaces 100"));
         assert!(body.contains("worker_utilization 0.72"));
+        assert!(body.contains("warm_pool_hits 44"));
+        assert!(body.contains("cache_hit_ratio 0.91"));
+    }
+
+    #[test]
+    fn execution_match_engine_assigns_framework_image_with_confidence() {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo-next".to_string(),
+            lockfile_hash: Some("lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "javascript".to_string(),
+            framework_signature: Some("nextjs".to_string()),
+        };
+
+        let matched = ExecutionMatchEngine::match_repository(&fingerprint);
+        assert_eq!(matched.image.runtime, RuntimeType::Node);
+        assert!(matched.image.image_id.contains("nextjs"));
+        assert!(matched.confidence >= 90);
+    }
+
+    #[test]
+    fn warm_pool_manager_tracks_prewarm_allocation_release_and_cache_binding() {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo-fastapi".to_string(),
+            lockfile_hash: Some("uv-lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "python".to_string(),
+            framework_signature: Some("fastapi".to_string()),
+        };
+        let image = ExecutionMatchEngine::match_repository(&fingerprint).image;
+
+        let mut manager = WarmPoolManager::default();
+        manager.prewarm(&image, WarmPoolType::Cloud, 2);
+        assert_eq!(
+            manager.get(&image.image_id).map(|entry| entry.idle_count),
+            Some(2)
+        );
+        assert!(manager.allocate(&image.image_id));
+        assert!(manager.mark_running(&image.image_id));
+        assert!(manager.release(&image.image_id));
+        manager.bind_cache_layer(&fingerprint, &image);
+        assert!(manager.has_cache_layer(&fingerprint, &image));
+
+        let status = manager.status();
+        assert_eq!(status.total_images, 1);
+        assert_eq!(status.warm_containers, 2);
+        assert_eq!(status.idle_containers, 2);
+        assert_eq!(status.assigned_containers, 0);
+    }
+
+    #[test]
+    fn warm_runtime_endpoints_expose_execution_image_and_pool_status() {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo-rust".to_string(),
+            lockfile_hash: Some("cargo-lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "rust".to_string(),
+            framework_signature: Some("rust".to_string()),
+        };
+        let mut registry = ExecutionImageRegistry::default();
+        let (image_path, image_body) =
+            execution_image_endpoint("repo-rust", &mut registry, &fingerprint);
+        assert_eq!(image_path, "/execution-image/repo-rust");
+        assert!(image_body.contains("\"repo_id\":\"repo-rust\""));
+        assert!(image_body.contains("\"image\""));
+
+        let image = registry
+            .image_for_repo("repo-rust")
+            .cloned()
+            .expect("image should be registered");
+        let mut pool = WarmPoolManager::default();
+        let (prewarm_path, _) =
+            warm_pool_prewarm_endpoint(&mut pool, &image, WarmPoolType::LocalDea, 1);
+        assert_eq!(prewarm_path, "/warm-pool/prewarm");
+
+        let (status_path, status_body) = warm_pool_status_endpoint(&pool);
+        assert_eq!(status_path, "/warm-pool/status");
+        assert!(status_body.contains("\"warm_containers\":1"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"GET /execution-image/{repo_id}"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"GET /warm-pool/status"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"POST /warm-pool/prewarm"));
     }
 }
