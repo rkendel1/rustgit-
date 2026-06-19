@@ -476,6 +476,7 @@ impl NativeRuntimeEngine {
                 "native:{}:{}:{}",
                 request.command, resources.max_memory_mb, resources.max_cpu_millis
             ),
+            ..ProcessHandle::default()
         })
     }
 }
@@ -505,6 +506,7 @@ impl HybridExecutionBridge {
                 self.wasm.execute_module(wasm_bytes, &spec, wasi)?;
                 Ok(ProcessHandle {
                     pid_hint: format!("wasm:{}", ctx.execution_graph.cache_key()),
+                    ..ProcessHandle::default()
                 })
             }
             ExecutionTarget::Native | ExecutionTarget::Static => self.native.execute(
@@ -652,6 +654,21 @@ pub enum ExecutionTarget {
 #[derive(Default)]
 struct ProviderRegistry;
 
+#[derive(Debug)]
+struct ScoredProvider {
+    score: i32,
+    provider_id: String,
+}
+
+const TIER_LOCAL_MACHINE_PROXIMITY_SCORE: i32 = 50;
+const TIER_LOCAL_DOCKER_PROXIMITY_SCORE: i32 = 40;
+const TIER_EXTERNAL_PROVIDER_PROXIMITY_SCORE: i32 = 30;
+const TIER_CLOUD_PARTNER_PROXIMITY_SCORE: i32 = 20;
+const TIER_DDOCKIT_CLOUD_PROXIMITY_SCORE: i32 = 10;
+const PREFERRED_PROVIDER_AFFINITY_BONUS: i32 = 30;
+const FALLBACK_PROVIDER_AFFINITY_BONUS: i32 = 20;
+const CAPABILITY_MATCH_BONUS: i32 = 10;
+
 impl ProviderRegistry {
     fn ranked_provider_ids_for_tier(
         &self,
@@ -668,43 +685,48 @@ impl ProviderRegistry {
                 if capability.tier != tier || !provider.can_run(ctx) {
                     return None;
                 }
+                // Weighted score favors locality first, then capability/reliability, then cost/latency.
                 let proximity_score = match tier {
-                    ExecutionTier::LocalMachine => 50,
-                    ExecutionTier::LocalDocker => 40,
-                    ExecutionTier::ExternalProvider => 30,
-                    ExecutionTier::CloudPartner => 20,
-                    ExecutionTier::DDockitCloud => 10,
+                    ExecutionTier::LocalMachine => TIER_LOCAL_MACHINE_PROXIMITY_SCORE,
+                    ExecutionTier::LocalDocker => TIER_LOCAL_DOCKER_PROXIMITY_SCORE,
+                    ExecutionTier::ExternalProvider => TIER_EXTERNAL_PROVIDER_PROXIMITY_SCORE,
+                    ExecutionTier::CloudPartner => TIER_CLOUD_PARTNER_PROXIMITY_SCORE,
+                    ExecutionTier::DDockitCloud => TIER_DDOCKIT_CLOUD_PROXIMITY_SCORE,
                 };
                 let affinity_bonus = if provider.id() == affinity.preferred_provider {
-                    30
+                    PREFERRED_PROVIDER_AFFINITY_BONUS
                 } else if affinity
                     .fallback_providers
                     .iter()
                     .any(|fallback| fallback == provider.id())
                 {
-                    20
+                    FALLBACK_PROVIDER_AFFINITY_BONUS
                 } else {
                     0
                 };
                 let capability_bonus = if capability.supported_runtimes.contains(&primary_runtime) {
-                    10
+                    CAPABILITY_MATCH_BONUS
                 } else {
                     0
                 };
                 let score = proximity_score
-                    + capability.reliability_score
+                    + capability.reliability_score as i32
                     + affinity_bonus
                     + capability_bonus
-                    - capability.latency_score
-                    - capability.cost_score;
-                Some((score, provider.id().to_string()))
+                    - capability.latency_score as i32
+                    - capability.cost_score as i32;
+                Some(ScoredProvider {
+                    score,
+                    provider_id: provider.id().to_string(),
+                })
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        scored
-            .into_iter()
-            .map(|(_, provider_id)| provider_id)
-            .collect()
+        scored.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+        });
+        scored.into_iter().map(|entry| entry.provider_id).collect()
     }
 }
 
@@ -734,11 +756,31 @@ impl ExecutionRouter {
     }
 
     fn execution_trace_uri(workspace_id: &str) -> String {
-        format!("ddockit://workspace/{workspace_id}/trace")
+        let safe_workspace_id = Self::sanitized_workspace_id(workspace_id);
+        format!("ddockit://workspace/{safe_workspace_id}/trace")
     }
 
     fn execution_trace_url(workspace_id: &str) -> String {
-        format!("https://app.ddockit.dev/workspaces/{workspace_id}/execution-path")
+        let safe_workspace_id = Self::sanitized_workspace_id(workspace_id);
+        format!("https://app.ddockit.dev/workspaces/{safe_workspace_id}/execution-path")
+    }
+
+    fn sanitized_workspace_id(workspace_id: &str) -> String {
+        let normalized = workspace_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if normalized.is_empty() {
+            "unknown".to_string()
+        } else {
+            normalized
+        }
     }
 
     fn tier_allowed_by_policy(&self, tier: ExecutionTier) -> bool {
@@ -814,7 +856,9 @@ impl ExecutionRouter {
                 ctx.workspace_id, ctx.analysis.framework, attempted
             ))
         })?;
-        let selected_tier = selected_tier.expect("selected tier should be present");
+        let selected_tier = selected_tier.expect(
+            "internal error: selected_tier must be set when selected_provider_id is set",
+        );
 
         let provider = self.provider_by_id(&selected_provider_id).ok_or_else(|| {
             RuntimeError::UnsupportedRepository(format!(
@@ -866,10 +910,9 @@ impl ExecutionRouter {
         let health = provider.health(&handle)?;
         if health.healthy {
             Ok(ProcessHandle {
-                pid_hint: format!(
-                    "{}|trace={}|http_trace={}",
-                    handle.pid_hint, selection.trace_uri, selection.trace_url
-                ),
+                pid_hint: handle.pid_hint,
+                trace_uri: Some(selection.trace_uri),
+                trace_url: Some(selection.trace_url),
             })
         } else {
             match provider.stop(&handle) {
@@ -2171,13 +2214,12 @@ impl CacheKeyEngine {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProcessHandle {
     pub pid_hint: String,
+    pub trace_uri: Option<String>,
+    pub trace_url: Option<String>,
 }
-
-pub type ExecutionHandle = ProcessHandle;
-pub type ExecutionRequest = ExecutionContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthStatus {
@@ -2655,7 +2697,7 @@ pub trait ExecutionProvider {
     /// Returns true when this provider owns runtime execution for `ctx`.
     fn can_handle(&self, ctx: &ExecutionContext) -> bool;
     /// Returns true when this provider can run `req`.
-    fn can_run(&self, req: &ExecutionRequest) -> bool {
+    fn can_run(&self, req: &ExecutionContext) -> bool {
         self.can_handle(req)
     }
     /// Mutates provider-specific runtime details before start.
@@ -2663,19 +2705,19 @@ pub trait ExecutionProvider {
     /// Starts execution from an immutable execution contract.
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle>;
     /// Starts execution by-value for escalation APIs.
-    fn start_request(&self, req: ExecutionRequest) -> Result<ExecutionHandle> {
+    fn start_request(&self, req: ExecutionContext) -> Result<ProcessHandle> {
         self.start(&req)
     }
     /// Stops a process started by this provider.
     fn stop(&self, handle: &ProcessHandle) -> Result<()>;
     /// Stops a by-value execution handle.
-    fn stop_handle(&self, handle: ExecutionHandle) -> Result<()> {
+    fn stop_handle(&self, handle: ProcessHandle) -> Result<()> {
         self.stop(&handle)
     }
     /// Reports process health after startup and during monitoring.
     fn health(&self, handle: &ProcessHandle) -> Result<HealthStatus>;
     /// Reports health of an execution handle.
-    fn health_status(&self, handle: &ExecutionHandle) -> Result<HealthStatus> {
+    fn health_status(&self, handle: &ProcessHandle) -> Result<HealthStatus> {
         self.health(handle)
     }
 }
@@ -4469,6 +4511,7 @@ impl ExecutionProvider for WasmExecutionProvider {
                     runtime.instantiate(&execution_context)?;
                     last_handle = Some(ProcessHandle {
                         pid_hint: format!("wasm:{}:{}", binding.node_id, binding.artifact_key),
+                        ..ProcessHandle::default()
                     });
                 }
                 ExecutionTarget::Native | ExecutionTarget::Static => {
@@ -4549,6 +4592,7 @@ impl ExecutionProvider for NodeRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("node:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -4595,6 +4639,7 @@ impl ExecutionProvider for RustRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("rust:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -4634,6 +4679,7 @@ impl ExecutionProvider for StaticRuntimeProvider {
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
         Ok(ProcessHandle {
             pid_hint: format!("static:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
         })
     }
 
@@ -6819,12 +6865,14 @@ mod tests {
 
         let handle = engine.start(&mut ctx).expect("engine should use fallback");
         assert!(handle.pid_hint.starts_with("rust:"));
-        assert!(handle
-            .pid_hint
-            .contains("trace=ddockit://workspace/ws-router-fallback/trace"));
-        assert!(handle
-            .pid_hint
-            .contains("http_trace=https://app.ddockit.dev/workspaces/ws-router-fallback/execution-path"));
+        assert_eq!(
+            handle.trace_uri.as_deref(),
+            Some("ddockit://workspace/ws-router-fallback/trace")
+        );
+        assert_eq!(
+            handle.trace_url.as_deref(),
+            Some("https://app.ddockit.dev/workspaces/ws-router-fallback/execution-path")
+        );
     }
 
     #[test]
