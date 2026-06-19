@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
@@ -2054,6 +2055,105 @@ pub enum ReadinessCheck {
     Process,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitExecutionSpecification {
+    pub version: u32,
+    #[serde(default)]
+    pub application: Option<DdockitApplication>,
+    #[serde(default)]
+    pub services: HashMap<String, DdockitServiceSpecification>,
+    #[serde(default)]
+    pub dependencies: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub execution: Option<DdockitExecutionPreferences>,
+    #[serde(default)]
+    pub resources: Option<DdockitResourceConstraints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitApplication {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitServiceSpecification {
+    pub runtime: DdockitRuntime,
+    #[serde(default)]
+    pub framework: Option<String>,
+    #[serde(default)]
+    pub install: Vec<String>,
+    #[serde(default)]
+    pub build: Vec<String>,
+    #[serde(default)]
+    pub run: Vec<String>,
+    #[serde(default)]
+    pub test: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub environment: HashMap<String, DdockitEnvironmentVariable>,
+    #[serde(default)]
+    pub healthcheck: Option<DdockitHealthcheck>,
+    #[serde(default)]
+    pub resources: Option<DdockitResourceConstraints>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DdockitRuntime {
+    Node,
+    Python,
+    Rust,
+    Bun,
+    Go,
+    Docker,
+    Wasm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitEnvironmentVariable {
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitHealthcheck {
+    #[serde(rename = "type")]
+    pub check_type: DdockitHealthcheckType,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DdockitHealthcheckType {
+    Http,
+    Tcp,
+    Process,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitExecutionPreferences {
+    #[serde(default)]
+    pub preferred_tier: Vec<String>,
+    #[serde(default)]
+    pub fallback: Option<DdockitExecutionFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitExecutionFallback {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DdockitResourceConstraints {
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    #[serde(default)]
+    pub memory: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceDefinition {
     pub id: String,
@@ -2717,6 +2817,7 @@ pub struct RepositoryAnalysis {
     pub root: PathBuf,
     pub framework: Framework,
     pub language: Language,
+    pub execution_spec: Option<DdockitExecutionSpecification>,
     pub dependency_files: Vec<PathBuf>,
     pub topology: Option<ApplicationTopology>,
     pub fingerprint: RepositoryFingerprint,
@@ -3286,6 +3387,9 @@ pub struct NodeAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExecutionPlan {
+    pub topology: Option<ApplicationTopology>,
+    pub services: Vec<ServiceDefinition>,
+    pub startup_order: Vec<String>,
     pub ordered_nodes: Vec<String>,
     pub assignments: Vec<NodeAssignment>,
     pub leases: HashMap<String, NodeLease>,
@@ -3404,6 +3508,22 @@ impl ExecutionPlan {
         reassigned.sort();
         reassigned
     }
+}
+
+pub fn generate_execution_plan(analysis: &RepositoryAnalysis) -> ExecutionPlan {
+    let mut plan = ExecutionPlan::default();
+    if let Some(topology) = analysis.topology.as_ref() {
+        plan.topology = Some(topology.clone());
+        plan.services = topology.services.clone();
+        plan.startup_order = topology
+            .startup_order
+            .stages
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+    }
+    plan
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3615,6 +3735,9 @@ impl DistributedScheduler {
             .collect();
 
         ExecutionPlan {
+            topology: None,
+            services: vec![],
+            startup_order: vec![],
             ordered_nodes,
             assignments,
             leases,
@@ -4450,8 +4573,158 @@ impl WorkspaceMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryAnalyzeRequest {
+    pub repo_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionStartRequest {
+    pub repo_url: String,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionMigrateRequest {
+    pub target: String,
+}
+
 pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
     ("/metrics".to_string(), metrics.render_prometheus())
+}
+
+pub fn repositories_analyze_endpoint(
+    request: &RepositoryAnalyzeRequest,
+    analysis: &RepositoryAnalysis,
+) -> (String, String) {
+    let frameworks = if analysis.fingerprint.frameworks.is_empty() {
+        vec![format!("{:?}", analysis.framework).to_ascii_lowercase()]
+    } else {
+        analysis
+            .fingerprint
+            .frameworks
+            .iter()
+            .map(|entry| entry.framework.to_ascii_lowercase())
+            .collect()
+    };
+    let services = analysis
+        .topology
+        .as_ref()
+        .map(|topology| {
+            topology
+                .services
+                .iter()
+                .map(|service| service.id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    (
+        "/api/v1/repositories/analyze".to_string(),
+        json!({
+            "repo_url": &request.repo_url,
+            "fingerprint_id": &analysis.fingerprint.repo_hash,
+            "frameworks": frameworks,
+            "services": services
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_plan_endpoint(analysis: &RepositoryAnalysis) -> (String, String) {
+    let plan = generate_execution_plan(analysis);
+    let execution_plan_id = plan
+        .topology
+        .as_ref()
+        .map(|topology| topology.topology_id.clone())
+        .unwrap_or_else(|| format!("plan-{}", hash_key(&analysis.fingerprint.repo_hash)));
+    (
+        "/api/v1/execution/plan".to_string(),
+        json!({
+            "execution_plan_id": execution_plan_id,
+            "services": plan.services.iter().map(|service| service.id.clone()).collect::<Vec<_>>(),
+            "startup_order": plan.startup_order
+        })
+        .to_string(),
+    )
+}
+
+pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, String) {
+    let execution_seed = format!(
+        "{}|{}|{}",
+        request.repo_url,
+        request.branch.as_deref().unwrap_or_default(),
+        request.commit.as_deref().unwrap_or_default()
+    );
+    let execution_id = format!("exec-{}", hash_key(&execution_seed));
+    let workspace_slug = ExecutionRouter::sanitized_workspace_id(&execution_id);
+    (
+        "/api/v1/executions".to_string(),
+        json!({
+            "execution_id": execution_id,
+            "status": "starting",
+            "workspace_url": format!("https://workspace-{workspace_slug}.ddockit.dev")
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_status_endpoint(execution_id: &str) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}"),
+        json!({
+            "state": "running",
+            "health": "healthy"
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_logs_endpoint(execution_id: &str, logs: &[String]) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}/logs"),
+        json!({
+            "logs": logs
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_restart_endpoint(execution_id: &str) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}/restart"),
+        json!({
+            "execution_id": execution_id,
+            "status": "restarting"
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_stop_endpoint(execution_id: &str) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}/stop"),
+        json!({
+            "execution_id": execution_id,
+            "status": "stopped"
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_migrate_endpoint(
+    execution_id: &str,
+    request: &ExecutionMigrateRequest,
+) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}/migrate"),
+        json!({
+            "execution_id": execution_id,
+            "target": &request.target
+        })
+        .to_string(),
+    )
 }
 
 pub fn execution_image_endpoint(
@@ -6495,6 +6768,154 @@ fn language_for_runtime(runtime: RuntimeType) -> Language {
     }
 }
 
+impl DdockitRuntime {
+    fn as_runtime_type(self) -> RuntimeType {
+        match self {
+            Self::Node | Self::Bun => RuntimeType::Node,
+            Self::Python => RuntimeType::Python,
+            Self::Rust => RuntimeType::Rust,
+            Self::Go => RuntimeType::Go,
+            Self::Docker => RuntimeType::Static,
+            Self::Wasm => RuntimeType::Wasm,
+        }
+    }
+}
+
+fn load_ddockit_execution_spec(root: &Path) -> Result<Option<DdockitExecutionSpecification>> {
+    let candidate = [root.join(".ddockit").join("ddockit.yaml"), root.join("ddockit.yaml")]
+        .into_iter()
+        .find(|path| path.exists());
+    let Some(path) = candidate else {
+        return Ok(None);
+    };
+
+        let content = fs::read_to_string(&path)?;
+        let spec = serde_yaml::from_str::<DdockitExecutionSpecification>(&content).map_err(|err| {
+            RuntimeError::UnsupportedRepository(format!("invalid execution spec `{}`: {err}", path.display()))
+        })?;
+        if spec.services.is_empty() {
+            return Err(RuntimeError::UnsupportedRepository(format!(
+                "invalid execution spec `{}`: at least one service is required",
+                path.display()
+            )));
+        }
+    Ok(Some(spec))
+}
+
+fn runtime_for_ddockit_service(service: &DdockitServiceSpecification) -> RuntimeType {
+    service.runtime.as_runtime_type()
+}
+
+fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -> Vec<ReadinessCheck> {
+    let mut checks = vec![];
+    if let Some(port) = service.port {
+        checks.push(ReadinessCheck::Port(port));
+    }
+    if let Some(healthcheck) = service.healthcheck.as_ref() {
+        match healthcheck.check_type {
+            DdockitHealthcheckType::Http => checks.push(ReadinessCheck::Http(
+                healthcheck
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| "/".to_string()),
+            )),
+            DdockitHealthcheckType::Tcp => {
+                if let Some(port) = healthcheck.port.or(service.port) {
+                    checks.push(ReadinessCheck::Port(port));
+                }
+            }
+            DdockitHealthcheckType::Process => checks.push(ReadinessCheck::Process),
+        }
+    }
+    if !checks.iter().any(|entry| matches!(entry, ReadinessCheck::Process)) {
+        checks.push(ReadinessCheck::Process);
+    }
+    checks
+}
+
+fn service_definition_from_ddockit(
+    repo_root: &Path,
+    service_id: &str,
+    service: &DdockitServiceSpecification,
+) -> ServiceDefinition {
+    let runtime = runtime_for_ddockit_service(service);
+    let working_directory = repo_root.join(service_id).to_string_lossy().to_string();
+    let start_command = service
+        .run
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("cd {working_directory}"));
+    let package_manager = match service.runtime {
+        DdockitRuntime::Node => Some("npm".to_string()),
+        DdockitRuntime::Bun => Some("bun".to_string()),
+        DdockitRuntime::Python => Some("pip".to_string()),
+        DdockitRuntime::Rust => Some("cargo".to_string()),
+        DdockitRuntime::Go => Some("go".to_string()),
+        DdockitRuntime::Docker => Some("docker".to_string()),
+        DdockitRuntime::Wasm => None,
+    };
+    ServiceDefinition {
+        id: service_id.to_string(),
+        name: service_id.to_string(),
+        runtime,
+        package_manager,
+        working_directory,
+        start_command,
+        ports: service.port.into_iter().collect(),
+        readiness_checks: readiness_checks_for_ddockit_service(service),
+    }
+}
+
+fn topology_from_ddockit_spec(root: &Path, spec: &DdockitExecutionSpecification) -> ApplicationTopology {
+    let mut service_ids = spec.services.keys().cloned().collect::<Vec<_>>();
+    service_ids.sort();
+    let services = service_ids
+        .iter()
+        .filter_map(|id| {
+            spec.services
+                .get(id)
+                .map(|service| service_definition_from_ddockit(root, id, service))
+        })
+        .collect::<Vec<_>>();
+
+    let mut dependencies = vec![];
+    for service_id in &service_ids {
+        if let Some(depends_on) = spec.dependencies.get(service_id) {
+            for dependency in depends_on {
+                dependencies.push(ServiceDependency {
+                    service_id: service_id.clone(),
+                    depends_on: dependency.clone(),
+                });
+            }
+        }
+    }
+    dependencies.sort_by(|left, right| {
+        left.service_id
+            .cmp(&right.service_id)
+            .then_with(|| left.depends_on.cmp(&right.depends_on))
+    });
+
+    let startup_order = compute_startup_order(&services, &dependencies);
+    let topology_seed = spec
+        .application
+        .as_ref()
+        .map(|application| application.name.clone())
+        .unwrap_or_else(|| service_ids.join("|"));
+    ApplicationTopology {
+        topology_id: format!("des-{}", hash_key(&topology_seed)),
+        services: services.clone(),
+        edges: dependencies.clone(),
+        global_network: infer_network_topology(&services),
+        startup_strategy: StartupStrategy {
+            stages: startup_order.stages.clone(),
+            enforce_dependencies: true,
+        },
+        health_policy: infer_health_policy(&services),
+        dependencies,
+        startup_order,
+    }
+}
+
 fn path_has_filename(path: &str, expected_file_name: &str) -> bool {
     Path::new(path)
         .file_name()
@@ -6540,6 +6961,7 @@ fn diff_repo_snapshots(
 
 pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     let mut dependency_files = vec![];
+    let execution_spec = load_ddockit_execution_spec(root)?;
 
     let package_json = root.join("package.json");
     let cargo_toml = root.join("Cargo.toml");
@@ -6580,7 +7002,10 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
     }
 
     let (mut framework, mut language, package_content) = infer_framework_and_language(root);
-    let topology = infer_application_topology(root);
+    let topology = execution_spec
+        .as_ref()
+        .map(|spec| topology_from_ddockit_spec(root, spec))
+        .or_else(|| infer_application_topology(root));
 
     if framework == Framework::Unknown {
         if let Some(discovered) = topology
@@ -6696,6 +7121,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         root: root.to_path_buf(),
         framework,
         language,
+        execution_spec,
         dependency_files,
         topology,
         fingerprint: execution_profile.fingerprint.clone(),
@@ -6724,7 +7150,7 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
 impl BuildPlanner {
     pub fn build_graph(analysis: &RepositoryAnalysis) -> ExecutionGraph {
         if let Some(topology) = analysis.topology.as_ref() {
-            if topology.services.len() > 1 {
+            if analysis.execution_spec.is_some() || topology.services.len() > 1 {
                 return Self::build_topology_graph(analysis, topology);
             }
         }
@@ -7712,6 +8138,14 @@ impl Default for RestApiSpec {
             "POST /warm-pool/prewarm",
             "GET /repo/{id}/commits",
             "POST /execute/recover",
+            "POST /api/v1/repositories/analyze",
+            "POST /api/v1/execution/plan",
+            "POST /api/v1/executions",
+            "GET /api/v1/executions/{id}",
+            "GET /api/v1/executions/{id}/logs",
+            "POST /api/v1/executions/{id}/restart",
+            "POST /api/v1/executions/{id}/stop",
+            "POST /api/v1/executions/{id}/migrate",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self {
@@ -9709,6 +10143,7 @@ mod tests {
             root: PathBuf::from("/tmp/repo"),
             framework,
             language: Language::Unknown,
+            execution_spec: None,
             dependency_files: vec![],
             topology: None,
             fingerprint,
@@ -9956,6 +10391,75 @@ mod tests {
             .outputs
             .iter()
             .any(|output| output == "svc://apps-web.svc.local"));
+    }
+
+    #[test]
+    fn ddockit_execution_spec_is_used_as_primary_execution_contract() {
+        let repo = temp_dir("ddockit-spec");
+        fs::create_dir_all(repo.join(".ddockit")).expect("create .ddockit");
+        fs::write(
+            repo.join(".ddockit/ddockit.yaml"),
+            r#"
+version: 1
+application:
+  name: my-saas
+services:
+  frontend:
+    runtime: node
+    framework: nextjs
+    install:
+      - pnpm install
+    build:
+      - pnpm build
+    run:
+      - pnpm start
+    port: 3000
+    healthcheck:
+      type: http
+      path: /
+  backend:
+    runtime: python
+    framework: fastapi
+    install:
+      - uv sync
+    run:
+      - uvicorn app:app --host 0.0.0.0 --port 8000
+    port: 8000
+    healthcheck:
+      type: http
+      path: /docs
+dependencies:
+  frontend:
+    - backend
+"#,
+        )
+        .expect("write ddockit.yaml");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let topology = analysis.topology.expect("topology should exist");
+        assert!(analysis.execution_spec.is_some());
+        assert_eq!(topology.services.len(), 2);
+        assert!(topology
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.service_id == "frontend" && dependency.depends_on == "backend"));
+        assert_eq!(
+            topology.startup_order.stages,
+            vec![vec!["backend".to_string()], vec!["frontend".to_string()]]
+        );
+        let frontend = topology
+            .services
+            .iter()
+            .find(|service| service.id == "frontend")
+            .expect("frontend");
+        assert_eq!(frontend.start_command, "pnpm start");
+        assert!(frontend
+            .readiness_checks
+            .contains(&ReadinessCheck::Http("/".to_string())));
+        let graph = analysis.execution_graph;
+        assert!(graph.nodes.iter().any(|node| {
+            node.id == "frontend-run" && node.command.as_deref() == Some("pnpm start")
+        }));
     }
 
     #[test]
@@ -11442,6 +11946,19 @@ mod tests {
     }
 
     #[test]
+    fn rest_api_spec_includes_execution_api_layer_routes() {
+        let spec = RestApiSpec::default();
+        assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
+        assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
+        assert!(spec.routes.contains(&"POST /api/v1/executions"));
+        assert!(spec.routes.contains(&"GET /api/v1/executions/{id}"));
+        assert!(spec.routes.contains(&"GET /api/v1/executions/{id}/logs"));
+        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/restart"));
+        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/stop"));
+        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/migrate"));
+    }
+
+    #[test]
     fn ucpe_ti_scheduler_follows_policy_tiers() {
         let scheduler = ucpe_ti::ExecutionScheduler;
         let policy = ucpe_ti::PolicyEngine::default();
@@ -12012,6 +12529,75 @@ mod tests {
         assert!(body.contains("worker_utilization 0.72"));
         assert!(body.contains("warm_pool_hits 44"));
         assert!(body.contains("cache_hit_ratio 0.91"));
+    }
+
+    #[test]
+    fn execution_api_layer_endpoints_emit_expected_payloads() {
+        let repo = temp_dir("execution-api");
+        fs::create_dir_all(repo.join(".ddockit")).expect("create .ddockit");
+        fs::write(
+            repo.join(".ddockit/ddockit.yaml"),
+            r#"
+version: 1
+services:
+  backend:
+    runtime: rust
+    run:
+      - cargo run
+    port: 8080
+"#,
+        )
+        .expect("write ddockit spec");
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+
+        let (analyze_path, analyze_body) = repositories_analyze_endpoint(
+            &RepositoryAnalyzeRequest {
+                repo_url: "https://github.com/example/app".to_string(),
+            },
+            &analysis,
+        );
+        assert_eq!(analyze_path, "/api/v1/repositories/analyze");
+        assert!(analyze_body.contains("\"fingerprint_id\""));
+        assert!(analyze_body.contains("\"services\":[\"backend\"]"));
+
+        let (plan_path, plan_body) = execution_plan_endpoint(&analysis);
+        assert_eq!(plan_path, "/api/v1/execution/plan");
+        assert!(plan_body.contains("\"execution_plan_id\""));
+        assert!(plan_body.contains("\"startup_order\":[\"backend\"]"));
+
+        let (start_path, start_body) = executions_start_endpoint(&ExecutionStartRequest {
+            repo_url: "https://github.com/example/app".to_string(),
+            branch: Some("main".to_string()),
+            commit: None,
+        });
+        assert_eq!(start_path, "/api/v1/executions");
+        assert!(start_body.contains("\"status\":\"starting\""));
+        assert!(start_body.contains("\"workspace_url\":\"https://workspace-"));
+
+        let (status_path, status_body) = execution_status_endpoint("exec-1");
+        assert_eq!(status_path, "/api/v1/executions/exec-1");
+        assert!(status_body.contains("\"health\":\"healthy\""));
+
+        let (logs_path, logs_body) = execution_logs_endpoint("exec-1", &["line1".to_string()]);
+        assert_eq!(logs_path, "/api/v1/executions/exec-1/logs");
+        assert!(logs_body.contains("\"logs\":[\"line1\"]"));
+
+        let (restart_path, restart_body) = execution_restart_endpoint("exec-1");
+        assert_eq!(restart_path, "/api/v1/executions/exec-1/restart");
+        assert!(restart_body.contains("\"status\":\"restarting\""));
+
+        let (stop_path, stop_body) = execution_stop_endpoint("exec-1");
+        assert_eq!(stop_path, "/api/v1/executions/exec-1/stop");
+        assert!(stop_body.contains("\"status\":\"stopped\""));
+
+        let (migrate_path, migrate_body) = execution_migrate_endpoint(
+            "exec-1",
+            &ExecutionMigrateRequest {
+                target: "cloud".to_string(),
+            },
+        );
+        assert_eq!(migrate_path, "/api/v1/executions/exec-1/migrate");
+        assert!(migrate_body.contains("\"target\":\"cloud\""));
     }
 
     #[test]
