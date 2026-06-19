@@ -1089,9 +1089,10 @@ impl TemporalExecutionRouter {
         }
 
         let selected = match strategy {
-            RecoveryStrategy::LastKnownGood => self
-                .navigator
-                .recover_from_failure(graph, head_commit, &self.policy),
+            RecoveryStrategy::LastKnownGood => {
+                self.navigator
+                    .recover_from_failure(graph, head_commit, &self.policy)
+            }
             RecoveryStrategy::BestRunnable => self.navigator.find_best_runnable_commit(graph),
         }?;
         Some(selected.commit_hash.clone())
@@ -1161,7 +1162,11 @@ pub struct FailureSignal {
 pub struct FailureClassifier;
 
 impl FailureClassifier {
-    pub fn classify(&self, failure: &FailureSignal, fingerprint: &RepositoryFingerprint) -> FailureClass {
+    pub fn classify(
+        &self,
+        failure: &FailureSignal,
+        fingerprint: &RepositoryFingerprint,
+    ) -> FailureClass {
         let message = failure.message.to_ascii_lowercase();
         let attempted_command = failure
             .attempted_command
@@ -1500,7 +1505,9 @@ impl HealingCoordinator {
         head_commit: &str,
     ) -> HealingDecision {
         let failure_class = self.classifier.classify(failure, fingerprint);
-        let strategy = self.catalog.strategy_for(failure_class, failure, fingerprint);
+        let strategy = self
+            .catalog
+            .strategy_for(failure_class, failure, fingerprint);
         if let Some(result) = self
             .engine
             .execute_plan(&strategy, runtime, &self.validator)
@@ -1518,7 +1525,9 @@ impl HealingCoordinator {
             };
         }
 
-        if let Some(commit) = temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood) {
+        if let Some(commit) =
+            temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood)
+        {
             self.journal.record(
                 repo_id,
                 failure_class,
@@ -4593,6 +4602,28 @@ pub struct ExecutionStartRequest {
     pub commit: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductSurface {
+    GitHubOverlayExtension,
+    Portal,
+}
+
+impl ProductSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHubOverlayExtension => "github_overlay_extension",
+            Self::Portal => "portal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayRepositoryContext {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionMigrateRequest {
     pub target: String,
@@ -4882,8 +4913,11 @@ pub fn compute_customer_journey_metrics(results: &[JourneyResult]) -> CustomerJo
         })
         .count() as f32;
     let url_successes = results.iter().filter(|result| result.url_success).count() as f32;
-    let average_startup_time =
-        results.iter().map(|result| result.startup_time_ms as f32).sum::<f32>() / total;
+    let average_startup_time = results
+        .iter()
+        .map(|result| result.startup_time_ms as f32)
+        .sum::<f32>()
+        / total;
 
     let mut framework_totals: HashMap<String, (u32, u32)> = HashMap::new();
     for result in results {
@@ -4914,7 +4948,10 @@ pub fn compute_customer_journey_metrics(results: &[JourneyResult]) -> CustomerJo
         .iter()
         .filter(|result| result.journey_kind == CustomerJourneyKind::HealingRepairAndRetry)
         .count() as f32;
-    let healing_successes = results.iter().filter(|result| result.healing_success).count() as f32;
+    let healing_successes = results
+        .iter()
+        .filter(|result| result.healing_success)
+        .count() as f32;
     let fallback_candidates = results
         .iter()
         .filter(|result| result.journey_kind == CustomerJourneyKind::BrokenHeadCommitFallback)
@@ -5086,6 +5123,212 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
             "execution_id": execution_id,
             "status": "starting",
             "workspace_url": format!("https://workspace-{workspace_slug}.ddockit.dev")
+        })
+        .to_string(),
+    )
+}
+
+pub fn surface_execution_start_endpoint(
+    surface: ProductSurface,
+    request: &ExecutionStartRequest,
+) -> (String, String) {
+    let (path, body) = executions_start_endpoint(request);
+    let mut payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(_) => return (path, body),
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("surface".to_string(), json!(surface.as_str()));
+        object.insert("entry_api".to_string(), json!("/api/v1/executions"));
+        object.insert("control_plane".to_string(), json!("unified"));
+    }
+    (path, payload.to_string())
+}
+
+pub fn detect_overlay_repository_context(url: &str) -> Option<OverlayRepositoryContext> {
+    let github_root = "https://github.com/";
+    let path = url.strip_prefix(github_root)?;
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let owner = segments.next()?.to_string();
+    let repo = segments.next()?.to_string();
+    let branch = match segments.next() {
+        Some("tree") => {
+            let suffix = segments.collect::<Vec<_>>().join("/");
+            if suffix.is_empty() {
+                return None;
+            }
+            suffix
+        }
+        // Overlay URL extraction falls back to main when GitHub does not include `/tree/<branch>`.
+        _ => "main".to_string(),
+    };
+    Some(OverlayRepositoryContext {
+        owner,
+        repo,
+        branch,
+    })
+}
+
+const OVERLAY_EXTENSION_ACTIONS: &[&str] = &["run", "instant_run", "analyze", "runtime", "commits"];
+
+pub fn extension_overlay_actions() -> &'static [&'static str] {
+    OVERLAY_EXTENSION_ACTIONS
+}
+
+pub fn extension_overlay_actions_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/extension/actions".to_string(),
+        json!({
+            "surface": ProductSurface::GitHubOverlayExtension.as_str(),
+            "actions": extension_overlay_actions(),
+            "run_entrypoint": "/api/v1/executions",
+            "ui_endpoint": "/api/v1/surfaces/extension/ui"
+        })
+        .to_string(),
+    )
+}
+
+pub fn extension_overlay_ui_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/extension/ui".to_string(),
+        json!({
+            "surface": ProductSurface::GitHubOverlayExtension.as_str(),
+            "view": "overlay_panel",
+            "title": "Run with DDockit",
+            "repository_context": {
+                "owner": "{owner}",
+                "repo": "{repo}",
+                "branch": "{branch}"
+            },
+            "sections": [
+                {
+                    "id": "quick_actions",
+                    "type": "button_group",
+                    "label": "Quick Actions",
+                    "actions": [
+                        {"id": "run", "label": "Run"},
+                        {"id": "instant_run", "label": "Instant Run"},
+                        {"id": "analyze", "label": "Analyze"}
+                    ]
+                },
+                {
+                    "id": "runtime",
+                    "type": "select",
+                    "label": "Runtime",
+                    "default": "auto",
+                    "options": ["auto", "local", "cloud"]
+                },
+                {
+                    "id": "latest_execution",
+                    "type": "status_card",
+                    "label": "Latest execution",
+                    "fields": ["execution_id", "status", "workspace_url", "started_at"]
+                }
+            ],
+            "actions_api": "/api/v1/surfaces/extension/actions",
+            "run_api": "/api/v1/executions"
+        })
+        .to_string(),
+    )
+}
+
+const PORTAL_INITIAL_NAVIGATION: &[&str] = &[
+    "dashboard",
+    "workspaces",
+    "repositories",
+    "executions",
+    "agents",
+    "analytics",
+    "settings",
+];
+
+pub fn portal_initial_navigation() -> &'static [&'static str] {
+    PORTAL_INITIAL_NAVIGATION
+}
+
+pub fn portal_navigation_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/portal/navigation".to_string(),
+        json!({
+            "surface": ProductSurface::Portal.as_str(),
+            "navigation": portal_initial_navigation(),
+            "workspace_path": "/api/v1/executions/{id}",
+            "ui_endpoint": "/api/v1/surfaces/portal/ui"
+        })
+        .to_string(),
+    )
+}
+
+pub fn portal_ui_endpoint() -> (String, String) {
+    (
+        "/api/v1/surfaces/portal/ui".to_string(),
+        json!({
+            "surface": ProductSurface::Portal.as_str(),
+            "layout": {
+                "type": "shell",
+                "navigation": portal_initial_navigation(),
+                "default_view": "dashboard"
+            },
+            "views": {
+                "dashboard": {
+                    "widgets": [
+                        {"id": "active_workspaces", "type": "metric", "label": "Active workspaces"},
+                        {"id": "running_executions", "type": "metric", "label": "Running executions"},
+                        {"id": "degraded_executions", "type": "metric", "label": "Degraded executions"}
+                    ]
+                },
+                "workspaces": {
+                    "table": {
+                        "columns": ["workspace_id", "repository", "status", "runtime", "url"],
+                        "primary_action": "open_workspace"
+                    }
+                },
+                "executions": {
+                    "table": {
+                        "columns": ["execution_id", "repository", "state", "health", "agent"],
+                        "primary_action": "open_execution"
+                    }
+                },
+                "agents": {
+                    "table": {
+                        "columns": ["agent_id", "state", "tier", "last_heartbeat"],
+                        "primary_action": "open_agent"
+                    }
+                }
+            },
+            "api_bindings": {
+                "execution_status": "/api/v1/executions/{id}",
+                "execution_logs": "/api/v1/executions/{id}/logs",
+                "workspace_history": "/executions/{id}/history"
+            }
+        })
+        .to_string(),
+    )
+}
+
+pub fn dual_surface_experience_contract_endpoint() -> (String, String) {
+    (
+        "/api/v1/dual-surface/contract".to_string(),
+        json!({
+            "surfaces": [
+                {
+                    "id": ProductSurface::GitHubOverlayExtension.as_str(),
+                    "role": "activation",
+                    "actions": extension_overlay_actions(),
+                    "ui_endpoint": "/api/v1/surfaces/extension/ui",
+                },
+                {
+                    "id": ProductSurface::Portal.as_str(),
+                    "role": "management",
+                    "navigation": portal_initial_navigation(),
+                    "ui_endpoint": "/api/v1/surfaces/portal/ui",
+                }
+            ],
+            "shared_backend": {
+                "execution_api": "/api/v1/executions",
+                "control_plane": "unified"
+            },
+            "state_guarantees": ["same_execution_ids", "same_urls", "same_state"]
         })
         .to_string(),
     )
@@ -7509,9 +7752,12 @@ impl DdockitRuntime {
 
 /// Loads DES from `.ddockit/ddockit.yaml` first, then falls back to `ddockit.yaml`.
 fn load_ddockit_execution_spec(root: &Path) -> Result<Option<DdockitExecutionSpecification>> {
-    let candidate = [root.join(".ddockit").join("ddockit.yaml"), root.join("ddockit.yaml")]
-        .into_iter()
-        .find(|path| path.exists());
+    let candidate = [
+        root.join(".ddockit").join("ddockit.yaml"),
+        root.join("ddockit.yaml"),
+    ]
+    .into_iter()
+    .find(|path| path.exists());
     let Some(path) = candidate else {
         return Ok(None);
     };
@@ -7536,7 +7782,9 @@ fn runtime_for_ddockit_service(service: &DdockitServiceSpecification) -> Runtime
     service.runtime.as_runtime_type()
 }
 
-fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -> Vec<ReadinessCheck> {
+fn readiness_checks_for_ddockit_service(
+    service: &DdockitServiceSpecification,
+) -> Vec<ReadinessCheck> {
     let mut checks = vec![];
     if let Some(port) = service.port {
         checks.push(ReadinessCheck::Port(port));
@@ -7544,10 +7792,7 @@ fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -
     if let Some(healthcheck) = service.healthcheck.as_ref() {
         match healthcheck.check_type {
             DdockitHealthcheckType::Http => checks.push(ReadinessCheck::Http(
-                healthcheck
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| "/".to_string()),
+                healthcheck.path.clone().unwrap_or_else(|| "/".to_string()),
             )),
             DdockitHealthcheckType::Tcp => {
                 if let Some(port) = healthcheck.port.or(service.port) {
@@ -7557,7 +7802,10 @@ fn readiness_checks_for_ddockit_service(service: &DdockitServiceSpecification) -
             DdockitHealthcheckType::Process => checks.push(ReadinessCheck::Process),
         }
     }
-    if !checks.iter().any(|entry| matches!(entry, ReadinessCheck::Process)) {
+    if !checks
+        .iter()
+        .any(|entry| matches!(entry, ReadinessCheck::Process))
+    {
         checks.push(ReadinessCheck::Process);
     }
     checks
@@ -7607,7 +7855,10 @@ fn service_definition_from_ddockit(
     }
 }
 
-fn topology_from_ddockit_spec(root: &Path, spec: &DdockitExecutionSpecification) -> ApplicationTopology {
+fn topology_from_ddockit_spec(
+    root: &Path,
+    spec: &DdockitExecutionSpecification,
+) -> ApplicationTopology {
     let mut service_ids = spec.services.keys().cloned().collect::<Vec<_>>();
     service_ids.sort();
     let services = service_ids
@@ -8824,7 +9075,9 @@ pub mod ucpe_ti {
                     execution_id,
                     state,
                 } => {
-                    self.state.executions.insert(execution_id.clone(), state.clone());
+                    self.state
+                        .executions
+                        .insert(execution_id.clone(), state.clone());
                     self.registry.executions.insert(execution_id, state);
                 }
                 ControlPlaneEvent::ExecutionFailed { execution_id } => {
@@ -8891,11 +9144,14 @@ impl Default for RestApiSpec {
             "GET /executions/{id}/history",
             "GET /repositories/{id}/healing",
             "GET /repositories/{id}/last-good",
+            "GET /api/v1/dual-surface/contract",
+            "GET /api/v1/surfaces/extension/actions",
+            "GET /api/v1/surfaces/portal/navigation",
+            "GET /api/v1/surfaces/extension/ui",
+            "GET /api/v1/surfaces/portal/ui",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
-        Self {
-            routes,
-        }
+        Self { routes }
     }
 }
 
@@ -11067,18 +11323,11 @@ mod tests {
             topology.startup_order.stages
         );
         assert!(topology.startup_strategy.enforce_dependencies);
-        assert!(
-            topology
-                .global_network
-                .service_dns
-                .contains_key("apps-web")
-        );
-        assert!(
-            topology
-                .health_policy
-                .service_checks
-                .contains_key("apps-web")
-        );
+        assert!(topology.global_network.service_dns.contains_key("apps-web"));
+        assert!(topology
+            .health_policy
+            .service_checks
+            .contains_key("apps-web"));
         assert!(topology.health_policy.require_healthy_dependencies);
         assert_eq!(analysis.fingerprint.spec_version, "1.0");
         assert_eq!(analysis.fingerprint.services.len(), 2);
@@ -11187,7 +11436,8 @@ dependencies:
         assert!(topology
             .dependencies
             .iter()
-            .any(|dependency| dependency.service_id == "frontend" && dependency.depends_on == "backend"));
+            .any(|dependency| dependency.service_id == "frontend"
+                && dependency.depends_on == "backend"));
         assert_eq!(
             topology.startup_order.stages,
             vec![vec!["backend".to_string()], vec!["frontend".to_string()]]
@@ -12698,13 +12948,26 @@ dependencies:
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}/logs"));
-        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/restart"));
+        assert!(spec
+            .routes
+            .contains(&"POST /api/v1/executions/{id}/restart"));
         assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/stop"));
-        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/migrate"));
+        assert!(spec
+            .routes
+            .contains(&"POST /api/v1/executions/{id}/migrate"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/history"));
         assert!(spec.routes.contains(&"GET /executions/{id}/history"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
+        assert!(spec.routes.contains(&"GET /api/v1/dual-surface/contract"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/v1/surfaces/extension/actions"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/v1/surfaces/portal/navigation"));
+        assert!(spec.routes.contains(&"GET /api/v1/surfaces/extension/ui"));
+        assert!(spec.routes.contains(&"GET /api/v1/surfaces/portal/ui"));
     }
 
     #[test]
@@ -12853,10 +13116,7 @@ dependencies:
             .state
             .topology_graphs
             .contains_key("topology-ucpe"));
-        assert!(control_plane
-            .state
-            .agent_states
-            .contains_key("agent-ucpe"));
+        assert!(control_plane.state.agent_states.contains_key("agent-ucpe"));
         assert_eq!(
             control_plane
                 .state
@@ -13350,18 +13610,142 @@ services:
     }
 
     #[test]
+    fn dual_surface_contract_uses_single_execution_api_and_control_plane() {
+        let (path, body) = dual_surface_experience_contract_endpoint();
+        assert_eq!(path, "/api/v1/dual-surface/contract");
+        assert!(body.contains("\"github_overlay_extension\""));
+        assert!(body.contains("\"portal\""));
+        assert!(body.contains("\"execution_api\":\"/api/v1/executions\""));
+        assert!(body.contains("\"control_plane\":\"unified\""));
+        assert!(body.contains("\"same_execution_ids\""));
+        assert!(body.contains("\"same_urls\""));
+        assert!(body.contains("\"same_state\""));
+        assert!(body.contains("\"ui_endpoint\":\"/api/v1/surfaces/extension/ui\""));
+        assert!(body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
+    }
+
+    #[test]
+    fn overlay_repository_detection_extracts_owner_repo_and_branch() {
+        let context = detect_overlay_repository_context("https://github.com/org/repo")
+            .expect("github URL should parse");
+        assert_eq!(context.owner, "org");
+        assert_eq!(context.repo, "repo");
+        assert_eq!(context.branch, "main");
+
+        let branch_context =
+            detect_overlay_repository_context("https://github.com/org/repo/tree/release")
+                .expect("github URL with branch should parse");
+        assert_eq!(branch_context.branch, "release");
+
+        let nested_branch_context =
+            detect_overlay_repository_context("https://github.com/org/repo/tree/feature/ui")
+                .expect("github URL with nested branch should parse");
+        assert_eq!(nested_branch_context.branch, "feature/ui");
+
+        assert!(detect_overlay_repository_context("https://github.com/org/repo/tree").is_none());
+    }
+
+    #[test]
+    fn extension_and_portal_execution_starts_share_ids_and_urls() {
+        let request = ExecutionStartRequest {
+            repo_url: "https://github.com/example/app".to_string(),
+            branch: Some("main".to_string()),
+            commit: None,
+        };
+        let (extension_path, extension_body) =
+            surface_execution_start_endpoint(ProductSurface::GitHubOverlayExtension, &request);
+        let (portal_path, portal_body) =
+            surface_execution_start_endpoint(ProductSurface::Portal, &request);
+
+        assert_eq!(extension_path, "/api/v1/executions");
+        assert_eq!(portal_path, "/api/v1/executions");
+
+        let extension_payload: serde_json::Value =
+            serde_json::from_str(&extension_body).expect("extension payload json");
+        let portal_payload: serde_json::Value =
+            serde_json::from_str(&portal_body).expect("portal payload json");
+
+        assert_eq!(
+            extension_payload
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str),
+            portal_payload
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            extension_payload
+                .get("workspace_url")
+                .and_then(serde_json::Value::as_str),
+            portal_payload
+                .get("workspace_url")
+                .and_then(serde_json::Value::as_str)
+        );
+    }
+
+    #[test]
+    fn dual_surface_endpoints_expose_extension_actions_and_portal_navigation() {
+        let (extension_path, extension_body) = extension_overlay_actions_endpoint();
+        assert_eq!(extension_path, "/api/v1/surfaces/extension/actions");
+        assert!(extension_body.contains("\"run\""));
+        assert!(extension_body.contains("\"instant_run\""));
+        assert!(extension_body.contains("\"run_entrypoint\":\"/api/v1/executions\""));
+        assert!(extension_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/extension/ui\""));
+
+        let (portal_path, portal_body) = portal_navigation_endpoint();
+        assert_eq!(portal_path, "/api/v1/surfaces/portal/navigation");
+        assert!(portal_body.contains("\"dashboard\""));
+        assert!(portal_body.contains("\"workspaces\""));
+        assert!(portal_body.contains("\"workspace_path\":\"/api/v1/executions/{id}\""));
+        assert!(portal_body.contains("\"ui_endpoint\":\"/api/v1/surfaces/portal/ui\""));
+    }
+
+    #[test]
+    fn dual_surface_ui_endpoints_expose_actual_surface_layouts() {
+        let (extension_ui_path, extension_ui_body) = extension_overlay_ui_endpoint();
+        assert_eq!(extension_ui_path, "/api/v1/surfaces/extension/ui");
+        assert!(extension_ui_body.contains("\"view\":\"overlay_panel\""));
+        assert!(extension_ui_body.contains("\"quick_actions\""));
+        assert!(extension_ui_body.contains("\"latest_execution\""));
+
+        let (portal_ui_path, portal_ui_body) = portal_ui_endpoint();
+        assert_eq!(portal_ui_path, "/api/v1/surfaces/portal/ui");
+        assert!(portal_ui_body.contains("\"layout\""));
+        assert!(portal_ui_body.contains("\"dashboard\""));
+        assert!(portal_ui_body.contains("\"workspaces\""));
+        assert!(portal_ui_body.contains("\"executions\""));
+        assert!(portal_ui_body.contains("\"agents\""));
+    }
+
+    #[test]
     fn golden_repository_catalog_loads_required_framework_categories() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("golden_repos")
             .join("catalog.yaml");
-        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        let catalog =
+            load_golden_repository_catalog(&path).expect("load golden repository catalog");
         assert_eq!(catalog.schema_version, "2");
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "node"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "python"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "rust"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "go"));
-        assert!(catalog.repositories.iter().any(|repo| repo.category == "bun"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "node"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "python"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "rust"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "go"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "bun"));
         assert!(catalog
             .repositories
             .iter()
@@ -13402,7 +13786,8 @@ services:
             .join("tests")
             .join("golden_repos")
             .join("catalog.yaml");
-        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        let catalog =
+            load_golden_repository_catalog(&path).expect("load golden repository catalog");
         let runner = CustomerJourneyRunner::new(catalog);
         let results = runner.run_default_suite();
         assert_eq!(results.len(), 10);
@@ -13741,10 +14126,8 @@ services:
     #[test]
     fn environment_resolver_only_generates_known_safe_defaults() {
         let resolver = EnvironmentResolver;
-        let defaults = resolver.defaults_for(&[
-            "DATABASE_URL".to_string(),
-            "SECRET_TOKEN".to_string(),
-        ]);
+        let defaults =
+            resolver.defaults_for(&["DATABASE_URL".to_string(), "SECRET_TOKEN".to_string()]);
         assert_eq!(
             defaults,
             vec![("DATABASE_URL".to_string(), "database.internal".to_string())]
@@ -14015,7 +14398,8 @@ services:
             recorded_at: 12,
         });
 
-        let (repo_history_path, repo_history_body) = repository_history_endpoint("repo-eidb", &database);
+        let (repo_history_path, repo_history_body) =
+            repository_history_endpoint("repo-eidb", &database);
         assert_eq!(repo_history_path, "/repositories/repo-eidb/history");
         assert!(repo_history_body.contains("\"commit_hash\":\"aaaaaaa\""));
 
@@ -14025,11 +14409,13 @@ services:
         assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
         assert!(execution_history_body.contains("workspace-1.ddockit.dev"));
 
-        let (healing_path, healing_body) = repository_healing_history_endpoint("repo-eidb", &database);
+        let (healing_path, healing_body) =
+            repository_healing_history_endpoint("repo-eidb", &database);
         assert_eq!(healing_path, "/repositories/repo-eidb/healing");
         assert!(healing_body.contains("\"failure_class\":\"WrongPackageManager\""));
 
-        let (last_good_path, last_good_body) = repository_last_good_commit_endpoint("repo-eidb", &database);
+        let (last_good_path, last_good_body) =
+            repository_last_good_commit_endpoint("repo-eidb", &database);
         assert_eq!(last_good_path, "/repositories/repo-eidb/last-good");
         assert!(last_good_body.contains("\"commit_hash\":\"aaaaaaa\""));
     }

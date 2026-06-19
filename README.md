@@ -13,6 +13,19 @@ A Rust foundation for a Gitpod-compatible WebAssembly workspace runtime.
 - REST API route surface definition (`RestApiSpec`)
 - Example CLI (`wasm-workspace-cli`)
 
+## Dual Surface Experience (DSE)
+
+DDockit is modeled as one product with two entry surfaces:
+
+- **GitHub Overlay Extension** (activation surface): discover repositories on GitHub and launch runs quickly.
+- **DDockit Portal** (management surface): monitor workspaces, executions, logs, URLs, and agents.
+
+Both surfaces route through the same backend primitives:
+
+- Shared **Execution API** (`/api/v1/executions`)
+- Shared **Control Plane**
+- Shared execution IDs, URLs, and runtime state
+
 ## Quick start
 
 ```bash
