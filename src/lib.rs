@@ -2081,6 +2081,8 @@ pub struct DdockitServiceSpecification {
     #[serde(default)]
     pub framework: Option<String>,
     #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
     pub install: Vec<String>,
     #[serde(default)]
     pub build: Vec<String>,
@@ -6781,6 +6783,7 @@ impl DdockitRuntime {
     }
 }
 
+/// Loads DES from `.ddockit/ddockit.yaml` first, then falls back to `ddockit.yaml`.
 fn load_ddockit_execution_spec(root: &Path) -> Result<Option<DdockitExecutionSpecification>> {
     let candidate = [root.join(".ddockit").join("ddockit.yaml"), root.join("ddockit.yaml")]
         .into_iter()
@@ -6789,16 +6792,19 @@ fn load_ddockit_execution_spec(root: &Path) -> Result<Option<DdockitExecutionSpe
         return Ok(None);
     };
 
-        let content = fs::read_to_string(&path)?;
-        let spec = serde_yaml::from_str::<DdockitExecutionSpecification>(&content).map_err(|err| {
-            RuntimeError::UnsupportedRepository(format!("invalid execution spec `{}`: {err}", path.display()))
-        })?;
-        if spec.services.is_empty() {
-            return Err(RuntimeError::UnsupportedRepository(format!(
-                "invalid execution spec `{}`: at least one service is required",
-                path.display()
-            )));
-        }
+    let content = fs::read_to_string(&path)?;
+    let spec = serde_yaml::from_str::<DdockitExecutionSpecification>(&content).map_err(|err| {
+        RuntimeError::UnsupportedRepository(format!(
+            "invalid execution spec `{}`: {err}",
+            path.display()
+        ))
+    })?;
+    if spec.services.is_empty() {
+        return Err(RuntimeError::UnsupportedRepository(format!(
+            "invalid execution spec `{}`: at least one service is required",
+            path.display()
+        )));
+    }
     Ok(Some(spec))
 }
 
@@ -6839,7 +6845,18 @@ fn service_definition_from_ddockit(
     service: &DdockitServiceSpecification,
 ) -> ServiceDefinition {
     let runtime = runtime_for_ddockit_service(service);
-    let working_directory = repo_root.join(service_id).to_string_lossy().to_string();
+    let working_directory = service
+        .working_directory
+        .as_deref()
+        .map(|path| {
+            let service_path = Path::new(path);
+            if service_path.is_absolute() {
+                service_path.to_string_lossy().to_string()
+            } else {
+                repo_root.join(service_path).to_string_lossy().to_string()
+            }
+        })
+        .unwrap_or_else(|| repo_root.to_string_lossy().to_string());
     let start_command = service
         .run
         .first()
@@ -6861,7 +6878,7 @@ fn service_definition_from_ddockit(
         package_manager,
         working_directory,
         start_command,
-        ports: service.port.into_iter().collect(),
+        ports: service.port.map(|port| vec![port]).unwrap_or_default(),
         readiness_checks: readiness_checks_for_ddockit_service(service),
     }
 }
