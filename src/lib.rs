@@ -16,6 +16,8 @@ const WASM_PARTIAL_CPU_LIMIT_UNITS: u32 = 750;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
+const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 
@@ -982,6 +984,9 @@ impl WorkspaceSession {
     }
 
     pub fn record_graph_event(&mut self, event: GraphEvent) {
+        if self.graph_events.len() >= SESSION_GRAPH_EVENT_BUFFER_LIMIT {
+            self.graph_events.pop_front();
+        }
         self.graph_events.push_back(event);
     }
 
@@ -994,6 +999,9 @@ impl WorkspaceSession {
     }
 
     pub fn record_worker_event(&mut self, event: WorkerEvent) {
+        if self.worker_events.len() >= SESSION_WORKER_EVENT_BUFFER_LIMIT {
+            self.worker_events.remove(0);
+        }
         self.worker_events.push(event);
     }
 
@@ -3635,6 +3643,41 @@ mod tests {
                 .last()
                 .map(|event| event.event_type),
             Some(GraphEventType::NodeQueued)
+        );
+    }
+
+    #[test]
+    fn workspace_session_event_buffers_are_bounded() {
+        let mut session = WorkspaceSession::new(
+            "session-2",
+            "repo-2",
+            "graph-2",
+            "http://coordinator:8080",
+        );
+        for index in 0..=SESSION_GRAPH_EVENT_BUFFER_LIMIT {
+            session.record_graph_event(GraphEvent {
+                node_id: format!("node-{index}"),
+                event_type: GraphEventType::NodeStarted,
+                timestamp: index as u64,
+            });
+        }
+        for index in 0..=SESSION_WORKER_EVENT_BUFFER_LIMIT {
+            session.record_worker_event(WorkerEvent {
+                worker_id: "worker-1".to_string(),
+                message: format!("event-{index}"),
+                timestamp: index as u64,
+            });
+        }
+
+        assert_eq!(session.graph_events.len(), SESSION_GRAPH_EVENT_BUFFER_LIMIT);
+        assert_eq!(session.worker_events.len(), SESSION_WORKER_EVENT_BUFFER_LIMIT);
+        assert_eq!(
+            session.graph_events.front().map(|event| event.node_id.as_str()),
+            Some("node-1")
+        );
+        assert_eq!(
+            session.worker_events.first().map(|event| event.message.as_str()),
+            Some("event-1")
         );
     }
 
