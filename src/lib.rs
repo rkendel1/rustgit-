@@ -394,6 +394,8 @@ pub struct BuildStrategy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionImageSpec {
     pub spec_version: String,
+    pub commit_hash: Option<String>,
+    pub deterministic_build: bool,
     pub language: LanguageKind,
     pub runtime: ImageRuntimeKind,
     pub runtime_version: String,
@@ -524,6 +526,8 @@ impl ExecutionImageCompiler {
 
         let mut image_spec = ExecutionImageSpec {
             spec_version: EXECUTION_IMAGE_VERSION.to_string(),
+            commit_hash: None,
+            deterministic_build: true,
             language,
             runtime,
             runtime_version,
@@ -549,6 +553,15 @@ impl ExecutionImageCompiler {
             build_strategy,
             confidence,
         }
+    }
+
+    pub fn compile_for_commit(
+        fingerprint: &RepositoryFingerprint,
+        commit_hash: impl Into<String>,
+    ) -> CompiledExecutionImage {
+        let mut compiled = Self::compile(fingerprint);
+        compiled.image_spec.commit_hash = Some(commit_hash.into());
+        compiled
     }
 }
 
@@ -800,6 +813,304 @@ impl WarmPoolManager {
         let key = warm_cache_binding_key(&fingerprint.repo_hash, &image.image_id);
         self.caches.contains_key(&key)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStatus {
+    Unknown,
+    Success,
+    Failed,
+    PartialSuccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub started: bool,
+    pub stable: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitNode {
+    pub commit_hash: String,
+    pub timestamp: i64,
+    pub urfs_snapshot: Option<RepositoryFingerprint>,
+    pub build_status: Option<BuildStatus>,
+    pub execution_result: Option<ExecutionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitEdge {
+    pub from_hash: String,
+    pub to_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RepositoryTimeGraph {
+    pub repo_id: String,
+    pub commits: Vec<CommitNode>,
+    pub edges: Vec<CommitEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitScore {
+    pub build_score: f32,
+    pub runtime_score: f32,
+    pub dependency_score: f32,
+    pub topology_score: f32,
+    pub overall_score: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitScorer;
+
+impl CommitScorer {
+    pub fn score(node: &CommitNode) -> CommitScore {
+        let build_score = match node.build_status.unwrap_or(BuildStatus::Unknown) {
+            BuildStatus::Success => 0.4,
+            BuildStatus::PartialSuccess => 0.2,
+            BuildStatus::Unknown | BuildStatus::Failed => 0.0,
+        };
+        let runtime_score = node
+            .execution_result
+            .as_ref()
+            .map(|result| if result.started { 0.3 } else { 0.0 })
+            .unwrap_or(0.0);
+        let dependency_score = node
+            .urfs_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                if snapshot.dependency_hash.is_some() {
+                    0.2
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let topology_score = node
+            .execution_result
+            .as_ref()
+            .map(|result| if result.stable { 0.1 } else { 0.0 })
+            .unwrap_or(0.0);
+        CommitScore {
+            build_score,
+            runtime_score,
+            dependency_score,
+            topology_score,
+            overall_score: build_score + runtime_score + dependency_score + topology_score,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitExecutionCache {
+    pub commit_hash: String,
+    pub execution_image: ExecutionImageSpec,
+    pub topology: ApplicationTopology,
+    pub result: ExecutionResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryStrategy {
+    LastKnownGood,
+    BestRunnable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalExecutionPolicy {
+    pub max_depth: usize,
+}
+
+impl Default for TemporalExecutionPolicy {
+    fn default() -> Self {
+        Self { max_depth: 50 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TemporalExecutionEngine {
+    cache: HashMap<String, CommitExecutionCache>,
+}
+
+impl TemporalExecutionEngine {
+    pub fn enumerate_commits(repo_root: &Path) -> Result<RepositoryTimeGraph> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("log")
+            .arg("--pretty=format:%H|%ct")
+            .output()
+            .map_err(|err| RuntimeError::CommandFailed(format!("git log failed: {err}")))?;
+        if !output.status.success() {
+            return Err(RuntimeError::CommandFailed(format!(
+                "git log exited with status {}",
+                output.status
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut commits = Vec::new();
+        for line in stdout.lines() {
+            let mut fields = line.split('|');
+            let Some(commit_hash) = fields.next().map(str::trim) else {
+                continue;
+            };
+            if !is_verified_commit_hash(commit_hash) {
+                continue;
+            }
+            let timestamp = fields
+                .next()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default();
+            commits.push(CommitNode {
+                commit_hash: commit_hash.to_string(),
+                timestamp,
+                urfs_snapshot: None,
+                build_status: Some(BuildStatus::Unknown),
+                execution_result: None,
+            });
+        }
+        let mut edges = Vec::new();
+        for pair in commits.windows(2) {
+            edges.push(CommitEdge {
+                from_hash: pair[0].commit_hash.clone(),
+                to_hash: pair[1].commit_hash.clone(),
+            });
+        }
+        Ok(RepositoryTimeGraph {
+            repo_id: repo_root.to_string_lossy().to_string(),
+            commits,
+            edges,
+        })
+    }
+
+    pub fn cache_successful_execution(&mut self, cache_entry: CommitExecutionCache) {
+        self.cache
+            .insert(cache_entry.commit_hash.clone(), cache_entry);
+    }
+
+    pub fn get_cached_execution(&self, commit_hash: &str) -> Option<&CommitExecutionCache> {
+        self.cache.get(commit_hash)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitNavigator;
+
+impl CommitNavigator {
+    pub fn find_last_working_commit<'a>(
+        &self,
+        graph: &'a RepositoryTimeGraph,
+    ) -> Option<&'a CommitNode> {
+        graph.commits.iter().find(|node| commit_is_runnable(node))
+    }
+
+    pub fn find_best_runnable_commit<'a>(
+        &self,
+        graph: &'a RepositoryTimeGraph,
+    ) -> Option<&'a CommitNode> {
+        graph
+            .commits
+            .iter()
+            .filter(|node| commit_is_runnable(node))
+            .max_by(|left, right| {
+                CommitScorer::score(left)
+                    .overall_score
+                    .total_cmp(&CommitScorer::score(right).overall_score)
+            })
+    }
+
+    pub fn recover_from_failure<'a>(
+        &self,
+        graph: &'a RepositoryTimeGraph,
+        head_commit: &str,
+        policy: &TemporalExecutionPolicy,
+    ) -> Option<&'a CommitNode> {
+        if graph.commits.is_empty() {
+            return None;
+        }
+        let start_index = graph
+            .commits
+            .iter()
+            .position(|node| node.commit_hash == head_commit)
+            .unwrap_or_default();
+        let upper_bound = std::cmp::min(
+            graph.commits.len().saturating_sub(1),
+            start_index.saturating_add(policy.max_depth),
+        );
+        graph.commits[start_index..=upper_bound]
+            .iter()
+            .find(|node| commit_is_runnable(node))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalExecutionRouter {
+    policy: TemporalExecutionPolicy,
+    navigator: CommitNavigator,
+    engine: TemporalExecutionEngine,
+}
+
+impl Default for TemporalExecutionRouter {
+    fn default() -> Self {
+        Self {
+            policy: TemporalExecutionPolicy::default(),
+            navigator: CommitNavigator,
+            engine: TemporalExecutionEngine::default(),
+        }
+    }
+}
+
+impl TemporalExecutionRouter {
+    pub fn route(
+        &self,
+        graph: &RepositoryTimeGraph,
+        head_commit: &str,
+        strategy: RecoveryStrategy,
+    ) -> Option<String> {
+        if self.engine.get_cached_execution(head_commit).is_some() {
+            return Some(head_commit.to_string());
+        }
+
+        let selected = match strategy {
+            RecoveryStrategy::LastKnownGood => self
+                .navigator
+                .recover_from_failure(graph, head_commit, &self.policy),
+            RecoveryStrategy::BestRunnable => self.navigator.find_best_runnable_commit(graph),
+        }?;
+        Some(selected.commit_hash.clone())
+    }
+
+    pub fn cache(&mut self, cache_entry: CommitExecutionCache) {
+        self.engine.cache_successful_execution(cache_entry);
+    }
+
+    pub fn cache_hit_rate(&self, commit_hash: &str) -> f64 {
+        if self.engine.get_cached_execution(commit_hash).is_some() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+fn commit_is_runnable(node: &CommitNode) -> bool {
+    let build_ok = matches!(
+        node.build_status.unwrap_or(BuildStatus::Unknown),
+        BuildStatus::Success | BuildStatus::PartialSuccess
+    );
+    let runtime_ok = node
+        .execution_result
+        .as_ref()
+        .map(|result| result.started && result.stable)
+        .unwrap_or(false);
+    build_ok && runtime_ok
+}
+
+fn is_verified_commit_hash(commit_hash: &str) -> bool {
+    (7..=64).contains(&commit_hash.len())
+        && commit_hash
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3564,6 +3875,10 @@ pub struct WorkspaceMetrics {
     pub image_match_confidence: f64,
     pub cache_hit_ratio: f64,
     pub execution_start_latency: f64,
+    pub commit_execution_success_rate: f64,
+    pub fallback_depth_distribution: f64,
+    pub last_known_good_distance: f64,
+    pub commit_cache_hit_rate: f64,
 }
 
 impl Default for WorkspaceMetrics {
@@ -3580,6 +3895,10 @@ impl Default for WorkspaceMetrics {
             image_match_confidence: 0.0,
             cache_hit_ratio: 0.0,
             execution_start_latency: 0.0,
+            commit_execution_success_rate: 0.0,
+            fallback_depth_distribution: 0.0,
+            last_known_good_distance: 0.0,
+            commit_cache_hit_rate: 0.0,
         }
     }
 }
@@ -3587,7 +3906,7 @@ impl Default for WorkspaceMetrics {
 impl WorkspaceMetrics {
     pub fn render_prometheus(&self) -> String {
         format!(
-            "# HELP active_workspaces Number of active workspaces\n# TYPE active_workspaces gauge\nactive_workspaces {}\n# HELP failed_workspaces Number of failed workspaces\n# TYPE failed_workspaces gauge\nfailed_workspaces {}\n# HELP workspace_restarts Total workspace restarts\n# TYPE workspace_restarts counter\nworkspace_restarts {}\n# HELP migration_count Total workspace migrations\n# TYPE migration_count counter\nmigration_count {}\n# HELP router_latency Workspace router latency in milliseconds\n# TYPE router_latency gauge\nrouter_latency {}\n# HELP worker_utilization Worker utilization ratio\n# TYPE worker_utilization gauge\nworker_utilization {}\n# HELP warm_pool_hits Number of warm pool hits\n# TYPE warm_pool_hits counter\nwarm_pool_hits {}\n# HELP cold_start_fallbacks Number of cold start fallbacks\n# TYPE cold_start_fallbacks counter\ncold_start_fallbacks {}\n# HELP image_match_confidence Mean execution image match confidence\n# TYPE image_match_confidence gauge\nimage_match_confidence {}\n# HELP cache_hit_ratio Warm execution cache hit ratio\n# TYPE cache_hit_ratio gauge\ncache_hit_ratio {}\n# HELP execution_start_latency Execution start latency in milliseconds\n# TYPE execution_start_latency gauge\nexecution_start_latency {}\n",
+            "# HELP active_workspaces Number of active workspaces\n# TYPE active_workspaces gauge\nactive_workspaces {}\n# HELP failed_workspaces Number of failed workspaces\n# TYPE failed_workspaces gauge\nfailed_workspaces {}\n# HELP workspace_restarts Total workspace restarts\n# TYPE workspace_restarts counter\nworkspace_restarts {}\n# HELP migration_count Total workspace migrations\n# TYPE migration_count counter\nmigration_count {}\n# HELP router_latency Workspace router latency in milliseconds\n# TYPE router_latency gauge\nrouter_latency {}\n# HELP worker_utilization Worker utilization ratio\n# TYPE worker_utilization gauge\nworker_utilization {}\n# HELP warm_pool_hits Number of warm pool hits\n# TYPE warm_pool_hits counter\nwarm_pool_hits {}\n# HELP cold_start_fallbacks Number of cold start fallbacks\n# TYPE cold_start_fallbacks counter\ncold_start_fallbacks {}\n# HELP image_match_confidence Mean execution image match confidence\n# TYPE image_match_confidence gauge\nimage_match_confidence {}\n# HELP cache_hit_ratio Warm execution cache hit ratio\n# TYPE cache_hit_ratio gauge\ncache_hit_ratio {}\n# HELP execution_start_latency Execution start latency in milliseconds\n# TYPE execution_start_latency gauge\nexecution_start_latency {}\n# HELP commit_execution_success_rate Commit execution success rate across temporal retries\n# TYPE commit_execution_success_rate gauge\ncommit_execution_success_rate {}\n# HELP fallback_depth_distribution Mean fallback depth selected during recovery\n# TYPE fallback_depth_distribution gauge\nfallback_depth_distribution {}\n# HELP last_known_good_distance Mean HEAD to known-good distance\n# TYPE last_known_good_distance gauge\nlast_known_good_distance {}\n# HELP commit_cache_hit_rate Commit execution cache hit rate\n# TYPE commit_cache_hit_rate gauge\ncommit_cache_hit_rate {}\n",
             self.active_workspaces,
             self.failed_workspaces,
             self.workspace_restarts,
@@ -3598,7 +3917,11 @@ impl WorkspaceMetrics {
             self.cold_start_fallbacks,
             self.image_match_confidence,
             self.cache_hit_ratio,
-            self.execution_start_latency
+            self.execution_start_latency,
+            self.commit_execution_success_rate,
+            self.fallback_depth_distribution,
+            self.last_known_good_distance,
+            self.commit_cache_hit_rate
         )
     }
 }
@@ -3799,6 +4122,15 @@ fn runtime_kind_label(runtime_kind: RuntimeKind) -> &'static str {
     }
 }
 
+fn build_status_label(status: BuildStatus) -> &'static str {
+    match status {
+        BuildStatus::Unknown => "unknown",
+        BuildStatus::Success => "success",
+        BuildStatus::Failed => "failed",
+        BuildStatus::PartialSuccess => "partial_success",
+    }
+}
+
 pub fn warm_pool_prewarm_endpoint(
     manager: &mut WarmPoolManager,
     image: &ExecutionImage,
@@ -3816,6 +4148,75 @@ pub fn warm_pool_prewarm_endpoint(
                 WarmPoolType::External => "external",
             },
             "requested": count
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalExecuteRequest {
+    pub repo: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalRecoverRequest {
+    pub repo: String,
+    pub strategy: String,
+}
+
+pub fn list_repo_commits_endpoint(repo_id: &str, graph: &RepositoryTimeGraph) -> (String, String) {
+    (
+        format!("/repo/{repo_id}/commits"),
+        json!({
+            "repo": repo_id,
+            "commits": graph.commits.iter().map(|commit| {
+                json!({
+                    "commit_hash": &commit.commit_hash,
+                    "timestamp": commit.timestamp,
+                    "build_status": commit.build_status.map(build_status_label).unwrap_or("unknown"),
+                })
+            }).collect::<Vec<_>>()
+        })
+        .to_string(),
+    )
+}
+
+pub fn execute_commit_endpoint(request: &TemporalExecuteRequest) -> (String, String) {
+    let verified = is_verified_commit_hash(&request.commit);
+    (
+        "/execute".to_string(),
+        json!({
+            "repo": &request.repo,
+            "commit": &request.commit,
+            "accepted": verified,
+            "reason": if verified { "verified commit hash" } else { "unverified commit hash" },
+        })
+        .to_string(),
+    )
+}
+
+pub fn execute_recover_endpoint(
+    request: &TemporalRecoverRequest,
+    router: &TemporalExecutionRouter,
+    graph: &RepositoryTimeGraph,
+) -> (String, String) {
+    let strategy = match request.strategy.to_ascii_lowercase().as_str() {
+        "best_runnable" => RecoveryStrategy::BestRunnable,
+        _ => RecoveryStrategy::LastKnownGood,
+    };
+    let head = graph
+        .commits
+        .first()
+        .map(|commit| commit.commit_hash.as_str())
+        .unwrap_or_default();
+    let selected = router.route(graph, head, strategy);
+    (
+        "/execute/recover".to_string(),
+        json!({
+            "repo": &request.repo,
+            "strategy": &request.strategy,
+            "selected_commit": selected,
         })
         .to_string(),
     )
@@ -6781,6 +7182,8 @@ impl Default for RestApiSpec {
             "POST /fingerprint/recompute",
             "GET /warm-pool/status",
             "POST /warm-pool/prewarm",
+            "GET /repo/{id}/commits",
+            "POST /execute/recover",
         ];
         routes.extend(ucpe_ti::unified_api_routes());
         Self {
@@ -7842,8 +8245,9 @@ fn execution_image_spec_material(spec: &ExecutionImageSpec) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "version={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}",
+        "version={}|commit={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}|commit_deterministic={}",
         spec.spec_version,
+        spec.commit_hash.as_deref().unwrap_or(UNKNOWN_SIGNATURE),
         language_kind_label(spec.language),
         image_runtime_kind_label(spec.runtime),
         spec.runtime_version,
@@ -7853,7 +8257,8 @@ fn execution_image_spec_material(spec: &ExecutionImageSpec) -> String {
         build_steps,
         environment,
         sandbox_model_label(spec.sandbox_model),
-        spec.caching_policy.deterministic
+        spec.caching_policy.deterministic,
+        spec.deterministic_build
     )
 }
 
@@ -7868,6 +8273,8 @@ fn execution_image_spec_payload(spec: &ExecutionImageSpec) -> Value {
         .unwrap_or(UNKNOWN_SIGNATURE);
     json!({
         "spec_version": spec.spec_version,
+        "commit_hash": spec.commit_hash,
+        "deterministic_build": spec.deterministic_build,
         "language": language_kind_label(spec.language),
         "runtime": image_runtime_kind_label(spec.runtime),
         "runtime_version": spec.runtime_version,
@@ -11066,6 +11473,10 @@ mod tests {
             image_match_confidence: 96.5,
             cache_hit_ratio: 0.91,
             execution_start_latency: 3.4,
+            commit_execution_success_rate: 0.85,
+            fallback_depth_distribution: 1.2,
+            last_known_good_distance: 2.0,
+            commit_cache_hit_rate: 0.7,
         };
         let (path, body) = metrics_endpoint(&metrics);
         assert_eq!(path, "/metrics");
@@ -11109,6 +11520,8 @@ mod tests {
 
         let compiled = ExecutionImageCompiler::compile(&fingerprint);
         assert_eq!(compiled.image_spec.spec_version, EXECUTION_IMAGE_VERSION);
+        assert_eq!(compiled.image_spec.commit_hash, None);
+        assert!(compiled.image_spec.deterministic_build);
         assert_eq!(compiled.image_spec.runtime, ImageRuntimeKind::Node);
         assert_eq!(compiled.image_spec.runtime_version, "20");
         assert_eq!(compiled.image_spec.framework, Some(FrameworkKind::NextJs));
@@ -11125,6 +11538,11 @@ mod tests {
         assert_eq!(
             compiled.image_spec.caching_policy.key,
             compiled_again.image_spec.caching_policy.key
+        );
+        let commit_compiled = ExecutionImageCompiler::compile_for_commit(&fingerprint, "abc1234");
+        assert_eq!(
+            commit_compiled.image_spec.commit_hash.as_deref(),
+            Some("abc1234")
         );
     }
 
@@ -11150,6 +11568,7 @@ mod tests {
         assert!(body.contains("\"image_spec\""));
         assert!(body.contains("\"runtime\":\"python\""));
         assert!(body.contains("\"confidence\":0."));
+        assert!(body.contains("\"deterministic_build\":true"));
     }
 
     #[test]
@@ -11238,6 +11657,94 @@ mod tests {
         assert!(RestApiSpec::default()
             .routes
             .contains(&"POST /warm-pool/prewarm"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"GET /repo/{id}/commits"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"POST /execute/recover"));
+    }
+
+    #[test]
+    fn temporal_execution_router_recovers_last_known_good_commit() {
+        let graph = RepositoryTimeGraph {
+            repo_id: "repo-temporal".to_string(),
+            commits: vec![
+                CommitNode {
+                    commit_hash: "aaaaaaa".to_string(),
+                    timestamp: 3,
+                    urfs_snapshot: None,
+                    build_status: Some(BuildStatus::Failed),
+                    execution_result: Some(ExecutionResult {
+                        started: false,
+                        stable: false,
+                        message: "build failed".to_string(),
+                    }),
+                },
+                CommitNode {
+                    commit_hash: "bbbbbbb".to_string(),
+                    timestamp: 2,
+                    urfs_snapshot: Some(RepositoryFingerprint {
+                        dependency_hash: Some("deps".to_string()),
+                        ..RepositoryFingerprint::default()
+                    }),
+                    build_status: Some(BuildStatus::Success),
+                    execution_result: Some(ExecutionResult {
+                        started: true,
+                        stable: true,
+                        message: "ok".to_string(),
+                    }),
+                },
+            ],
+            edges: vec![CommitEdge {
+                from_hash: "aaaaaaa".to_string(),
+                to_hash: "bbbbbbb".to_string(),
+            }],
+        };
+        let router = TemporalExecutionRouter::default();
+        let selected = router.route(&graph, "aaaaaaa", RecoveryStrategy::LastKnownGood);
+        assert_eq!(selected.as_deref(), Some("bbbbbbb"));
+    }
+
+    #[test]
+    fn temporal_endpoints_emit_commit_and_recovery_payloads() {
+        let graph = RepositoryTimeGraph {
+            repo_id: "repo-temporal".to_string(),
+            commits: vec![CommitNode {
+                commit_hash: "bbbbbbb".to_string(),
+                timestamp: 2,
+                urfs_snapshot: None,
+                build_status: Some(BuildStatus::Success),
+                execution_result: Some(ExecutionResult {
+                    started: true,
+                    stable: true,
+                    message: "ok".to_string(),
+                }),
+            }],
+            edges: vec![],
+        };
+        let (commits_path, commits_body) = list_repo_commits_endpoint("repo-temporal", &graph);
+        assert_eq!(commits_path, "/repo/repo-temporal/commits");
+        assert!(commits_body.contains("\"commit_hash\":\"bbbbbbb\""));
+
+        let (execute_path, execute_body) = execute_commit_endpoint(&TemporalExecuteRequest {
+            repo: "repo-temporal".to_string(),
+            commit: "bbbbbbb".to_string(),
+        });
+        assert_eq!(execute_path, "/execute");
+        assert!(execute_body.contains("\"accepted\":true"));
+
+        let router = TemporalExecutionRouter::default();
+        let (recover_path, recover_body) = execute_recover_endpoint(
+            &TemporalRecoverRequest {
+                repo: "repo-temporal".to_string(),
+                strategy: "last_known_good".to_string(),
+            },
+            &router,
+            &graph,
+        );
+        assert_eq!(recover_path, "/execute/recover");
+        assert!(recover_body.contains("\"selected_commit\":\"bbbbbbb\""));
     }
 
     #[test]
