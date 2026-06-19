@@ -13,6 +13,18 @@ path = "src/lib.rs"
 name = "wasm-workspace-cli"
 path = "src/bin/wasm_workspace_cli.rs"
 
+[[bin]]
+name = "analyze-architecture"
+path = "tools/analyze_architecture.rs"
+
+[[bin]]
+name = "extract-execution-graph"
+path = "tools/extract_execution_graph.rs"
+
+[[bin]]
+name = "generate-docs"
+path = "tools/generate_docs.rs"
+
 [dependencies]
 serde_json = "1.0"
 wasmtime = { version = "45.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }

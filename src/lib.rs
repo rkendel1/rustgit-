@@ -10,6 +10,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
+mod architecture_docs;
+
+pub use architecture_docs::{
+    analyze_architecture_from_source, extract_execution_flow_from_source, generate_grounded_docs,
+    ArchitectureSnapshot, CallGraph, ExecutionFlowGraph, GeneratedDocs,
+};
+
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
 const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
 const WASM_PARTIAL_MEMORY_LIMIT_MB: u64 = 256;
@@ -222,8 +229,9 @@ impl WasmRuntimeEngine {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
-        let engine = Engine::new(&config)
-            .map_err(|err| RuntimeError::WasmRuntime(format!("failed to initialize engine: {err}")))?;
+        let engine = Engine::new(&config).map_err(|err| {
+            RuntimeError::WasmRuntime(format!("failed to initialize engine: {err}"))
+        })?;
         let linker = Linker::new(&engine);
         Ok(Self { engine, linker })
     }
@@ -236,13 +244,19 @@ impl WasmRuntimeEngine {
         }
         if ctx.node_id.is_empty() || ctx.env.workspace_id.is_empty() {
             return Err(RuntimeError::WasmRuntime(
-                "wasm execution context requires non-empty node and workspace identifiers".to_string(),
+                "wasm execution context requires non-empty node and workspace identifiers"
+                    .to_string(),
             ));
         }
         if !Path::new(&ctx.env.repo_path).is_absolute() {
             return Err(RuntimeError::InvalidPath(ctx.env.repo_path.clone()));
         }
-        if !ctx.sandbox.filesystem_scope.iter().any(|scope| scope == &ctx.env.repo_path) {
+        if !ctx
+            .sandbox
+            .filesystem_scope
+            .iter()
+            .any(|scope| scope == &ctx.env.repo_path)
+        {
             return Err(RuntimeError::WasmRuntime(format!(
                 "sandbox scope does not include repo path {}",
                 ctx.env.repo_path
@@ -259,23 +273,28 @@ impl WasmRuntimeEngine {
             ..ctx.spec.clone()
         };
 
-        let module = Module::from_binary(&self.engine, &ctx.module.bytes)
-            .map_err(|err| RuntimeError::WasmRuntime(format!("module compilation failed: {err}")))?;
+        let module = Module::from_binary(&self.engine, &ctx.module.bytes).map_err(|err| {
+            RuntimeError::WasmRuntime(format!("module compilation failed: {err}"))
+        })?;
         self.enforce_memory_limits(&module, &effective_spec)?;
 
         let mut store = Store::new(&self.engine, ());
         store
             .set_fuel(u64::from(effective_spec.cpu_limit_units))
-            .map_err(|err| RuntimeError::WasmRuntime(format!("failed to set fuel limits: {err}")))?;
+            .map_err(|err| {
+                RuntimeError::WasmRuntime(format!("failed to set fuel limits: {err}"))
+            })?;
         let instance = self
             .linker
             .instantiate(&mut store, &module)
-            .map_err(|err| RuntimeError::WasmRuntime(format!("module instantiation failed: {err}")))?;
+            .map_err(|err| {
+                RuntimeError::WasmRuntime(format!("module instantiation failed: {err}"))
+            })?;
 
         if let Ok(entrypoint) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            entrypoint
-                .call(&mut store, ())
-                .map_err(|err| RuntimeError::WasmRuntime(format!("module execution failed: {err}")))?;
+            entrypoint.call(&mut store, ()).map_err(|err| {
+                RuntimeError::WasmRuntime(format!("module execution failed: {err}"))
+            })?;
         }
 
         let mut exported_functions = Vec::new();
@@ -315,7 +334,8 @@ impl WasmRuntimeEngine {
             },
             sandbox: WasmSandbox {
                 memory_limit: spec.memory_limit_mb.saturating_mul(BYTES_PER_MB),
-                time_limit_ms: u64::from(spec.cpu_limit_units).saturating_mul(CPU_UNIT_TO_TIME_LIMIT_MS),
+                time_limit_ms: u64::from(spec.cpu_limit_units)
+                    .saturating_mul(CPU_UNIT_TO_TIME_LIMIT_MS),
                 filesystem_scope: vec!["/".to_string()],
             },
             spec: spec.clone(),
@@ -377,9 +397,7 @@ impl NativeRuntimeEngine {
         Ok(ProcessHandle {
             pid_hint: format!(
                 "native:{}:{}:{}",
-                request.command,
-                resources.max_memory_mb,
-                resources.max_cpu_millis
+                request.command, resources.max_memory_mb, resources.max_cpu_millis
             ),
         })
     }
@@ -933,11 +951,15 @@ impl ArtifactStore {
     }
 
     fn wasm_artifact_path(&self, node_id: &str) -> PathBuf {
-        self.root.join("wasm").join(format!("{node_id}.artifact.json"))
+        self.root
+            .join("wasm")
+            .join(format!("{node_id}.artifact.json"))
     }
 
     fn wasm_binding_path(&self, node_id: &str) -> PathBuf {
-        self.root.join("wasm").join(format!("{node_id}.binding.json"))
+        self.root
+            .join("wasm")
+            .join(format!("{node_id}.binding.json"))
     }
 }
 
@@ -1150,7 +1172,11 @@ impl DistributedScheduler {
             let supports_artifacts = config
                 .required_artifacts
                 .get(&node_id)
-                .map(|required| required.iter().all(|key| artifact_store.fetch(key).is_some()))
+                .map(|required| {
+                    required
+                        .iter()
+                        .all(|key| artifact_store.fetch(key).is_some())
+                })
                 .unwrap_or(true);
             if !supports_artifacts {
                 unscheduled_nodes.push(node_id.clone());
@@ -1261,9 +1287,13 @@ fn worker_supports_mode(worker: &WorkerNode, mode: ExecutionMode) -> bool {
 }
 
 fn worker_has_labels(worker: &WorkerNode, labels: &[String]) -> bool {
-    labels
-        .iter()
-        .all(|label| worker.capabilities.labels.iter().any(|worker_label| worker_label == label))
+    labels.iter().all(|label| {
+        worker
+            .capabilities
+            .labels
+            .iter()
+            .any(|worker_label| worker_label == label)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1304,7 +1334,11 @@ impl ExecutionCoordinator {
         config: &DistributedExecutionConfig,
         now: u64,
     ) -> ExecutionPlan {
-        if let Some(worker) = self.workers.iter_mut().find(|worker| worker.id == failed_worker_id) {
+        if let Some(worker) = self
+            .workers
+            .iter_mut()
+            .find(|worker| worker.id == failed_worker_id)
+        {
             worker.status = WorkerStatus::Offline;
         }
         self.plan(graph, config, now)
@@ -3031,7 +3065,12 @@ impl ExecutionProvider for WasmExecutionProvider {
         let keys = ctx.execution_graph.compute_cache_keys();
         let mut last_handle = None;
         for node_id in ordered_ids {
-            let Some(node) = ctx.execution_graph.nodes.iter().find(|node| node.id == node_id) else {
+            let Some(node) = ctx
+                .execution_graph
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)
+            else {
                 continue;
             };
             match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
@@ -3082,7 +3121,9 @@ impl ExecutionProvider for WasmExecutionProvider {
             }
         }
         last_handle.ok_or_else(|| {
-            RuntimeError::CommandFailed("execution graph contains no dispatchable nodes".to_string())
+            RuntimeError::CommandFailed(
+                "execution graph contains no dispatchable nodes".to_string(),
+            )
         })
     }
 
@@ -3672,8 +3713,11 @@ mod tests {
     #[test]
     fn static_web_graph_includes_wasm_compile_binding_step() {
         let repo = temp_dir("static-web-graph");
-        fs::write(repo.join("index.html"), "<!doctype html><title>static</title>")
-            .expect("write index.html");
+        fs::write(
+            repo.join("index.html"),
+            "<!doctype html><title>static</title>",
+        )
+        .expect("write index.html");
 
         let analysis = analyze_repository(&repo).expect("analyze repo");
         let graph = &analysis.execution_graph;
@@ -4199,7 +4243,8 @@ mod tests {
                 status: WorkerStatus::Ready,
             },
         ];
-        let mut coordinator = ExecutionCoordinator::new(workers, DistributedArtifactStore::default());
+        let mut coordinator =
+            ExecutionCoordinator::new(workers, DistributedArtifactStore::default());
         let config = DistributedExecutionConfig::default();
 
         let initial = coordinator.plan(graph.clone(), &config, 50);
@@ -4298,7 +4343,9 @@ mod tests {
             .execute_module(&wasm_bytes, &spec, &WasiContext::default())
             .expect_err("memory limit should be enforced");
 
-        assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("exceeds limit")));
+        assert!(
+            matches!(err, RuntimeError::WasmRuntime(message) if message.contains("exceeds limit"))
+        );
     }
 
     #[test]
@@ -4480,7 +4527,9 @@ mod tests {
         let err = provider
             .start(&ctx)
             .expect_err("expected missing artifact to fail");
-        assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("no compiled wasm artifact found")));
+        assert!(
+            matches!(err, RuntimeError::WasmRuntime(message) if message.contains("no compiled wasm artifact found"))
+        );
     }
 
     #[test]
@@ -4506,12 +4555,8 @@ mod tests {
 
     #[test]
     fn workspace_session_tracks_graph_events_and_controls() {
-        let mut session = WorkspaceSession::new(
-            "session-1",
-            "repo-1",
-            "graph-1",
-            "http://coordinator:8080",
-        );
+        let mut session =
+            WorkspaceSession::new("session-1", "repo-1", "graph-1", "http://coordinator:8080");
         assert_eq!(session.sync_state, WorkspaceSessionSyncState::Connecting);
 
         session.record_graph_event(GraphEvent {
@@ -4539,12 +4584,8 @@ mod tests {
 
     #[test]
     fn workspace_session_event_buffers_are_bounded() {
-        let mut session = WorkspaceSession::new(
-            "session-2",
-            "repo-2",
-            "graph-2",
-            "http://coordinator:8080",
-        );
+        let mut session =
+            WorkspaceSession::new("session-2", "repo-2", "graph-2", "http://coordinator:8080");
         for index in 0..=SESSION_GRAPH_EVENT_BUFFER_LIMIT {
             session.record_graph_event(GraphEvent {
                 node_id: format!("node-{index}"),
@@ -4561,9 +4602,15 @@ mod tests {
         }
 
         assert_eq!(session.graph_events.len(), SESSION_GRAPH_EVENT_BUFFER_LIMIT);
-        assert_eq!(session.worker_events.len(), SESSION_WORKER_EVENT_BUFFER_LIMIT);
         assert_eq!(
-            session.graph_events.front().map(|event| event.node_id.as_str()),
+            session.worker_events.len(),
+            SESSION_WORKER_EVENT_BUFFER_LIMIT
+        );
+        assert_eq!(
+            session
+                .graph_events
+                .front()
+                .map(|event| event.node_id.as_str()),
             Some("node-1")
         );
         assert_eq!(
