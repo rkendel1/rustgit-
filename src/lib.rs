@@ -3769,6 +3769,463 @@ impl Default for DistributedExecutionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExecutionPriority {
+    Interactive,
+    System,
+    Batch,
+}
+
+impl ExecutionPriority {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Interactive => 0,
+            Self::System => 1,
+            Self::Batch => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionQueueStatus {
+    Queued,
+    Running,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedExecution {
+    pub execution_id: ExecutionId,
+    pub org_id: OrganizationId,
+    pub priority: ExecutionPriority,
+    pub status: ExecutionQueueStatus,
+    pub submitted_at: DateTime,
+    pub preferred_region: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNodeType {
+    Dea,
+    Docker,
+    Cloud,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeNodeHealth {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    Offline,
+}
+
+impl RuntimeNodeHealth {
+    fn is_routable(self) -> bool {
+        matches!(self, Self::Healthy | Self::Degraded)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeNode {
+    pub node_id: String,
+    pub runtime_type: RuntimeNodeType,
+    pub capacity_cpu: u32,
+    pub capacity_memory: u64,
+    pub current_load: u32,
+    pub health_status: RuntimeNodeHealth,
+    pub region: String,
+    pub cost_per_second: f64,
+    pub latency_ms: u32,
+    pub max_concurrent_executions: usize,
+    pub active_jobs: Vec<ExecutionId>,
+    pub last_heartbeat: DateTime,
+    pub success_rate: f64,
+    pub warm_pool_ready: bool,
+}
+
+impl RuntimeNode {
+    fn available_slots(&self) -> usize {
+        self.max_concurrent_executions
+            .saturating_sub(self.active_jobs.len())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionQueue {
+    pub executions: VecDeque<QueuedExecution>,
+}
+
+impl ExecutionQueue {
+    pub fn enqueue(&mut self, mut execution: QueuedExecution) {
+        execution.status = ExecutionQueueStatus::Queued;
+        self.executions.push_back(execution);
+    }
+
+    pub fn len(&self) -> usize {
+        self.executions.len()
+    }
+
+    fn next_schedulable_index(&self) -> Option<usize> {
+        self.executions
+            .iter()
+            .enumerate()
+            .filter(|(_, execution)| execution.status != ExecutionQueueStatus::Running)
+            .min_by(|(_, left), (_, right)| {
+                left.priority
+                    .rank()
+                    .cmp(&right.priority.rank())
+                    .then_with(|| left.submitted_at.cmp(&right.submitted_at))
+                    .then_with(|| left.execution_id.cmp(&right.execution_id))
+            })
+            .map(|(index, _)| index)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeRegistry {
+    pub nodes: HashMap<String, RuntimeNode>,
+}
+
+impl RuntimeRegistry {
+    pub fn register_node(&mut self, node: RuntimeNode) {
+        self.nodes.insert(node.node_id.clone(), node);
+    }
+
+    pub fn record_heartbeat(
+        &mut self,
+        node_id: &str,
+        heartbeat_at: DateTime,
+        healthy: bool,
+    ) -> bool {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return false;
+        };
+        node.last_heartbeat = heartbeat_at;
+        node.health_status = if healthy {
+            RuntimeNodeHealth::Healthy
+        } else {
+            RuntimeNodeHealth::Unhealthy
+        };
+        true
+    }
+
+    pub fn assign_execution(
+        &mut self,
+        node_id: &str,
+        execution_id: ExecutionId,
+        heartbeat_at: DateTime,
+    ) -> bool {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return false;
+        };
+        if !node.health_status.is_routable() || node.available_slots() == 0 {
+            return false;
+        }
+        if !node.active_jobs.iter().any(|active| active == &execution_id) {
+            node.active_jobs.push(execution_id);
+            node.current_load = node.active_jobs.len() as u32;
+        }
+        node.last_heartbeat = heartbeat_at;
+        true
+    }
+
+    pub fn release_execution(&mut self, node_id: &str, execution_id: &str) -> bool {
+        let Some(node) = self.nodes.get_mut(node_id) else {
+            return false;
+        };
+        let before = node.active_jobs.len();
+        node.active_jobs.retain(|active| active != execution_id);
+        node.current_load = node.active_jobs.len() as u32;
+        node.active_jobs.len() != before
+    }
+
+    pub fn active_jobs_for_node(&self, node_id: &str) -> Vec<ExecutionId> {
+        self.nodes
+            .get(node_id)
+            .map(|node| node.active_jobs.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn detect_unhealthy_nodes(
+        &mut self,
+        now: DateTime,
+        heartbeat_timeout_secs: u64,
+    ) -> Vec<String> {
+        let timeout = heartbeat_timeout_secs.max(MIN_COORDINATION_TIMEOUT_SECS);
+        let mut stale = Vec::new();
+        for node in self.nodes.values_mut() {
+            if !node.health_status.is_routable() {
+                continue;
+            }
+            if now.saturating_sub(node.last_heartbeat) > timeout {
+                node.health_status = RuntimeNodeHealth::Unhealthy;
+                stale.push(node.node_id.clone());
+            }
+        }
+        stale.sort();
+        stale
+    }
+}
+
+pub trait RoutingPolicy {
+    fn score(&self, node: &RuntimeNode, execution: &QueuedExecution) -> f64;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DefaultRoutingPolicy;
+
+impl RoutingPolicy for DefaultRoutingPolicy {
+    fn score(&self, node: &RuntimeNode, execution: &QueuedExecution) -> f64 {
+        if !node.health_status.is_routable() || node.available_slots() == 0 {
+            return f64::NEG_INFINITY;
+        }
+        let max_slots = node.max_concurrent_executions.max(1) as f64;
+        let load_ratio = (node.active_jobs.len() as f64 / max_slots).clamp(0.0, 1.0);
+        let load_score = 1.0 - load_ratio;
+        let cost_score = 1.0 / (1.0 + node.cost_per_second.max(0.0));
+        let latency_score = 1.0 / (1.0 + f64::from(node.latency_ms.max(1)));
+        let success_score = node.success_rate.clamp(0.0, 1.0);
+        let warm_pool_bonus = if node.warm_pool_ready { 0.15 } else { 0.0 };
+        let priority_bonus = match execution.priority {
+            ExecutionPriority::Interactive => 0.15,
+            ExecutionPriority::System => 0.1,
+            ExecutionPriority::Batch => 0.0,
+        };
+        let region_bonus = if execution
+            .preferred_region
+            .as_deref()
+            .is_some_and(|region| region == node.region)
+        {
+            0.1
+        } else {
+            0.0
+        };
+        (load_score * 0.35)
+            + (cost_score * 0.2)
+            + (latency_score * 0.2)
+            + (success_score * 0.15)
+            + warm_pool_bonus
+            + priority_bonus
+            + region_bonus
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoutingPolicyEngine;
+
+impl RoutingPolicyEngine {
+    pub fn score(&self, node: &RuntimeNode, execution: &QueuedExecution) -> f64 {
+        DefaultRoutingPolicy.score(node, execution)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadBalancer;
+
+impl LoadBalancer {
+    pub fn select_best_runtime(
+        &self,
+        execution: &QueuedExecution,
+        registry: &RuntimeRegistry,
+        policy_engine: &RoutingPolicyEngine,
+    ) -> Option<String> {
+        registry
+            .nodes
+            .values()
+            .filter(|node| node.health_status.is_routable())
+            .filter(|node| node.available_slots() > 0)
+            .max_by(|left, right| {
+                let left_score = policy_engine.score(left, execution);
+                let right_score = policy_engine.score(right, execution);
+                left_score
+                    .total_cmp(&right_score)
+                    // `max_by` keeps the left entry when ordering is `Greater`; reversing
+                    // right/left comparisons here intentionally prefers lower load/cost/latency.
+                    .then_with(|| right.current_load.cmp(&left.current_load))
+                    .then_with(|| right.cost_per_second.total_cmp(&left.cost_per_second))
+                    .then_with(|| right.latency_ms.cmp(&left.latency_ms))
+                    .then_with(|| left.node_id.cmp(&right.node_id))
+            })
+            .map(|node| node.node_id.clone())
+    }
+}
+
+pub trait RuntimeProvider {
+    fn can_execute(&self, repo: &RepositoryAnalysis) -> bool;
+    fn execute(&self, job: &QueuedExecution) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerEvent {
+    pub execution_id: ExecutionId,
+    pub selected_node: Option<String>,
+    pub reason: String,
+    pub queue_time: u64,
+    pub start_time: Option<DateTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DistributedExecutionScheduler {
+    pub queue: ExecutionQueue,
+    pub registry: RuntimeRegistry,
+    pub load_balancer: LoadBalancer,
+    pub policy_engine: RoutingPolicyEngine,
+    pub scheduler_events: Vec<SchedulerEvent>,
+    pub in_flight: HashMap<ExecutionId, QueuedExecution>,
+    pub backpressure_threshold: usize,
+}
+
+impl Default for DistributedExecutionScheduler {
+    fn default() -> Self {
+        Self {
+            queue: ExecutionQueue::default(),
+            registry: RuntimeRegistry::default(),
+            load_balancer: LoadBalancer,
+            policy_engine: RoutingPolicyEngine,
+            scheduler_events: Vec::new(),
+            in_flight: HashMap::new(),
+            backpressure_threshold: 1_000,
+        }
+    }
+}
+
+impl DistributedExecutionScheduler {
+    pub fn enqueue(&mut self, execution: QueuedExecution) {
+        self.queue.enqueue(execution);
+    }
+
+    pub fn register_runtime_node(&mut self, node: RuntimeNode) {
+        self.registry.register_node(node);
+    }
+
+    pub fn queue_length(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn should_scale_runtime(&self, runtime_type: RuntimeNodeType) -> bool {
+        let has_backlog = self
+            .queue
+            .executions
+            .iter()
+            .any(|execution| execution.status != ExecutionQueueStatus::Running);
+        if !has_backlog {
+            return false;
+        }
+        let mut saw_runtime = false;
+        for node in self.registry.nodes.values() {
+            if node.runtime_type != runtime_type || !node.health_status.is_routable() {
+                continue;
+            }
+            saw_runtime = true;
+            if node.available_slots() > 0 {
+                return false;
+            }
+        }
+        saw_runtime
+    }
+
+    pub fn schedule_next(&mut self, now: DateTime) -> Option<SchedulerEvent> {
+        let index = self.queue.next_schedulable_index()?;
+        let queue_overloaded = self.queue.len() > self.backpressure_threshold;
+        let execution = self.queue.executions.get(index)?.clone();
+
+        if queue_overloaded && execution.priority == ExecutionPriority::Batch {
+            if let Some(entry) = self.queue.executions.get_mut(index) {
+                entry.status = ExecutionQueueStatus::Blocked;
+            }
+            let event = SchedulerEvent {
+                execution_id: execution.execution_id,
+                selected_node: None,
+                reason: "backpressure delayed batch execution".to_string(),
+                queue_time: now.saturating_sub(execution.submitted_at),
+                start_time: None,
+            };
+            self.scheduler_events.push(event.clone());
+            return Some(event);
+        }
+
+        let selected = self.load_balancer.select_best_runtime(
+            &execution,
+            &self.registry,
+            &self.policy_engine,
+        );
+        let queue_time = now.saturating_sub(execution.submitted_at);
+
+        let Some(selected_node) = selected else {
+            if let Some(entry) = self.queue.executions.get_mut(index) {
+                entry.status = ExecutionQueueStatus::Blocked;
+            }
+            let event = SchedulerEvent {
+                execution_id: execution.execution_id,
+                selected_node: None,
+                reason: "no healthy runtime node with capacity".to_string(),
+                queue_time,
+                start_time: None,
+            };
+            self.scheduler_events.push(event.clone());
+            return Some(event);
+        };
+
+        let mut running = self.queue.executions.remove(index)?;
+        running.status = ExecutionQueueStatus::Running;
+        if !self
+            .registry
+            .assign_execution(&selected_node, running.execution_id.clone(), now)
+        {
+            running.status = ExecutionQueueStatus::Blocked;
+            self.queue.executions.push_front(running);
+            let event = SchedulerEvent {
+                execution_id: execution.execution_id,
+                selected_node: None,
+                reason: "runtime capacity changed before assignment".to_string(),
+                queue_time,
+                start_time: None,
+            };
+            self.scheduler_events.push(event.clone());
+            return Some(event);
+        }
+
+        self.in_flight
+            .insert(running.execution_id.clone(), running.clone());
+        let event = SchedulerEvent {
+            execution_id: running.execution_id,
+            selected_node: Some(selected_node),
+            reason: "selected by routing policy score".to_string(),
+            queue_time,
+            start_time: Some(now),
+        };
+        self.scheduler_events.push(event.clone());
+        Some(event)
+    }
+
+    pub fn recover_failed_executions(
+        &mut self,
+        now: DateTime,
+        heartbeat_timeout_secs: u64,
+    ) -> Vec<ExecutionId> {
+        let failed_nodes = self
+            .registry
+            .detect_unhealthy_nodes(now, heartbeat_timeout_secs);
+        let mut recovered = Vec::new();
+
+        for node_id in failed_nodes {
+            for execution_id in self.registry.active_jobs_for_node(&node_id) {
+                if self.registry.release_execution(&node_id, &execution_id) {
+                    if let Some(mut queued) = self.in_flight.remove(&execution_id) {
+                        queued.status = ExecutionQueueStatus::Queued;
+                        queued.submitted_at = now;
+                        self.queue.enqueue(queued);
+                        recovered.push(execution_id);
+                    }
+                }
+            }
+        }
+
+        recovered.sort();
+        recovered
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DistributedScheduler;
 
@@ -13285,6 +13742,240 @@ dependencies:
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0].node_id, "build");
         assert_eq!(plan.unscheduled_nodes, vec!["test"]);
+    }
+
+    #[test]
+    fn distributed_execution_scheduler_prioritizes_interactive_jobs_and_logs_decisions() {
+        let mut scheduler = DistributedExecutionScheduler::default();
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "dea-east".to_string(),
+            runtime_type: RuntimeNodeType::Dea,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-east".to_string(),
+            cost_per_second: 0.01,
+            latency_ms: 20,
+            max_concurrent_executions: 4,
+            active_jobs: vec![],
+            last_heartbeat: 100,
+            success_rate: 0.99,
+            warm_pool_ready: true,
+        });
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "cloud-west".to_string(),
+            runtime_type: RuntimeNodeType::Cloud,
+            capacity_cpu: 16,
+            capacity_memory: 32_768,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-west".to_string(),
+            cost_per_second: 0.03,
+            latency_ms: 40,
+            max_concurrent_executions: 8,
+            active_jobs: vec![],
+            last_heartbeat: 100,
+            success_rate: 0.95,
+            warm_pool_ready: false,
+        });
+
+        scheduler.enqueue(QueuedExecution {
+            execution_id: "exec-batch".to_string(),
+            org_id: "org-1".to_string(),
+            priority: ExecutionPriority::Batch,
+            status: ExecutionQueueStatus::Queued,
+            submitted_at: 10,
+            preferred_region: Some("us-east".to_string()),
+        });
+        scheduler.enqueue(QueuedExecution {
+            execution_id: "exec-interactive".to_string(),
+            org_id: "org-1".to_string(),
+            priority: ExecutionPriority::Interactive,
+            status: ExecutionQueueStatus::Queued,
+            submitted_at: 11,
+            preferred_region: Some("us-east".to_string()),
+        });
+
+        let decision = scheduler
+            .schedule_next(20)
+            .expect("interactive execution should be scheduled");
+        assert_eq!(decision.execution_id, "exec-interactive");
+        assert_eq!(decision.selected_node.as_deref(), Some("dea-east"));
+        assert_eq!(scheduler.queue_length(), 1);
+        assert_eq!(scheduler.scheduler_events.len(), 1);
+        assert!(scheduler
+            .scheduler_events
+            .iter()
+            .any(|event| event.reason.contains("routing policy score")));
+    }
+
+    #[test]
+    fn distributed_execution_scheduler_applies_backpressure_to_batch_jobs() {
+        let mut scheduler = DistributedExecutionScheduler {
+            backpressure_threshold: 0,
+            ..DistributedExecutionScheduler::default()
+        };
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "dea-east".to_string(),
+            runtime_type: RuntimeNodeType::Dea,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-east".to_string(),
+            cost_per_second: 0.01,
+            latency_ms: 20,
+            max_concurrent_executions: 1,
+            active_jobs: vec![],
+            last_heartbeat: 100,
+            success_rate: 0.99,
+            warm_pool_ready: false,
+        });
+        scheduler.enqueue(QueuedExecution {
+            execution_id: "exec-batch".to_string(),
+            org_id: "org-1".to_string(),
+            priority: ExecutionPriority::Batch,
+            status: ExecutionQueueStatus::Queued,
+            submitted_at: 5,
+            preferred_region: None,
+        });
+
+        let decision = scheduler
+            .schedule_next(10)
+            .expect("scheduler should emit backpressure decision");
+        assert_eq!(decision.execution_id, "exec-batch");
+        assert!(decision.selected_node.is_none());
+        assert!(decision.reason.contains("backpressure"));
+        assert_eq!(scheduler.queue_length(), 1);
+        assert_eq!(
+            scheduler
+                .queue
+                .executions
+                .front()
+                .map(|execution| execution.status),
+            Some(ExecutionQueueStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn distributed_execution_scheduler_requeues_jobs_after_heartbeat_timeout() {
+        let mut scheduler = DistributedExecutionScheduler::default();
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "dea-a".to_string(),
+            runtime_type: RuntimeNodeType::Dea,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-east".to_string(),
+            cost_per_second: 0.01,
+            latency_ms: 15,
+            max_concurrent_executions: 1,
+            active_jobs: vec![],
+            last_heartbeat: 100,
+            success_rate: 0.99,
+            warm_pool_ready: true,
+        });
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "dea-b".to_string(),
+            runtime_type: RuntimeNodeType::Dea,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-east".to_string(),
+            cost_per_second: 0.02,
+            latency_ms: 20,
+            max_concurrent_executions: 1,
+            active_jobs: vec![],
+            last_heartbeat: 115,
+            success_rate: 0.98,
+            warm_pool_ready: false,
+        });
+        scheduler.enqueue(QueuedExecution {
+            execution_id: "exec-1".to_string(),
+            org_id: "org-1".to_string(),
+            priority: ExecutionPriority::Interactive,
+            status: ExecutionQueueStatus::Queued,
+            submitted_at: 101,
+            preferred_region: Some("us-east".to_string()),
+        });
+
+        let first = scheduler
+            .schedule_next(105)
+            .expect("first assignment should succeed");
+        assert_eq!(first.selected_node.as_deref(), Some("dea-a"));
+        assert_eq!(scheduler.queue_length(), 0);
+
+        let recovered = scheduler.recover_failed_executions(120, 10);
+        assert_eq!(recovered, vec!["exec-1".to_string()]);
+        assert_eq!(scheduler.queue_length(), 1);
+        assert_eq!(
+            scheduler
+                .registry
+                .nodes
+                .get("dea-a")
+                .map(|node| node.health_status),
+            Some(RuntimeNodeHealth::Unhealthy)
+        );
+
+        let second = scheduler
+            .schedule_next(121)
+            .expect("execution should be reassigned to healthy worker");
+        assert_eq!(second.execution_id, "exec-1");
+        assert_eq!(second.selected_node.as_deref(), Some("dea-b"));
+    }
+
+    #[test]
+    fn distributed_execution_scheduler_emits_runtime_scale_signal_only_when_saturated() {
+        let mut scheduler = DistributedExecutionScheduler::default();
+        scheduler.enqueue(QueuedExecution {
+            execution_id: "exec-scale".to_string(),
+            org_id: "org-1".to_string(),
+            priority: ExecutionPriority::Batch,
+            status: ExecutionQueueStatus::Queued,
+            submitted_at: 1,
+            preferred_region: None,
+        });
+
+        assert!(!scheduler.should_scale_runtime(RuntimeNodeType::Cloud));
+
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "cloud-a".to_string(),
+            runtime_type: RuntimeNodeType::Cloud,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 1,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-east".to_string(),
+            cost_per_second: 0.05,
+            latency_ms: 30,
+            max_concurrent_executions: 1,
+            active_jobs: vec!["active-1".to_string()],
+            last_heartbeat: 1,
+            success_rate: 0.95,
+            warm_pool_ready: false,
+        });
+        assert!(scheduler.should_scale_runtime(RuntimeNodeType::Cloud));
+
+        scheduler.register_runtime_node(RuntimeNode {
+            node_id: "cloud-b".to_string(),
+            runtime_type: RuntimeNodeType::Cloud,
+            capacity_cpu: 8,
+            capacity_memory: 16_384,
+            current_load: 0,
+            health_status: RuntimeNodeHealth::Healthy,
+            region: "us-west".to_string(),
+            cost_per_second: 0.05,
+            latency_ms: 35,
+            max_concurrent_executions: 2,
+            active_jobs: vec![],
+            last_heartbeat: 1,
+            success_rate: 0.95,
+            warm_pool_ready: false,
+        });
+        assert!(!scheduler.should_scale_runtime(RuntimeNodeType::Cloud));
     }
 
     #[test]
