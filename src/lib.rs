@@ -221,6 +221,7 @@ pub struct RuntimeSelection {
     pub provider_id: String,
     pub reason: String,
     pub fallback_chain: Vec<RuntimeType>,
+    pub execution_id: ExecutionId,
     pub selected_tier: ExecutionTier,
     pub escalation_trace: Vec<EscalationTraceStep>,
     pub trace_uri: String,
@@ -760,9 +761,13 @@ impl ExecutionRouter {
         format!("ddockit://workspace/{safe_workspace_id}/trace")
     }
 
+    fn execution_id(workspace_id: &str) -> ExecutionId {
+        Self::sanitized_workspace_id(workspace_id)
+    }
+
     fn execution_trace_url(workspace_id: &str) -> String {
-        let safe_workspace_id = Self::sanitized_workspace_id(workspace_id);
-        format!("https://app.ddockit.dev/workspaces/{safe_workspace_id}/execution-path")
+        let execution_id = Self::execution_id(workspace_id);
+        ExecutionIdentity::canonical_url_for(&execution_id)
     }
 
     fn sanitized_workspace_id(workspace_id: &str) -> String {
@@ -886,12 +891,14 @@ impl ExecutionRouter {
                 affinity.preferred_provider, selected_provider_id, selected_tier
             )
         };
+        let execution_id = Self::execution_id(&ctx.workspace_id);
 
         Ok(RuntimeSelection {
             runtime: provider.runtime(),
             provider_id: selected_provider_id,
             reason,
             fallback_chain,
+            execution_id,
             selected_tier,
             escalation_trace,
             trace_uri: Self::execution_trace_uri(&ctx.workspace_id),
@@ -2248,6 +2255,79 @@ pub type ExecutionId = String;
 pub type WorkerId = String;
 pub type DateTime = u64;
 pub type RuntimeKind = RuntimeType;
+pub type ExecutionUrl = String;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionState {
+    Created,
+    Routing,
+    Running,
+    Migrating,
+    Degraded,
+    Failed,
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionIdentity {
+    pub execution_id: ExecutionId,
+    pub workspace_id: WorkspaceId,
+    pub repository_id: RepositoryId,
+    pub current_url: ExecutionUrl,
+    pub canonical_url: ExecutionUrl,
+    pub current_tier: ExecutionTier,
+    pub state: ExecutionState,
+}
+
+impl ExecutionIdentity {
+    pub fn canonical_url_for(execution_id: &str) -> ExecutionUrl {
+        format!("https://app.ddockit.dev/e/{execution_id}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierResult {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceEvent {
+    RepoAnalyzed,
+    GraphBuilt,
+    TierAttempted {
+        tier: ExecutionTier,
+        provider: String,
+        result: TierResult,
+    },
+    ExecutionStarted {
+        provider: String,
+        endpoint: String,
+    },
+    ExecutionMigrated {
+        from: ExecutionTier,
+        to: ExecutionTier,
+    },
+    UrlRebound {
+        new_endpoint: String,
+    },
+    HealthCheckPassed,
+    HealthCheckFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionTrace {
+    pub execution_id: ExecutionId,
+    pub events: Vec<TraceEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAffinity {
+    pub execution_id: ExecutionId,
+    pub session_id: String,
+    pub preferred_provider: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct WorkspaceUrl(pub String);
@@ -2436,6 +2516,131 @@ impl WorkspaceProxy {
 
     pub fn resolve(&self, workspace_id: &str) -> Option<&WorkspaceProxyBinding> {
         self.routes.get(workspace_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionUrlResolver {
+    identities: HashMap<ExecutionId, ExecutionIdentity>,
+}
+
+impl ExecutionUrlResolver {
+    pub fn upsert(&mut self, identity: ExecutionIdentity) {
+        self.identities
+            .insert(identity.execution_id.clone(), identity);
+    }
+
+    pub fn get(&self, execution_id: &str) -> Option<&ExecutionIdentity> {
+        self.identities.get(execution_id)
+    }
+
+    pub fn resolve(&self, execution_id: &str) -> Option<&str> {
+        self.identities
+            .get(execution_id)
+            .map(|identity| identity.current_url.as_str())
+    }
+
+    pub fn rebind(
+        &mut self,
+        execution_id: &str,
+        tier: ExecutionTier,
+        endpoint: impl Into<String>,
+    ) -> Option<ExecutionIdentity> {
+        let identity = self.identities.get_mut(execution_id)?;
+        identity.current_tier = tier;
+        identity.current_url = endpoint.into();
+        identity.state = ExecutionState::Running;
+        Some(identity.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRoute {
+    pub execution_id: ExecutionId,
+    pub workspace_id: WorkspaceId,
+    pub runtime_url: String,
+    pub canonical_url: ExecutionUrl,
+    pub tier: ExecutionTier,
+    pub state: ExecutionState,
+    pub preferred_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionGateway {
+    resolver: ExecutionUrlResolver,
+    affinity_by_session: HashMap<String, SessionAffinity>,
+}
+
+impl ExecutionGateway {
+    pub fn resolver(&self) -> &ExecutionUrlResolver {
+        &self.resolver
+    }
+
+    pub fn bind_execution(&mut self, identity: ExecutionIdentity) {
+        self.resolver.upsert(identity);
+    }
+
+    pub fn bind_session_affinity(&mut self, affinity: SessionAffinity) {
+        self.affinity_by_session
+            .insert(affinity.session_id.clone(), affinity);
+    }
+
+    pub fn route_request(
+        &self,
+        canonical_request_url: &str,
+        session_id: Option<&str>,
+    ) -> Option<ExecutionRoute> {
+        let requested_execution_id = parse_execution_id(canonical_request_url)?;
+        let execution_id = match session_id.and_then(|id| self.affinity_by_session.get(id)) {
+            Some(affinity) if affinity.execution_id == requested_execution_id => {
+                affinity.execution_id.clone()
+            }
+            Some(_) => return None,
+            None => requested_execution_id,
+        };
+        let identity = self.resolver.get(&execution_id)?;
+        Some(ExecutionRoute {
+            execution_id: identity.execution_id.clone(),
+            workspace_id: identity.workspace_id.clone(),
+            runtime_url: identity.current_url.clone(),
+            canonical_url: identity.canonical_url.clone(),
+            tier: identity.current_tier,
+            state: identity.state,
+            preferred_provider: session_id
+                .and_then(|id| self.affinity_by_session.get(id))
+                .map(|affinity| affinity.preferred_provider.clone()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionRebindingEngine;
+
+impl ExecutionRebindingEngine {
+    pub fn rebind(
+        &self,
+        resolver: &mut ExecutionUrlResolver,
+        trace: &mut ExecutionTrace,
+        execution_id: &str,
+        to_tier: ExecutionTier,
+        endpoint: impl Into<String>,
+    ) -> bool {
+        let Some(previous) = resolver.get(execution_id).cloned() else {
+            return false;
+        };
+        trace.events.push(TraceEvent::ExecutionMigrated {
+            from: previous.current_tier,
+            to: to_tier,
+        });
+        let Some(identity) = resolver.rebind(execution_id, to_tier, endpoint) else {
+            trace.events.push(TraceEvent::HealthCheckFailed);
+            return false;
+        };
+        trace.events.push(TraceEvent::UrlRebound {
+            new_endpoint: identity.current_url,
+        });
+        trace.events.push(TraceEvent::HealthCheckPassed);
+        true
     }
 }
 
@@ -5663,6 +5868,22 @@ fn parse_workspace_id(request_target: &str) -> Option<String> {
         .map(|id| id.to_string())
 }
 
+fn parse_execution_id(request_target: &str) -> Option<String> {
+    let raw = request_target
+        .strip_prefix("https://app.ddockit.dev/e/")
+        .or_else(|| request_target.strip_prefix("http://app.ddockit.dev/e/"))
+        .or_else(|| request_target.strip_prefix("app.ddockit.dev/e/"))
+        .or_else(|| request_target.strip_prefix("/e/"))
+        .or_else(|| request_target.strip_prefix("e/"))?;
+    let normalized = raw
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/')
+        .to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6801,7 +7022,7 @@ mod tests {
         );
         assert_eq!(
             selection.trace_url,
-            "https://app.ddockit.dev/workspaces/ws-router-preferred/execution-path"
+            "https://app.ddockit.dev/e/ws-router-preferred"
         );
     }
 
@@ -6861,7 +7082,7 @@ mod tests {
         );
         assert_eq!(
             handle.trace_url.as_deref(),
-            Some("https://app.ddockit.dev/workspaces/ws-router-fallback/execution-path")
+            Some("https://app.ddockit.dev/e/ws-router-fallback")
         );
     }
 
@@ -7414,6 +7635,101 @@ mod tests {
         assert_eq!(record.assigned_worker.as_deref(), Some("worker-b"));
         assert_eq!(record.assigned_url, url);
         assert_eq!(record.state, WorkspaceState::Running);
+    }
+
+    #[test]
+    fn execution_gateway_routes_by_canonical_execution_url() {
+        let mut gateway = ExecutionGateway::default();
+        gateway.bind_execution(ExecutionIdentity {
+            execution_id: "abc123".to_string(),
+            workspace_id: "ws-a".to_string(),
+            repository_id: "repo-a".to_string(),
+            current_url: "http://worker-a:3000".to_string(),
+            canonical_url: ExecutionIdentity::canonical_url_for("abc123"),
+            current_tier: ExecutionTier::LocalMachine,
+            state: ExecutionState::Running,
+        });
+
+        let route = gateway
+            .route_request("https://app.ddockit.dev/e/abc123", None)
+            .expect("canonical route should resolve");
+        assert_eq!(route.execution_id, "abc123");
+        assert_eq!(route.runtime_url, "http://worker-a:3000");
+        assert_eq!(route.canonical_url, "https://app.ddockit.dev/e/abc123");
+        assert_eq!(route.tier, ExecutionTier::LocalMachine);
+    }
+
+    #[test]
+    fn execution_rebinding_updates_endpoint_without_changing_canonical_url() {
+        let mut resolver = ExecutionUrlResolver::default();
+        resolver.upsert(ExecutionIdentity {
+            execution_id: "exec-42".to_string(),
+            workspace_id: "ws-42".to_string(),
+            repository_id: "repo-42".to_string(),
+            current_url: "http://local:3000".to_string(),
+            canonical_url: ExecutionIdentity::canonical_url_for("exec-42"),
+            current_tier: ExecutionTier::LocalMachine,
+            state: ExecutionState::Running,
+        });
+        let mut trace = ExecutionTrace {
+            execution_id: "exec-42".to_string(),
+            events: vec![],
+        };
+
+        let rebound = ExecutionRebindingEngine.rebind(
+            &mut resolver,
+            &mut trace,
+            "exec-42",
+            ExecutionTier::DDockitCloud,
+            "https://cloud.ddockit.dev/runtime/42",
+        );
+        assert!(rebound);
+
+        let identity = resolver.get("exec-42").expect("identity should remain bound");
+        assert_eq!(
+            identity.canonical_url,
+            "https://app.ddockit.dev/e/exec-42"
+        );
+        assert_eq!(identity.current_url, "https://cloud.ddockit.dev/runtime/42");
+        assert_eq!(identity.current_tier, ExecutionTier::DDockitCloud);
+        assert!(trace.events.contains(&TraceEvent::ExecutionMigrated {
+            from: ExecutionTier::LocalMachine,
+            to: ExecutionTier::DDockitCloud
+        }));
+        assert!(trace.events.contains(&TraceEvent::UrlRebound {
+            new_endpoint: "https://cloud.ddockit.dev/runtime/42".to_string()
+        }));
+    }
+
+    #[test]
+    fn execution_gateway_enforces_session_affinity() {
+        let mut gateway = ExecutionGateway::default();
+        gateway.bind_execution(ExecutionIdentity {
+            execution_id: "exec-affinity".to_string(),
+            workspace_id: "ws-affinity".to_string(),
+            repository_id: "repo-affinity".to_string(),
+            current_url: "http://worker-affinity:3010".to_string(),
+            canonical_url: ExecutionIdentity::canonical_url_for("exec-affinity"),
+            current_tier: ExecutionTier::ExternalProvider,
+            state: ExecutionState::Running,
+        });
+        gateway.bind_session_affinity(SessionAffinity {
+            execution_id: "exec-affinity".to_string(),
+            session_id: "session-7".to_string(),
+            preferred_provider: "RustRuntimeProvider".to_string(),
+        });
+
+        let route = gateway
+            .route_request("https://app.ddockit.dev/e/exec-affinity", Some("session-7"))
+            .expect("session-bound canonical route should resolve");
+        assert_eq!(route.runtime_url, "http://worker-affinity:3010");
+        assert_eq!(
+            route.preferred_provider.as_deref(),
+            Some("RustRuntimeProvider")
+        );
+        assert!(gateway
+            .route_request("https://app.ddockit.dev/e/other-exec", Some("session-7"))
+            .is_none());
     }
 
     #[test]
