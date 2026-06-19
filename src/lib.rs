@@ -2794,14 +2794,14 @@ impl ExecutionProvider for WasmExecutionProvider {
             env: HashMap::from([("RUSTGIT_WORKSPACE_ID".to_string(), ctx.workspace_id.clone())]),
             args: vec!["rustgit-runtime".to_string()],
         };
-        let empty_wasm_module = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         let ordered_ids = ctx.execution_graph.ordered_node_ids();
         let mut last_handle = None;
         for node_id in ordered_ids {
             let Some(node) = ctx.execution_graph.nodes.iter().find(|node| node.id == node_id) else {
                 continue;
             };
-            let handle = bridge.dispatch(node, ctx, &wasi, &empty_wasm_module)?;
+            let wasm_module = load_compiled_wasm_module(ctx, node)?;
+            let handle = bridge.dispatch(node, ctx, &wasi, &wasm_module)?;
             last_handle = Some(handle);
         }
         last_handle.ok_or_else(|| {
@@ -2968,6 +2968,67 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Wasm => "wasm",
         ExecutionMode::Hybrid => "hybrid",
     }
+}
+
+fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Result<Vec<u8>> {
+    let repo_root = Path::new(&ctx.repo_path);
+    if !repo_root.is_absolute() {
+        return Err(RuntimeError::InvalidPath(ctx.repo_path.clone()));
+    }
+
+    let mut search_roots = vec![];
+    for output in &node.outputs {
+        if output.contains("://") {
+            continue;
+        }
+        search_roots.push(repo_root.join(output));
+    }
+    search_roots.push(repo_root.to_path_buf());
+
+    for root in search_roots {
+        let Some(module_path) = first_wasm_module_in(&root)? else {
+            continue;
+        };
+        return fs::read(&module_path).map_err(RuntimeError::from);
+    }
+
+    Err(RuntimeError::WasmRuntime(format!(
+        "no compiled wasm artifact found for node {}",
+        node.id
+    )))
+}
+
+fn first_wasm_module_in(root: &Path) -> Result<Option<PathBuf>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    if root.is_file() {
+        return Ok(is_wasm_module(root).then(|| root.to_path_buf()));
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut wasm_modules = vec![];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else if is_wasm_module(&path) {
+                wasm_modules.push(path);
+            }
+        }
+    }
+
+    wasm_modules.sort();
+    Ok(wasm_modules.into_iter().next())
+}
+
+fn is_wasm_module(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+        .unwrap_or(false)
 }
 
 fn wasm_sandbox_for(spec: &WasmRuntimeSpec, repo_path: &str) -> WasmSandbox {
@@ -3913,6 +3974,89 @@ mod tests {
             .dispatch(&node, &ctx, &WasiContext::default(), &wasm_bytes)
             .expect("dispatch wasm node");
         assert!(handle.pid_hint.starts_with("wasm:"));
+    }
+
+    #[test]
+    fn wasm_execution_provider_uses_compiled_wasm_artifact() {
+        let repo_root = temp_dir("wasm-provider-artifact");
+        let pkg = repo_root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create wasm output dir");
+        let wasm_bytes = parse_str("(module (func (export \"run\")))").expect("compile wat");
+        fs::write(pkg.join("app_bg.wasm"), wasm_bytes).expect("write wasm artifact");
+
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec!["pkg".to_string()],
+            cache_key: None,
+        };
+        let graph = ExecutionGraph {
+            nodes: vec![node],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: repo_root.to_string_lossy().to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let provider = WasmExecutionProvider;
+        let handle = provider.start(&ctx).expect("start wasm provider");
+        assert!(handle.pid_hint.starts_with("wasm:"));
+    }
+
+    #[test]
+    fn wasm_execution_provider_requires_compiled_wasm_artifact() {
+        let repo_root = temp_dir("wasm-provider-missing-artifact");
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec!["pkg".to_string()],
+            cache_key: None,
+        };
+        let graph = ExecutionGraph {
+            nodes: vec![node],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: repo_root.to_string_lossy().to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let provider = WasmExecutionProvider;
+        let err = provider
+            .start(&ctx)
+            .expect_err("expected missing artifact to fail");
+        assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("no compiled wasm artifact found")));
     }
 
     #[test]
