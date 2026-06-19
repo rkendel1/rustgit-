@@ -555,6 +555,10 @@ impl ExecutionImageCompiler {
         }
     }
 
+    /// Compiles an execution image spec bound to a specific commit hash.
+    ///
+    /// Use this when execution artifacts must be tied to one historical repository state.
+    /// Use `compile` when commit-specific binding is not required.
     pub fn compile_for_commit(
         fingerprint: &RepositoryFingerprint,
         commit_hash: impl Into<String>,
@@ -933,6 +937,10 @@ pub struct TemporalExecutionEngine {
 }
 
 impl TemporalExecutionEngine {
+    /// Enumerates repository commits using `git log --pretty=format:%H|%ct`.
+    ///
+    /// Returns commit nodes plus linear parent-child edges in log order.
+    /// Fails when `repo_root` is not a readable git repository or git execution fails.
     pub fn enumerate_commits(repo_root: &Path) -> Result<RepositoryTimeGraph> {
         let output = Command::new("git")
             .arg("-C")
@@ -1084,15 +1092,15 @@ impl TemporalExecutionRouter {
         self.engine.cache_successful_execution(cache_entry);
     }
 
-    pub fn cache_hit_rate(&self, commit_hash: &str) -> f64 {
-        if self.engine.get_cached_execution(commit_hash).is_some() {
-            1.0
-        } else {
-            0.0
-        }
+    pub fn is_cached(&self, commit_hash: &str) -> bool {
+        self.engine.get_cached_execution(commit_hash).is_some()
     }
 }
 
+/// Returns whether a commit can be treated as runnable for temporal recovery.
+///
+/// A runnable commit must have successful (or partial-success) build status
+/// and execution evidence that it started and remained stable.
 fn commit_is_runnable(node: &CommitNode) -> bool {
     let build_ok = matches!(
         node.build_status.unwrap_or(BuildStatus::Unknown),
@@ -1106,6 +1114,9 @@ fn commit_is_runnable(node: &CommitNode) -> bool {
     build_ok && runtime_ok
 }
 
+/// Performs lightweight hash-shape verification for commit identifiers.
+///
+/// Accepted lengths cover short SHAs (7+) and long hexadecimal digests (up to 64).
 fn is_verified_commit_hash(commit_hash: &str) -> bool {
     (7..=64).contains(&commit_hash.len())
         && commit_hash
@@ -4122,6 +4133,7 @@ fn runtime_kind_label(runtime_kind: RuntimeKind) -> &'static str {
     }
 }
 
+/// Serializes BuildStatus into API-safe lowercase labels.
 fn build_status_label(status: BuildStatus) -> &'static str {
     match status {
         BuildStatus::Unknown => "unknown",
@@ -4165,6 +4177,7 @@ pub struct TemporalRecoverRequest {
     pub strategy: String,
 }
 
+/// Returns `/repo/{id}/commits` payload containing commit hashes, timestamps, and build status.
 pub fn list_repo_commits_endpoint(repo_id: &str, graph: &RepositoryTimeGraph) -> (String, String) {
     (
         format!("/repo/{repo_id}/commits"),
@@ -4182,6 +4195,7 @@ pub fn list_repo_commits_endpoint(repo_id: &str, graph: &RepositoryTimeGraph) ->
     )
 }
 
+/// Returns `/execute` payload after validating that the requested commit hash is well-formed.
 pub fn execute_commit_endpoint(request: &TemporalExecuteRequest) -> (String, String) {
     let verified = is_verified_commit_hash(&request.commit);
     (
@@ -4196,6 +4210,7 @@ pub fn execute_commit_endpoint(request: &TemporalExecuteRequest) -> (String, Str
     )
 }
 
+/// Returns `/execute/recover` payload with a selected fallback commit for the requested strategy.
 pub fn execute_recover_endpoint(
     request: &TemporalRecoverRequest,
     router: &TemporalExecutionRouter,
