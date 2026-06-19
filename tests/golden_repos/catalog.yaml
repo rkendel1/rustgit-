@@ -1,0 +1,134 @@
+repositories:
+  - name: nextjs
+    category: node
+    repository: https://github.com/vercel/next.js
+    expected:
+      framework: nextjs
+      services: [web]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: express-basic
+    category: node
+    repository: https://github.com/expressjs/express
+    expected:
+      framework: express
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: nestjs-basic
+    category: node
+    repository: https://github.com/nestjs/nest
+    expected:
+      framework: nestjs
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: vite-basic
+    category: node
+    repository: https://github.com/vitejs/vite
+    expected:
+      framework: vite
+      services: [web]
+      route_checks: [/]
+      healthcheck: [200]
+
+  - name: fastapi-basic
+    category: python
+    repository: https://github.com/fastapi/fastapi
+    expected:
+      framework: fastapi
+      services: [backend]
+      route_checks: [/docs]
+      healthcheck: [200]
+  - name: django-basic
+    category: python
+    repository: https://github.com/django/django
+    expected:
+      framework: django
+      services: [backend]
+      route_checks: [/admin]
+      healthcheck: [200]
+  - name: flask-basic
+    category: python
+    repository: https://github.com/pallets/flask
+    expected:
+      framework: flask
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: streamlit-basic
+    category: python
+    repository: https://github.com/streamlit/streamlit
+    expected:
+      framework: streamlit
+      services: [frontend]
+      route_checks: [/]
+      healthcheck: [200]
+
+  - name: axum-basic
+    category: rust
+    repository: https://github.com/tokio-rs/axum
+    expected:
+      framework: axum
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: actix-basic
+    category: rust
+    repository: https://github.com/actix/actix-web
+    expected:
+      framework: actix
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+
+  - name: gin-basic
+    category: go
+    repository: https://github.com/gin-gonic/gin
+    expected:
+      framework: gin
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+  - name: fiber-basic
+    category: go
+    repository: https://github.com/gofiber/fiber
+    expected:
+      framework: fiber
+      services: [backend]
+      route_checks: [/]
+      healthcheck: [200]
+
+  - name: bun-starter
+    category: bun
+    repository: https://github.com/oven-sh/bun
+    expected:
+      framework: bun
+      services: [web]
+      route_checks: [/]
+      healthcheck: [200]
+
+  - name: nx-monorepo
+    category: monorepo
+    repository: https://github.com/nrwl/nx
+    expected:
+      framework: nx
+      services: [web, api]
+      route_checks: [/api/health]
+      healthcheck: [200]
+  - name: turborepo
+    category: monorepo
+    repository: https://github.com/vercel/turborepo
+    expected:
+      framework: turborepo
+      services: [web, api]
+      route_checks: [/api/health]
+      healthcheck: [200]
+  - name: pnpm-workspace
+    category: monorepo
+    repository: https://github.com/pnpm/pnpm
+    expected:
+      framework: pnpm-workspace
+      services: [web, api]
+      route_checks: [/api/health]
+      healthcheck: [200]

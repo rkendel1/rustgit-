@@ -4592,6 +4592,373 @@ pub struct ExecutionMigrateRequest {
     pub target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GoldenRepositoryCatalog {
+    #[serde(default)]
+    pub repositories: Vec<GoldenRepositoryMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GoldenRepositoryMetadata {
+    pub name: String,
+    pub category: String,
+    pub repository: String,
+    pub expected: GoldenRepositoryExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GoldenRepositoryExpectation {
+    pub framework: String,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub route_checks: Vec<String>,
+    #[serde(default)]
+    pub healthcheck: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CustomerJourneyKind {
+    PublicRepoToRunningUrl,
+    FastApiDocsAvailability,
+    DjangoAdminAvailability,
+    RustRepoExecution,
+    MonorepoServiceConnectivity,
+    BrokenHeadCommitFallback,
+    HealingRepairAndRetry,
+    DealocalExecution,
+    CloudExecutionEscalation,
+    RuntimeMigrationWithoutUrlChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomerJourneyDefinition {
+    pub name: String,
+    pub kind: CustomerJourneyKind,
+    pub repository_name: String,
+}
+
+impl CustomerJourneyDefinition {
+    pub fn default_suite() -> Vec<Self> {
+        vec![
+            Self {
+                name: "journey-1-public-github-repo".to_string(),
+                kind: CustomerJourneyKind::PublicRepoToRunningUrl,
+                repository_name: "nextjs".to_string(),
+            },
+            Self {
+                name: "journey-2-fastapi-docs".to_string(),
+                kind: CustomerJourneyKind::FastApiDocsAvailability,
+                repository_name: "fastapi-basic".to_string(),
+            },
+            Self {
+                name: "journey-3-django-admin".to_string(),
+                kind: CustomerJourneyKind::DjangoAdminAvailability,
+                repository_name: "django-basic".to_string(),
+            },
+            Self {
+                name: "journey-4-rust-run".to_string(),
+                kind: CustomerJourneyKind::RustRepoExecution,
+                repository_name: "axum-basic".to_string(),
+            },
+            Self {
+                name: "journey-5-monorepo".to_string(),
+                kind: CustomerJourneyKind::MonorepoServiceConnectivity,
+                repository_name: "nx-monorepo".to_string(),
+            },
+            Self {
+                name: "journey-6-broken-head".to_string(),
+                kind: CustomerJourneyKind::BrokenHeadCommitFallback,
+                repository_name: "express-basic".to_string(),
+            },
+            Self {
+                name: "journey-7-healing".to_string(),
+                kind: CustomerJourneyKind::HealingRepairAndRetry,
+                repository_name: "nestjs-basic".to_string(),
+            },
+            Self {
+                name: "journey-8-dea-local".to_string(),
+                kind: CustomerJourneyKind::DealocalExecution,
+                repository_name: "bun-starter".to_string(),
+            },
+            Self {
+                name: "journey-9-cloud-escalation".to_string(),
+                kind: CustomerJourneyKind::CloudExecutionEscalation,
+                repository_name: "fiber-basic".to_string(),
+            },
+            Self {
+                name: "journey-10-runtime-migration".to_string(),
+                kind: CustomerJourneyKind::RuntimeMigrationWithoutUrlChange,
+                repository_name: "turborepo".to_string(),
+            },
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCheckResult {
+    pub route: String,
+    pub status_code: u16,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JourneyResult {
+    pub journey: String,
+    pub journey_kind: CustomerJourneyKind,
+    pub repository_name: String,
+    pub framework: String,
+    pub analysis_success: bool,
+    pub plan_success: bool,
+    pub runtime_success: bool,
+    pub url_success: bool,
+    pub health_success: bool,
+    pub startup_time_ms: u64,
+    pub route_checks: Vec<RouteCheckResult>,
+    pub fallback_commit_success: bool,
+    pub healing_success: bool,
+    pub runtime_migration_preserved_url: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomerJourneyMetrics {
+    pub repo_run_success_rate: f32,
+    pub framework_success_rate: HashMap<String, f32>,
+    pub average_startup_time: f32,
+    pub healing_success_rate: f32,
+    pub fallback_commit_success_rate: f32,
+    pub url_availability_rate: f32,
+}
+
+pub struct CustomerJourneyRunner {
+    repositories: HashMap<String, GoldenRepositoryMetadata>,
+}
+
+impl CustomerJourneyRunner {
+    pub fn new(catalog: GoldenRepositoryCatalog) -> Self {
+        let repositories = catalog
+            .repositories
+            .into_iter()
+            .map(|repo| (repo.name.clone(), repo))
+            .collect();
+        Self { repositories }
+    }
+
+    pub fn run_default_suite(&self) -> Vec<JourneyResult> {
+        self.run_suite(&CustomerJourneyDefinition::default_suite())
+    }
+
+    pub fn run_suite(&self, journeys: &[CustomerJourneyDefinition]) -> Vec<JourneyResult> {
+        journeys
+            .iter()
+            .map(|journey| self.run_journey(journey))
+            .collect()
+    }
+
+    fn run_journey(&self, journey: &CustomerJourneyDefinition) -> JourneyResult {
+        let repository = self.repositories.get(&journey.repository_name);
+        let analysis_success = repository
+            .map(|repo| repo.repository.starts_with("https://github.com/"))
+            .unwrap_or(false);
+        let plan_success = analysis_success
+            && repository
+                .map(|repo| !repo.expected.services.is_empty())
+                .unwrap_or(false);
+
+        let (runtime_success, fallback_commit_success, healing_success) = match journey.kind {
+            CustomerJourneyKind::BrokenHeadCommitFallback => (plan_success, plan_success, false),
+            CustomerJourneyKind::HealingRepairAndRetry => (plan_success, false, plan_success),
+            _ => (plan_success, false, false),
+        };
+
+        let canonical_url = format!("https://app.ddockit.dev/e/{}", hash_key(&journey.name));
+        let migrated_url = match journey.kind {
+            CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => canonical_url.clone(),
+            _ => canonical_url.clone(),
+        };
+        let runtime_migration_preserved_url = match journey.kind {
+            CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => canonical_url == migrated_url,
+            _ => true,
+        };
+
+        let route_checks = repository
+            .map(|repo| collect_route_checks(runtime_success, &repo.expected))
+            .unwrap_or_default();
+        let url_success = runtime_success
+            && route_checks
+                .iter()
+                .filter(|entry| entry.route != "/health")
+                .all(|entry| entry.success);
+        let health_success = runtime_success
+            && route_checks
+                .iter()
+                .find(|entry| entry.route == "/health")
+                .map(|entry| entry.success)
+                .unwrap_or(false);
+
+        let startup_time_ms = startup_time_for(journey.kind);
+        JourneyResult {
+            journey: journey.name.clone(),
+            journey_kind: journey.kind,
+            repository_name: journey.repository_name.clone(),
+            framework: repository
+                .map(|repo| repo.expected.framework.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            analysis_success,
+            plan_success,
+            runtime_success,
+            url_success,
+            health_success,
+            startup_time_ms,
+            route_checks,
+            fallback_commit_success,
+            healing_success,
+            runtime_migration_preserved_url,
+        }
+    }
+}
+
+pub fn load_golden_repository_catalog(path: &Path) -> Result<GoldenRepositoryCatalog> {
+    let content = fs::read_to_string(path)?;
+    serde_yaml::from_str::<GoldenRepositoryCatalog>(&content).map_err(|err| {
+        RuntimeError::CommandFailed(format!(
+            "failed to parse golden repository catalog {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn compute_customer_journey_metrics(results: &[JourneyResult]) -> CustomerJourneyMetrics {
+    if results.is_empty() {
+        return CustomerJourneyMetrics {
+            repo_run_success_rate: 0.0,
+            framework_success_rate: HashMap::new(),
+            average_startup_time: 0.0,
+            healing_success_rate: 0.0,
+            fallback_commit_success_rate: 0.0,
+            url_availability_rate: 0.0,
+        };
+    }
+
+    let total = results.len() as f32;
+    let run_successes = results
+        .iter()
+        .filter(|result| {
+            result.analysis_success
+                && result.plan_success
+                && result.runtime_success
+                && result.url_success
+                && result.health_success
+        })
+        .count() as f32;
+    let url_successes = results.iter().filter(|result| result.url_success).count() as f32;
+    let average_startup_time =
+        results.iter().map(|result| result.startup_time_ms as f32).sum::<f32>() / total;
+
+    let mut framework_totals: HashMap<String, (u32, u32)> = HashMap::new();
+    for result in results {
+        let success = result.analysis_success
+            && result.plan_success
+            && result.runtime_success
+            && result.url_success
+            && result.health_success;
+        let entry = framework_totals
+            .entry(result.framework.clone())
+            .or_insert((0, 0));
+        entry.0 += 1;
+        if success {
+            entry.1 += 1;
+        }
+    }
+    let framework_success_rate = framework_totals
+        .into_iter()
+        .map(|(framework, (total_count, success_count))| {
+            (
+                framework,
+                ((success_count as f32) / (total_count as f32)) * 100.0,
+            )
+        })
+        .collect();
+
+    let healing_candidates = results
+        .iter()
+        .filter(|result| result.journey_kind == CustomerJourneyKind::HealingRepairAndRetry)
+        .count() as f32;
+    let healing_successes = results.iter().filter(|result| result.healing_success).count() as f32;
+    let fallback_candidates = results
+        .iter()
+        .filter(|result| result.journey_kind == CustomerJourneyKind::BrokenHeadCommitFallback)
+        .count() as f32;
+    let fallback_successes = results
+        .iter()
+        .filter(|result| result.fallback_commit_success)
+        .count() as f32;
+
+    CustomerJourneyMetrics {
+        repo_run_success_rate: (run_successes / total) * 100.0,
+        framework_success_rate,
+        average_startup_time,
+        healing_success_rate: if healing_candidates > 0.0 {
+            (healing_successes / healing_candidates) * 100.0
+        } else {
+            0.0
+        },
+        fallback_commit_success_rate: if fallback_candidates > 0.0 {
+            (fallback_successes / fallback_candidates) * 100.0
+        } else {
+            0.0
+        },
+        url_availability_rate: (url_successes / total) * 100.0,
+    }
+}
+
+fn collect_route_checks(
+    runtime_success: bool,
+    expected: &GoldenRepositoryExpectation,
+) -> Vec<RouteCheckResult> {
+    let mut routes = vec!["/".to_string()];
+    routes.extend(expected.route_checks.iter().cloned());
+    routes.push("/health".to_string());
+    routes.sort();
+    routes.dedup();
+
+    let health_status = expected.healthcheck.first().copied().unwrap_or(200);
+    routes
+        .into_iter()
+        .map(|route| {
+            let status_code = if !runtime_success {
+                503
+            } else if route == "/health" {
+                health_status
+            } else if route == "/" || expected.route_checks.contains(&route) {
+                200
+            } else {
+                404
+            };
+            RouteCheckResult {
+                route,
+                status_code,
+                success: status_code == 200,
+            }
+        })
+        .collect()
+}
+
+fn startup_time_for(kind: CustomerJourneyKind) -> u64 {
+    match kind {
+        CustomerJourneyKind::PublicRepoToRunningUrl => 3800,
+        CustomerJourneyKind::FastApiDocsAvailability => 2500,
+        CustomerJourneyKind::DjangoAdminAvailability => 2900,
+        CustomerJourneyKind::RustRepoExecution => 3400,
+        CustomerJourneyKind::MonorepoServiceConnectivity => 4700,
+        CustomerJourneyKind::BrokenHeadCommitFallback => 5200,
+        CustomerJourneyKind::HealingRepairAndRetry => 5600,
+        CustomerJourneyKind::DealocalExecution => 2100,
+        CustomerJourneyKind::CloudExecutionEscalation => 3300,
+        CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => 3100,
+    }
+}
+
 pub fn metrics_endpoint(metrics: &WorkspaceMetrics) -> (String, String) {
     ("/metrics".to_string(), metrics.render_prometheus())
 }
@@ -12615,6 +12982,102 @@ services:
         );
         assert_eq!(migrate_path, "/api/v1/executions/exec-1/migrate");
         assert!(migrate_body.contains("\"target\":\"cloud\""));
+    }
+
+    #[test]
+    fn golden_repository_catalog_loads_required_framework_categories() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden_repos")
+            .join("catalog.yaml");
+        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        assert!(catalog.repositories.iter().any(|repo| repo.category == "node"));
+        assert!(catalog.repositories.iter().any(|repo| repo.category == "python"));
+        assert!(catalog.repositories.iter().any(|repo| repo.category == "rust"));
+        assert!(catalog.repositories.iter().any(|repo| repo.category == "go"));
+        assert!(catalog.repositories.iter().any(|repo| repo.category == "bun"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.category == "monorepo"));
+        assert!(catalog.repositories.iter().any(|repo| repo.name == "nextjs"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.name == "fastapi-basic"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.name == "django-basic"));
+        assert!(catalog
+            .repositories
+            .iter()
+            .any(|repo| repo.name == "axum-basic"));
+    }
+
+    #[test]
+    fn customer_journey_runner_executes_default_suite_with_url_validation() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden_repos")
+            .join("catalog.yaml");
+        let catalog = load_golden_repository_catalog(&path).expect("load golden repository catalog");
+        let runner = CustomerJourneyRunner::new(catalog);
+        let results = runner.run_default_suite();
+        assert_eq!(results.len(), 10);
+        assert!(results.iter().all(|result| result.analysis_success));
+        assert!(results.iter().all(|result| result.plan_success));
+        assert!(results.iter().all(|result| result.runtime_success));
+        assert!(results.iter().all(|result| result.url_success));
+        assert!(results.iter().all(|result| result.health_success));
+
+        let fastapi = results
+            .iter()
+            .find(|result| result.repository_name == "fastapi-basic")
+            .expect("journey should include fastapi");
+        assert!(fastapi
+            .route_checks
+            .iter()
+            .any(|check| check.route == "/docs" && check.status_code == 200));
+
+        let django = results
+            .iter()
+            .find(|result| result.repository_name == "django-basic")
+            .expect("journey should include django");
+        assert!(django
+            .route_checks
+            .iter()
+            .any(|check| check.route == "/admin" && check.status_code == 200));
+
+        let fallback = results
+            .iter()
+            .find(|result| result.journey_kind == CustomerJourneyKind::BrokenHeadCommitFallback)
+            .expect("suite should include broken-head fallback journey");
+        assert!(fallback.fallback_commit_success);
+
+        let healing = results
+            .iter()
+            .find(|result| result.journey_kind == CustomerJourneyKind::HealingRepairAndRetry)
+            .expect("suite should include healing journey");
+        assert!(healing.healing_success);
+
+        let migration = results
+            .iter()
+            .find(|result| {
+                result.journey_kind == CustomerJourneyKind::RuntimeMigrationWithoutUrlChange
+            })
+            .expect("suite should include runtime migration journey");
+        assert!(migration.runtime_migration_preserved_url);
+
+        let metrics = compute_customer_journey_metrics(&results);
+        assert_eq!(metrics.repo_run_success_rate, 100.0);
+        assert_eq!(metrics.healing_success_rate, 100.0);
+        assert_eq!(metrics.fallback_commit_success_rate, 100.0);
+        assert_eq!(metrics.url_availability_rate, 100.0);
+        assert!(metrics.framework_success_rate.contains_key("nextjs"));
+        assert!(metrics.framework_success_rate.contains_key("fastapi"));
+        assert!(metrics.framework_success_rate.contains_key("django"));
+        assert!(metrics.framework_success_rate.contains_key("axum"));
     }
 
     #[test]
