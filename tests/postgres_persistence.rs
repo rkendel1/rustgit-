@@ -22,6 +22,8 @@ fn postgres_migrations_apply_and_enforce_foreign_keys() -> Result<(), Box<dyn st
     assert_eq!(store.migration_count()?, 3);
     assert!(store.table_exists("repositories")?);
     assert!(store.table_exists("executions")?);
+    assert!(store.table_exists("workspaces")?);
+    assert!(store.table_exists("workspace_runtime_bindings")?);
     assert!(store.table_exists("schema_migrations")?);
 
     let missing_repo_commit = store.insert_commit(&EidbCommitRecord {
