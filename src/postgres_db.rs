@@ -85,6 +85,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "billing_metering",
         sql: include_str!("../migrations/0004_billing_metering.sql"),
     },
+    Migration {
+        version: "0005",
+        name: "anonymous_execution_identity",
+        sql: include_str!("../migrations/0005_anonymous_execution_identity.sql"),
+    },
 ];
 
 pub trait ExecutionIntelligenceReadStore {
@@ -447,15 +452,21 @@ impl ExecutionIntelligencePostgresStore {
     }
 
     pub fn insert_execution(&self, record: &EidbExecutionRecord) -> PersistenceResult<()> {
+        if !record.has_owner() {
+            return Err(ExecutionIntelligencePersistenceError::Serialization(
+                "execution owner must include either user_id or anon_user_id".to_string(),
+            ));
+        }
         self.with_client(|client| {
             let completed_at = Self::optional_epoch_to_pg(record.completed_at);
             client.execute(
-                "INSERT INTO executions (execution_id, org_id, user_id, workspace_id, repository_id, commit_hash, started_at, completed_at, status, execution_tier)
-                 VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::double precision), CASE WHEN $8 IS NULL THEN NULL ELSE to_timestamp($8::double precision) END, $9, $10)
+                "INSERT INTO executions (execution_id, org_id, user_id, anon_user_id, workspace_id, repository_id, commit_hash, started_at, completed_at, status, execution_tier)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8::double precision), CASE WHEN $9 IS NULL THEN NULL ELSE to_timestamp($9::double precision) END, $10, $11)
                  ON CONFLICT (execution_id)
                  DO UPDATE SET
                     org_id = EXCLUDED.org_id,
                     user_id = EXCLUDED.user_id,
+                    anon_user_id = EXCLUDED.anon_user_id,
                     workspace_id = EXCLUDED.workspace_id,
                     repository_id = EXCLUDED.repository_id,
                     commit_hash = EXCLUDED.commit_hash,
@@ -467,6 +478,7 @@ impl ExecutionIntelligencePostgresStore {
                     &record.execution_id,
                     &record.org_id,
                     &record.user_id,
+                    &record.anon_user_id,
                     &record.workspace_id,
                     &record.repository_id,
                     &record.commit_hash,
@@ -748,7 +760,7 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
     ) -> PersistenceResult<Vec<EidbExecutionRecord>> {
         self.with_client(|client| {
             let rows = client.query(
-                "SELECT execution_id, org_id, user_id, workspace_id, repository_id, commit_hash,
+                "SELECT execution_id, org_id, user_id, anon_user_id, workspace_id, repository_id, commit_hash,
                         EXTRACT(EPOCH FROM started_at)::BIGINT,
                         EXTRACT(EPOCH FROM completed_at)::BIGINT,
                         status, execution_tier
@@ -760,18 +772,19 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
 
             rows.into_iter()
                 .map(|row| {
-                    let completed_epoch: Option<i64> = row.get(7);
+                    let completed_epoch: Option<i64> = row.get(8);
                     Ok(EidbExecutionRecord {
                         execution_id: row.get(0),
                         org_id: row.get(1),
                         user_id: row.get(2),
-                        workspace_id: row.get(3),
-                        repository_id: row.get(4),
-                        commit_hash: row.get(5),
-                        started_at: Self::to_u64(row.get::<_, i64>(6))?,
+                        anon_user_id: row.get(3),
+                        workspace_id: row.get(4),
+                        repository_id: row.get(5),
+                        commit_hash: row.get(6),
+                        started_at: Self::to_u64(row.get::<_, i64>(7))?,
                         completed_at: completed_epoch.map(Self::to_u64).transpose()?,
-                        status: row.get(8),
-                        execution_tier: row.get(9),
+                        status: row.get(9),
+                        execution_tier: row.get(10),
                     })
                 })
                 .collect()
@@ -808,7 +821,7 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
     fn execution(&self, execution_id: &str) -> PersistenceResult<Option<EidbExecutionRecord>> {
         self.with_client(|client| {
             let row = client.query_opt(
-                "SELECT execution_id, org_id, user_id, workspace_id, repository_id, commit_hash,
+                "SELECT execution_id, org_id, user_id, anon_user_id, workspace_id, repository_id, commit_hash,
                         EXTRACT(EPOCH FROM started_at)::BIGINT,
                         EXTRACT(EPOCH FROM completed_at)::BIGINT,
                         status, execution_tier
@@ -818,18 +831,19 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
             )?;
 
             row.map(|row| {
-                let completed_epoch: Option<i64> = row.get(7);
+                let completed_epoch: Option<i64> = row.get(8);
                 Ok(EidbExecutionRecord {
                     execution_id: row.get(0),
                     org_id: row.get(1),
                     user_id: row.get(2),
-                    workspace_id: row.get(3),
-                    repository_id: row.get(4),
-                    commit_hash: row.get(5),
-                    started_at: Self::to_u64(row.get::<_, i64>(6))?,
+                    anon_user_id: row.get(3),
+                    workspace_id: row.get(4),
+                    repository_id: row.get(5),
+                    commit_hash: row.get(6),
+                    started_at: Self::to_u64(row.get::<_, i64>(7))?,
                     completed_at: completed_epoch.map(Self::to_u64).transpose()?,
-                    status: row.get(8),
-                    execution_tier: row.get(9),
+                    status: row.get(9),
+                    execution_tier: row.get(10),
                 })
             })
             .transpose()

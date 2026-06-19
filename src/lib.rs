@@ -43,6 +43,8 @@ const PRO_PLAN_RUNS_PER_DAY: usize = 1_000;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
 const CJVF_CANONICAL_HOST: &str = "trythissoftware.com";
+pub const DDOCKIT_ANON_ID_COOKIE: &str = "ddockit_anon_id";
+pub const DDOCKIT_SESSION_ID_COOKIE: &str = "ddockit_session_id";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
 const LOCAL_AGENT_LOCK_POISONED: &str =
@@ -4711,6 +4713,15 @@ impl CacheKeyEngine {
         graph: &ExecutionGraph,
         fingerprint: Option<&RepositoryFingerprint>,
     ) -> String {
+        Self::compute_node_key_for_identity(node, graph, fingerprint, None)
+    }
+
+    pub fn compute_node_key_for_identity(
+        node: &ExecutionNode,
+        graph: &ExecutionGraph,
+        fingerprint: Option<&RepositoryFingerprint>,
+        identity_partition: Option<&str>,
+    ) -> String {
         let mut incoming = graph
             .edges
             .iter()
@@ -4737,15 +4748,17 @@ impl CacheKeyEngine {
             // Optional cache namespace partitioning (for example dev/staging/prod).
             std::env::var("RUSTGIT_RUNTIME_ENV").unwrap_or_default()
         ));
+        let identity_partition = identity_partition.unwrap_or_default();
 
         hash_key(&format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             node_type_name(node.node_type),
             execution_mode_name(node.execution_mode),
             node.command.as_deref().unwrap_or_default(),
             format!("in:{}|out:{}", incoming.join(","), outgoing.join(",")),
             repo_hash,
-            env_hash
+            env_hash,
+            identity_partition
         ))
     }
 }
@@ -5389,11 +5402,31 @@ pub struct RepositoryAnalyzeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionStartRequest {
-    pub org_id: String,
-    pub user_id: String,
+    pub org_id: Option<String>,
+    pub user_id: Option<String>,
+    pub anon_user_id: Option<String>,
+    pub anon_session_id: Option<String>,
+    pub device_fingerprint: Option<String>,
     pub repo_url: String,
     pub branch: Option<String>,
     pub commit: Option<String>,
+}
+
+impl ExecutionStartRequest {
+    fn identity_partition_key(&self) -> String {
+        self.user_id
+            .clone()
+            .or_else(|| self.anon_user_id.clone())
+            .unwrap_or_else(|| "anonymous".to_string())
+    }
+
+    fn identity_type(&self) -> &'static str {
+        if self.user_id.is_some() {
+            "authenticated"
+        } else {
+            "anonymous"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5421,6 +5454,13 @@ pub struct OverlayRepositoryContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionMigrateRequest {
     pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionClaimRequest {
+    pub anon_user_id: String,
+    pub user_id: String,
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -6389,8 +6429,8 @@ pub fn workspace_delete_endpoint(workspace_id: &str, org_id: &str) -> (String, S
 pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, String) {
     let execution_seed = format!(
         "{}|{}|{}|{}|{}",
-        request.org_id,
-        request.user_id,
+        request.org_id.as_deref().unwrap_or_default(),
+        request.identity_partition_key(),
         request.repo_url,
         request.branch.as_deref().unwrap_or_default(),
         request.commit.as_deref().unwrap_or_default()
@@ -6404,9 +6444,14 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
             "execution_id": execution_id,
             "org_id": &request.org_id,
             "user_id": &request.user_id,
+            "anon_user_id": &request.anon_user_id,
+            "anon_session_id": &request.anon_session_id,
+            "device_fingerprint": &request.device_fingerprint,
+            "identity_type": request.identity_type(),
             "workspace_id": workspace_id,
             "status": "starting",
-            "workspace_url": format!("https://workspace-{workspace_slug}.trythissoftware.com")
+            "workspace_url": format!("https://workspace-{workspace_slug}.trythissoftware.com"),
+            "claim_workspace_prompt": request.user_id.is_none(),
         })
         .to_string(),
     )
@@ -6415,12 +6460,13 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
 pub fn executions_list_endpoint(org_id: &str, executions: &[EidbExecutionRecord]) -> (String, String) {
     let scoped = executions
         .iter()
-        .filter(|execution| execution.org_id == org_id)
+        .filter(|execution| execution.org_id.as_deref() == Some(org_id))
         .map(|execution| {
             json!({
                 "execution_id": &execution.execution_id,
                 "org_id": &execution.org_id,
                 "user_id": &execution.user_id,
+                "anon_user_id": &execution.anon_user_id,
                 "workspace_id": &execution.workspace_id,
                 "status": &execution.status
             })
@@ -6918,6 +6964,23 @@ pub fn execution_migrate_endpoint(
     )
 }
 
+pub fn execution_claim_endpoint(
+    execution_id: &str,
+    request: &ExecutionClaimRequest,
+) -> (String, String) {
+    (
+        format!("/api/v1/executions/{execution_id}/claim"),
+        json!({
+            "execution_id": execution_id,
+            "anon_user_id": &request.anon_user_id,
+            "user_id": &request.user_id,
+            "org_id": &request.org_id,
+            "status": "claimed"
+        })
+        .to_string(),
+    )
+}
+
 pub fn execution_image_endpoint(
     repo_id: &str,
     registry: &mut ExecutionImageRegistry,
@@ -7206,8 +7269,9 @@ pub struct EidbTopologyRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EidbExecutionRecord {
     pub execution_id: String,
-    pub org_id: String,
-    pub user_id: String,
+    pub org_id: Option<String>,
+    pub user_id: Option<String>,
+    pub anon_user_id: Option<String>,
     pub workspace_id: String,
     pub repository_id: String,
     pub commit_hash: String,
@@ -7215,6 +7279,12 @@ pub struct EidbExecutionRecord {
     pub completed_at: Option<u64>,
     pub status: String,
     pub execution_tier: String,
+}
+
+impl EidbExecutionRecord {
+    pub fn has_owner(&self) -> bool {
+        self.user_id.is_some() || self.anon_user_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7301,6 +7371,31 @@ pub struct EidbCommitExecutionResultRecord {
     pub recorded_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityMergeEngine;
+
+impl IdentityMergeEngine {
+    pub fn claim_anonymous_executions(
+        &self,
+        database: &mut ExecutionIntelligenceDatabase,
+        anon_user_id: &str,
+        user_id: &str,
+        org_id: Option<&str>,
+    ) -> usize {
+        let mut merged = 0;
+        for execution in &mut database.executions {
+            if execution.anon_user_id.as_deref() == Some(anon_user_id) {
+                execution.user_id = Some(user_id.to_string());
+                if let Some(org_id) = org_id {
+                    execution.org_id = Some(org_id.to_string());
+                }
+                merged += 1;
+            }
+        }
+        merged
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ExecutionIntelligenceDatabase {
     pub repositories: HashMap<String, EidbRepositoryRecord>,
@@ -7327,6 +7422,7 @@ impl ExecutionIntelligenceDatabase {
             include_str!("../migrations/0002_indexes_and_constraints.sql"),
             include_str!("../migrations/0003_seed_bootstrap.sql"),
             include_str!("../migrations/0004_billing_metering.sql"),
+            include_str!("../migrations/0005_anonymous_execution_identity.sql"),
         ]
     }
 
@@ -10711,6 +10807,7 @@ pub mod ucpe_ti {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct SchedulingContext {
+        pub authenticated_identity: bool,
         pub trusted_repo: bool,
         pub cached_runtime: bool,
         pub cold_start_required: bool,
@@ -10726,6 +10823,9 @@ pub mod ucpe_ti {
             context: &SchedulingContext,
             policy_engine: &PolicyEngine,
         ) -> ExecutionTier {
+            if !context.authenticated_identity {
+                return ExecutionTier::ExternalProvider;
+            }
             if context.resource_heavy
                 && policy_engine
                     .execution_policies
@@ -11037,6 +11137,7 @@ impl Default for RestApiSpec {
             "POST /api/v1/repositories/analyze",
             "POST /api/v1/execution/plan",
             "POST /api/v1/executions",
+            "POST /api/v1/executions/{id}/claim",
             "GET /api/v1/executions/{id}",
             "GET /api/v1/executions/{id}/logs",
             "POST /api/v1/executions/{id}/restart",
@@ -13703,6 +13804,37 @@ dependencies:
     }
 
     #[test]
+    fn cache_key_engine_changes_with_identity_partition() {
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "build".to_string(),
+                node_type: ExecutionNodeType::Build,
+                command: Some("cargo build".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec!["Cargo.toml".to_string()],
+                outputs: vec!["target".to_string()],
+                cache_key: None,
+                runtime: None,
+                cache_binding: None,
+            }],
+            edges: vec![],
+        };
+        let key_for_user = CacheKeyEngine::compute_node_key_for_identity(
+            &graph.nodes[0],
+            &graph,
+            None,
+            Some("user-1"),
+        );
+        let key_for_anon = CacheKeyEngine::compute_node_key_for_identity(
+            &graph.nodes[0],
+            &graph,
+            None,
+            Some("anon-1"),
+        );
+        assert_ne!(key_for_user, key_for_anon);
+    }
+
+    #[test]
     fn repository_registry_classifies_and_tracks_repo_delta() {
         let repo = temp_dir("registry-monorepo");
         fs::write(
@@ -15105,6 +15237,7 @@ dependencies:
         assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
         assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
+        assert!(spec.routes.contains(&"POST /api/v1/executions/{id}/claim"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}"));
         assert!(spec.routes.contains(&"GET /api/v1/executions/{id}/logs"));
         assert!(spec
@@ -15139,6 +15272,7 @@ dependencies:
 
         let trusted_cached = scheduler.schedule(
             &ucpe_ti::SchedulingContext {
+                authenticated_identity: true,
                 trusted_repo: true,
                 cached_runtime: true,
                 cold_start_required: false,
@@ -15150,6 +15284,7 @@ dependencies:
 
         let cold_start = scheduler.schedule(
             &ucpe_ti::SchedulingContext {
+                authenticated_identity: true,
                 trusted_repo: false,
                 cached_runtime: false,
                 cold_start_required: true,
@@ -15161,6 +15296,7 @@ dependencies:
 
         let heavy = scheduler.schedule(
             &ucpe_ti::SchedulingContext {
+                authenticated_identity: true,
                 trusted_repo: true,
                 cached_runtime: true,
                 cold_start_required: false,
@@ -15169,6 +15305,18 @@ dependencies:
             &policy,
         );
         assert_eq!(heavy, ExecutionTier::DDockitCloud);
+
+        let anonymous = scheduler.schedule(
+            &ucpe_ti::SchedulingContext {
+                authenticated_identity: false,
+                trusted_repo: true,
+                cached_runtime: true,
+                cold_start_required: false,
+                resource_heavy: false,
+            },
+            &policy,
+        );
+        assert_eq!(anonymous, ExecutionTier::ExternalProvider);
     }
 
     #[test]
@@ -15806,8 +15954,11 @@ services:
         assert!(plan_body.contains("\"startup_order\":[\"backend\"]"));
 
         let (start_path, start_body) = executions_start_endpoint(&ExecutionStartRequest {
-            org_id: "org-1".to_string(),
-            user_id: "user-1".to_string(),
+            org_id: Some("org-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            anon_user_id: None,
+            anon_session_id: None,
+            device_fingerprint: None,
             repo_url: "https://github.com/example/app".to_string(),
             branch: Some("main".to_string()),
             commit: None,
@@ -15815,6 +15966,7 @@ services:
         assert_eq!(start_path, "/api/v1/executions");
         assert!(start_body.contains("\"org_id\":\"org-1\""));
         assert!(start_body.contains("\"user_id\":\"user-1\""));
+        assert!(start_body.contains("\"identity_type\":\"authenticated\""));
         assert!(start_body.contains("\"status\":\"starting\""));
         assert!(start_body.contains("\"workspace_url\":\"https://workspace-"));
 
@@ -15895,6 +16047,17 @@ services:
         );
         assert_eq!(migrate_path, "/api/v1/executions/exec-1/migrate");
         assert!(migrate_body.contains("\"target\":\"cloud\""));
+
+        let (claim_path, claim_body) = execution_claim_endpoint(
+            "exec-1",
+            &ExecutionClaimRequest {
+                anon_user_id: "anon-1".to_string(),
+                user_id: "user-1".to_string(),
+                org_id: Some("org-1".to_string()),
+            },
+        );
+        assert_eq!(claim_path, "/api/v1/executions/exec-1/claim");
+        assert!(claim_body.contains("\"status\":\"claimed\""));
 
         let (workspace_list_path, workspace_list_body) =
             workspaces_list_endpoint("org-1", &workspace_router);
@@ -16026,8 +16189,9 @@ services:
         let executions = vec![
             EidbExecutionRecord {
                 execution_id: "exec-1".to_string(),
-                org_id: "org-1".to_string(),
-                user_id: "user-1".to_string(),
+                org_id: Some("org-1".to_string()),
+                user_id: Some("user-1".to_string()),
+                anon_user_id: None,
                 workspace_id: "ws-1".to_string(),
                 repository_id: "repo".to_string(),
                 commit_hash: "aaaaaaa".to_string(),
@@ -16038,8 +16202,9 @@ services:
             },
             EidbExecutionRecord {
                 execution_id: "exec-2".to_string(),
-                org_id: "org-2".to_string(),
-                user_id: "user-2".to_string(),
+                org_id: Some("org-2".to_string()),
+                user_id: Some("user-2".to_string()),
+                anon_user_id: None,
                 workspace_id: "ws-2".to_string(),
                 repository_id: "repo".to_string(),
                 commit_hash: "bbbbbbb".to_string(),
@@ -16054,6 +16219,35 @@ services:
         assert_eq!(path, "/executions?org_id=org-1");
         assert!(body.contains("\"execution_id\":\"exec-1\""));
         assert!(!body.contains("\"execution_id\":\"exec-2\""));
+    }
+
+    #[test]
+    fn identity_merge_engine_claims_anonymous_execution_history() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-anon-1".to_string(),
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon-user-1".to_string()),
+            workspace_id: "ws-anon-1".to_string(),
+            repository_id: "repo".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 1,
+            completed_at: None,
+            status: "running".to_string(),
+            execution_tier: "DEA".to_string(),
+        });
+
+        let engine = IdentityMergeEngine;
+        let merged =
+            engine.claim_anonymous_executions(&mut database, "anon-user-1", "user-1", Some("org-1"));
+        assert_eq!(merged, 1);
+        assert_eq!(database.executions[0].user_id.as_deref(), Some("user-1"));
+        assert_eq!(database.executions[0].org_id.as_deref(), Some("org-1"));
+        assert_eq!(
+            database.executions[0].anon_user_id.as_deref(),
+            Some("anon-user-1")
+        );
     }
 
     #[test]
@@ -16095,8 +16289,11 @@ services:
     #[test]
     fn extension_and_portal_execution_starts_share_ids_and_urls() {
         let request = ExecutionStartRequest {
-            org_id: "org-1".to_string(),
-            user_id: "user-1".to_string(),
+            org_id: Some("org-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            anon_user_id: None,
+            anon_session_id: None,
+            device_fingerprint: None,
             repo_url: "https://github.com/example/app".to_string(),
             branch: Some("main".to_string()),
             commit: None,
@@ -16130,6 +16327,25 @@ services:
                 .get("workspace_url")
                 .and_then(serde_json::Value::as_str)
         );
+    }
+
+    #[test]
+    fn executions_start_endpoint_supports_anonymous_identity() {
+        let (path, body) = executions_start_endpoint(&ExecutionStartRequest {
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon-1".to_string()),
+            anon_session_id: Some("session-1".to_string()),
+            device_fingerprint: Some("browser-chrome:extension-a".to_string()),
+            repo_url: "https://github.com/example/app".to_string(),
+            branch: Some("main".to_string()),
+            commit: None,
+        });
+
+        assert_eq!(path, "/api/v1/executions");
+        assert!(body.contains("\"anon_user_id\":\"anon-1\""));
+        assert!(body.contains("\"identity_type\":\"anonymous\""));
+        assert!(body.contains("\"claim_workspace_prompt\":true"));
     }
 
     #[test]
@@ -16831,6 +17047,7 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS services"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS topologies"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS executions"));
+        assert!(schema.contains("anon_user_id"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_events"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS billing_events"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS runtime_images"));
@@ -16867,8 +17084,9 @@ services:
         });
         database.record_execution(EidbExecutionRecord {
             execution_id: "exec-1".to_string(),
-            org_id: "org-1".to_string(),
-            user_id: "user-1".to_string(),
+            org_id: Some("org-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            anon_user_id: None,
             workspace_id: "ws-1".to_string(),
             repository_id: "repo-eidb".to_string(),
             commit_hash: "aaaaaaa".to_string(),
@@ -16954,8 +17172,9 @@ services:
         });
         database.record_execution(EidbExecutionRecord {
             execution_id: "exec-2".to_string(),
-            org_id: "org-1".to_string(),
-            user_id: "user-1".to_string(),
+            org_id: Some("org-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            anon_user_id: None,
             workspace_id: "ws-2".to_string(),
             repository_id: "repo-eidb".to_string(),
             commit_hash: "bbbbbbb".to_string(),

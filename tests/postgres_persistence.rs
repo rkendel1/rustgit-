@@ -21,7 +21,7 @@ fn postgres_migrations_apply_and_enforce_foreign_keys() -> Result<(), Box<dyn st
     let store = ExecutionIntelligencePostgresStore::connect(&database_url)?;
     store.reset_for_development()?;
 
-    assert_eq!(store.migration_count()?, 4);
+    assert_eq!(store.migration_count()?, 5);
     assert!(store.table_exists("users")?);
     assert!(store.table_exists("organizations")?);
     assert!(store.table_exists("memberships")?);
@@ -85,8 +85,9 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
 
     store.insert_execution(&EidbExecutionRecord {
         execution_id: "exec-1".to_string(),
-        org_id: "org-bootstrap".to_string(),
-        user_id: "user-bootstrap".to_string(),
+        org_id: Some("org-bootstrap".to_string()),
+        user_id: Some("user-bootstrap".to_string()),
+        anon_user_id: None,
         workspace_id: "ws-1".to_string(),
         repository_id: "repo-eidb".to_string(),
         commit_hash: "aaaaaaa".to_string(),
