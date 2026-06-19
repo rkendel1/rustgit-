@@ -30,6 +30,8 @@ const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
     "distributed artifact store lock poisoned: another thread panicked while holding the lock";
+const LOCAL_AGENT_LOCK_POISONED: &str =
+    "LocalAgentProvider: failed to acquire agent lock due to panic in another thread";
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -1591,7 +1593,10 @@ impl DistributedExecutionAgent {
     pub fn assign_execution(&mut self, signed_graph: &SignedExecutionGraph) -> Result<()> {
         if !self.verify_graph(signed_graph) {
             return Err(RuntimeError::CommandFailed(
-                "distributed execution agent rejected unsigned execution graph".to_string(),
+                format!(
+                    "distributed execution agent `{}` rejected unsigned execution graph",
+                    self.identity.agent_id
+                ),
             ));
         }
         self.status = AgentStatus::AssignedExecution;
@@ -1601,9 +1606,7 @@ impl DistributedExecutionAgent {
     }
 
     pub fn complete_execution(&mut self) {
-        if self.active_executions > 0 {
-            self.active_executions -= 1;
-        }
+        self.active_executions = self.active_executions.saturating_sub(1);
         self.status = if self.active_executions == 0 {
             AgentStatus::Idle
         } else {
@@ -1622,7 +1625,11 @@ impl DistributedExecutionAgent {
     }
 
     pub fn stable_workspace_url(&self, workspace_id: &str) -> String {
-        let sanitized = ExecutionRouter::sanitized_workspace_id(workspace_id);
+        let normalized_workspace_id = workspace_id
+            .trim()
+            .strip_prefix("workspace-")
+            .unwrap_or(workspace_id);
+        let sanitized = ExecutionRouter::sanitized_workspace_id(normalized_workspace_id);
         format!("https://workspace-{sanitized}.ddockit.dev")
     }
 }
@@ -5068,7 +5075,7 @@ impl ExecutionProvider for LocalAgentProvider {
     }
 
     fn capability(&self) -> ProviderCapability {
-        let agent = self.agent.lock().expect("agent lock poisoned");
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
         let capabilities = agent.capabilities.clone().unwrap_or(AgentCapabilities {
             cpu: 0,
             memory: "0MB".to_string(),
@@ -5101,7 +5108,7 @@ impl ExecutionProvider for LocalAgentProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        let agent = self.agent.lock().expect("agent lock poisoned");
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
         agent.can_execute(ctx)
     }
 
@@ -5110,7 +5117,7 @@ impl ExecutionProvider for LocalAgentProvider {
     }
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
-        let mut agent = self.agent.lock().expect("agent lock poisoned");
+        let mut agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
         let graph = SignedExecutionGraph {
             graph: ctx.execution_graph.clone(),
             signature: agent.sign_graph(&ctx.execution_graph),
@@ -5123,13 +5130,13 @@ impl ExecutionProvider for LocalAgentProvider {
     }
 
     fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
-        let mut agent = self.agent.lock().expect("agent lock poisoned");
+        let mut agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
         agent.complete_execution();
         Ok(())
     }
 
     fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
-        let agent = self.agent.lock().expect("agent lock poisoned");
+        let agent = self.agent.lock().expect(LOCAL_AGENT_LOCK_POISONED);
         Ok(HealthStatus {
             healthy: agent.identity.trusted,
             message: if agent.identity.trusted {
@@ -5497,6 +5504,7 @@ fn parse_agent_memory_to_mb(memory: &str) -> u64 {
         }
     }
     let Some(value) = digits.parse::<f64>().ok() else {
+        eprintln!("unable to parse agent memory declaration `{memory}`");
         return 0;
     };
     let multiplier = match unit.as_str() {
@@ -5504,7 +5512,10 @@ fn parse_agent_memory_to_mb(memory: &str) -> u64 {
         "gb" | "gib" => 1024.0,
         "mb" | "mib" | "" => 1.0,
         "kb" | "kib" => 1.0 / 1024.0,
-        _ => 1.0,
+        _ => {
+            eprintln!("unsupported agent memory unit `{unit}` from declaration `{memory}`");
+            return 0;
+        }
     };
     (value * multiplier).round().max(0.0) as u64
 }
@@ -8001,7 +8012,7 @@ mod tests {
         assert_eq!(heartbeat.status, AgentStatus::Idle);
         assert_eq!(
             agent.stable_workspace_url("workspace-abc"),
-            "https://workspace-workspace-abc.ddockit.dev"
+            "https://workspace-abc.ddockit.dev"
         );
     }
 
