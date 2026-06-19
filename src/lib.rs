@@ -34,6 +34,12 @@ const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
 const SESSION_WORKER_EVENT_BUFFER_LIMIT: usize = 1_024;
 const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
+const MIN_BILLABLE_DURATION_SECONDS: f64 = 1.0;
+const RETRY_PENALTY_UNITS: f64 = 0.25;
+const HEALING_COST_MULTIPLIER_PER_CYCLE: f64 = 0.5;
+const WARM_POOL_DISCOUNT_MULTIPLIER: f64 = 0.1;
+const FREE_PLAN_RUNS_PER_DAY: usize = 10;
+const PRO_PLAN_RUNS_PER_DAY: usize = 1_000;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
 const CJVF_CANONICAL_HOST: &str = "trythissoftware.com";
@@ -1660,6 +1666,13 @@ fn now_epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn now_epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryClassification {
     pub class: RepoClass,
@@ -1725,7 +1738,30 @@ impl RuntimeTier {
             "DOCKER" | "DOCKER_LOCAL" | "LOCAL_DOCKER" => Self::DockerLocal,
             "EXTERNAL" | "EXTERNAL_PROVIDER" => Self::ExternalProvider,
             "CLOUD" | "CLOUD_FALLBACK" | "DDOCKIT_CLOUD" => Self::CloudFallback,
-            _ => Self::CloudFallback,
+            _ => Self::DeaLocal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingEventType {
+    ExecutionStarted,
+    ExecutionAnalyzed,
+    ExecutionRuntimeSelected,
+    ExecutionHealingAttempted,
+    ExecutionMigrated,
+    ExecutionCompleted,
+}
+
+impl BillingEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionStarted => "EXECUTION_STARTED",
+            Self::ExecutionAnalyzed => "EXECUTION_ANALYZED",
+            Self::ExecutionRuntimeSelected => "EXECUTION_RUNTIME_SELECTED",
+            Self::ExecutionHealingAttempted => "EXECUTION_HEALING_ATTEMPTED",
+            Self::ExecutionMigrated => "EXECUTION_MIGRATED",
+            Self::ExecutionCompleted => "EXECUTION_COMPLETED",
         }
     }
 }
@@ -1800,13 +1836,14 @@ impl ExecutionMeter {
     }
 
     pub fn complete_with_elapsed(&self, elapsed: Duration) -> ExecutionCostBreakdown {
-        let duration_seconds = elapsed.as_secs_f64().max(1.0);
+        let duration_seconds = elapsed.as_secs_f64().max(MIN_BILLABLE_DURATION_SECONDS);
         let runtime_weight = self.runtime_tier.weight();
         let runtime_cost = runtime_weight;
         let duration_cost = (duration_seconds / 60.0) * runtime_weight;
-        let retry_penalty = f64::from(self.retries) * 0.25;
-        let healing_cost = f64::from(self.healing_cycles) * 0.5 * runtime_weight;
-        let warm_pool_discount = f64::from(self.warm_pool_hits) * 0.1 * runtime_weight;
+        let retry_penalty = f64::from(self.retries) * RETRY_PENALTY_UNITS;
+        let healing_cost =
+            f64::from(self.healing_cycles) * HEALING_COST_MULTIPLIER_PER_CYCLE * runtime_weight;
+        let warm_pool_discount = f64::from(self.warm_pool_hits) * WARM_POOL_DISCOUNT_MULTIPLIER * runtime_weight;
         let total_cost_units =
             (runtime_cost + duration_cost + retry_penalty + healing_cost - warm_pool_discount).max(0.0);
 
@@ -6499,6 +6536,10 @@ pub struct EidbBillingEventRecord {
     pub user_id: String,
     pub workspace_id: String,
     pub execution_id: String,
+    /// Metered lifecycle event type.
+    /// Expected values include EXECUTION_STARTED, EXECUTION_ANALYZED,
+    /// EXECUTION_RUNTIME_SELECTED, EXECUTION_HEALING_ATTEMPTED,
+    /// EXECUTION_MIGRATED, and EXECUTION_COMPLETED.
     pub event_type: String,
     pub runtime_type: String,
     pub resource_usage: Value,
@@ -6767,11 +6808,16 @@ pub fn billing_usage_endpoint_with_store(
     let total_cost_units: f64 = events.iter().map(|event| event.cost_units).sum();
     let run_count = events
         .iter()
-        .filter(|event| event.event_type.eq_ignore_ascii_case("EXECUTION_COMPLETED"))
+        .filter(|event| {
+            event.event_type
+                .eq_ignore_ascii_case(BillingEventType::ExecutionCompleted.as_str())
+        })
         .count();
-    let free_tier_usage = run_count.min(10);
-    let pro_tier_usage = run_count.saturating_sub(10).min(1_000);
-    let enterprise_usage = run_count.saturating_sub(1_010);
+    let free_tier_usage = run_count.min(FREE_PLAN_RUNS_PER_DAY);
+    let pro_tier_usage = run_count
+        .saturating_sub(FREE_PLAN_RUNS_PER_DAY)
+        .min(PRO_PLAN_RUNS_PER_DAY);
+    let enterprise_usage = run_count.saturating_sub(FREE_PLAN_RUNS_PER_DAY + PRO_PLAN_RUNS_PER_DAY);
 
     Ok((
         format!("/billing/usage?org_id={org_id}"),
@@ -6780,8 +6826,8 @@ pub fn billing_usage_endpoint_with_store(
             "events": events,
             "total_cost_units": total_cost_units,
             "quota": {
-                "free_runs_per_day": 10,
-                "pro_runs_per_day": 1000,
+                "free_runs_per_day": FREE_PLAN_RUNS_PER_DAY,
+                "pro_runs_per_day": PRO_PLAN_RUNS_PER_DAY,
                 "enterprise_runs_per_day": "unlimited",
             },
             "usage_buckets": {
@@ -6789,7 +6835,7 @@ pub fn billing_usage_endpoint_with_store(
                 "pro_tier_usage": pro_tier_usage,
                 "enterprise_usage": enterprise_usage,
             },
-            "quota_exceeded": run_count > 1000,
+            "quota_exceeded": run_count > FREE_PLAN_RUNS_PER_DAY + PRO_PLAN_RUNS_PER_DAY,
         })
         .to_string(),
     ))
@@ -6817,7 +6863,7 @@ pub fn billing_summary_endpoint_with_store(
         *execution_cost_history
             .entry(event.execution_id.clone())
             .or_insert(0.0) += event.cost_units;
-        if event.event_type.contains("HEALING") {
+        if event.event_type == BillingEventType::ExecutionHealingAttempted.as_str() {
             healing_costs += event.cost_units;
         }
     }
@@ -6853,7 +6899,7 @@ pub fn billing_invoice_endpoint_with_store(
         *execution_costs.entry(event.execution_id.clone()).or_insert(0.0) += event.cost_units;
     }
 
-    let invoice_id = format!("invoice-{org_id}-{}", now_epoch_seconds());
+    let invoice_id = format!("invoice-{org_id}-{}", now_epoch_millis());
 
     Ok((
         "/billing/invoice".to_string(),

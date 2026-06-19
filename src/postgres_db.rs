@@ -615,8 +615,7 @@ impl ExecutionIntelligencePostgresStore {
                     event_type, runtime_type, resource_usage, cost_units, timestamp
                  )
                  VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    to_timestamp($10::double precision)
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10::double precision)
                  )
                  ON CONFLICT (event_id)
                  DO UPDATE SET
