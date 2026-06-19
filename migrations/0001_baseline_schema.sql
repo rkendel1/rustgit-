@@ -96,6 +96,27 @@ CREATE TABLE IF NOT EXISTS url_allocations (
     CHECK (released_at IS NULL OR released_at >= created_at)
 );
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    commit_hash TEXT NOT NULL REFERENCES commits(commit_hash) ON DELETE CASCADE,
+    current_runtime TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    last_healthy_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS workspace_runtime_bindings (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    runtime_type TEXT NOT NULL CHECK (runtime_type IN ('DEA', 'CLOUD', 'DOCKER', 'EXTERNAL')),
+    runtime_instance_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    runtime_heartbeat TIMESTAMPTZ,
+    last_request_time TIMESTAMPTZ,
+    execution_health BOOLEAN
+);
+
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
     capabilities JSONB NOT NULL,

@@ -15,6 +15,10 @@ CREATE INDEX IF NOT EXISTS idx_healing_attempts_repository_id ON healing_attempt
 CREATE INDEX IF NOT EXISTS idx_healing_attempts_execution_id ON healing_attempts(execution_id);
 CREATE INDEX IF NOT EXISTS idx_healing_attempts_created_at ON healing_attempts(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_url_allocations_execution_id ON url_allocations(execution_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_repository_id ON workspaces(repository_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_commit_hash ON workspaces(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_workspace_bindings_runtime_type ON workspace_runtime_bindings(runtime_type);
+CREATE INDEX IF NOT EXISTS idx_workspace_bindings_lease_expires_at ON workspace_runtime_bindings(lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_journey_results_repo_id ON journey_results(repo_id);
 CREATE INDEX IF NOT EXISTS idx_journey_results_journey_type ON journey_results(journey_type);
 CREATE INDEX IF NOT EXISTS idx_commit_execution_results_commit_hash ON commit_execution_results(commit_hash);

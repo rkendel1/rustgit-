@@ -5108,6 +5108,90 @@ pub fn execution_plan_endpoint(analysis: &RepositoryAnalysis) -> (String, String
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCreateRequest {
+    pub repository_id: String,
+    pub commit_hash: String,
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRuntimeRequest {
+    pub runtime_type: String,
+    pub runtime_instance_id: String,
+    pub endpoint: String,
+    pub lease_expires_at: u64,
+}
+
+pub fn workspace_create_endpoint(request: &WorkspaceCreateRequest) -> (String, String) {
+    let workspace_seed = format!("{}:{}", request.repository_id, request.commit_hash);
+    let workspace_id = ExecutionRouter::sanitized_workspace_id(&hash_key(&workspace_seed)[..12]);
+    (
+        "/workspaces".to_string(),
+        json!({
+            "workspace_id": workspace_id.clone(),
+            "repository_id": &request.repository_id,
+            "commit_hash": &request.commit_hash,
+            "owner_id": &request.owner_id,
+            "status": "pending",
+            "workspace_url": stable_workspace_url(&workspace_id, true).0
+        })
+        .to_string(),
+    )
+}
+
+pub fn workspace_resolve_endpoint(workspace_id: &str, router: &WorkspaceRouter) -> (String, String) {
+    let workspace = router.registry.get(workspace_id);
+    let binding = router.resolver.resolve(workspace_id);
+    (
+        format!("/workspaces/{workspace_id}"),
+        json!({
+            "workspace_id": workspace_id,
+            "repository_id": workspace.map(|record| record.repository_id.as_str()),
+            "status": workspace.map(|record| format!("{:?}", record.state)),
+            "url": workspace.map(|record| record.assigned_url.0.as_str()),
+            "runtime_type": binding.map(|entry| format!("{:?}", entry.runtime_type)),
+            "runtime_instance_id": binding.map(|entry| entry.runtime_instance_id.as_str()),
+            "endpoint": binding.map(|entry| entry.endpoint.as_str()),
+        })
+        .to_string(),
+    )
+}
+
+pub fn workspace_bind_endpoint(
+    workspace_id: &str,
+    request: &WorkspaceRuntimeRequest,
+) -> (String, String) {
+    (
+        format!("/workspaces/{workspace_id}/bind"),
+        json!({
+            "workspace_id": workspace_id,
+            "runtime_type": &request.runtime_type,
+            "runtime_instance_id": &request.runtime_instance_id,
+            "endpoint": &request.endpoint,
+            "lease_expires_at": request.lease_expires_at,
+        })
+        .to_string(),
+    )
+}
+
+pub fn workspace_migrate_endpoint(
+    workspace_id: &str,
+    request: &WorkspaceRuntimeRequest,
+) -> (String, String) {
+    (
+        format!("/workspaces/{workspace_id}/migrate"),
+        json!({
+            "workspace_id": workspace_id,
+            "runtime_type": &request.runtime_type,
+            "runtime_instance_id": &request.runtime_instance_id,
+            "endpoint": &request.endpoint,
+            "lease_expires_at": request.lease_expires_at,
+        })
+        .to_string(),
+    )
+}
+
 pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, String) {
     let execution_seed = format!(
         "{}|{}|{}",
@@ -6210,10 +6294,129 @@ pub fn execute_recover_endpoint(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceRuntimeType {
+    Dea,
+    Cloud,
+    Docker,
+    External,
+}
+
+impl WorkspaceRuntimeType {
+    pub fn to_runtime_type(self) -> RuntimeType {
+        match self {
+            Self::Dea => RuntimeType::Node,
+            Self::Cloud => RuntimeType::Static,
+            Self::Docker => RuntimeType::Wasm,
+            Self::External => RuntimeType::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceProxyProtocol {
+    Http,
+    WebSocket,
+    Sse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRuntimeBinding {
+    pub runtime_type: WorkspaceRuntimeType,
+    pub runtime_instance_id: String,
+    pub endpoint: String,
+    pub lease_expires_at: DateTime,
+    pub runtime_heartbeat: DateTime,
+    pub last_request_time: DateTime,
+    pub execution_health: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct WorkspaceRouter;
+pub struct RuntimeResolver {
+    bindings: HashMap<WorkspaceId, WorkspaceRuntimeBinding>,
+}
+
+impl RuntimeResolver {
+    pub fn bind(&mut self, workspace_id: &str, binding: WorkspaceRuntimeBinding) {
+        self.bindings.insert(workspace_id.to_string(), binding);
+    }
+
+    pub fn resolve(&self, workspace_id: &str) -> Option<&WorkspaceRuntimeBinding> {
+        self.bindings.get(workspace_id)
+    }
+
+    pub fn update_health(
+        &mut self,
+        workspace_id: &str,
+        heartbeat_at: DateTime,
+        request_at: DateTime,
+        execution_health: bool,
+    ) -> bool {
+        let Some(binding) = self.bindings.get_mut(workspace_id) else {
+            return false;
+        };
+        binding.runtime_heartbeat = heartbeat_at;
+        binding.last_request_time = request_at;
+        binding.execution_health = execution_health;
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRouterEvent {
+    pub workspace_id: WorkspaceId,
+    pub event_type: String,
+    pub timestamp: DateTime,
+}
+
+const RUNTIME_FAILOVER_PRIORITY: [WorkspaceRuntimeType; 4] = [
+    WorkspaceRuntimeType::Dea,
+    WorkspaceRuntimeType::Docker,
+    WorkspaceRuntimeType::External,
+    WorkspaceRuntimeType::Cloud,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceRouter {
+    pub registry: WorkspaceRegistry,
+    pub resolver: RuntimeResolver,
+    pub proxy: WorkspaceProxy,
+    pub events: Vec<WorkspaceRouterEvent>,
+}
 
 impl WorkspaceRouter {
+    pub fn create_workspace(
+        &mut self,
+        repository_id: &str,
+        commit_hash: &str,
+        owner_id: &str,
+        now: DateTime,
+    ) -> WorkspaceRecord {
+        let workspace_id = ExecutionRouter::sanitized_workspace_id(&hash_key(&format!(
+            "{repository_id}:{commit_hash}"
+        ))[..12]);
+        let record = WorkspaceRecord {
+            workspace_id: workspace_id.clone(),
+            repository_id: repository_id.to_string(),
+            owner_id: owner_id.to_string(),
+            execution_id: format!("exec-{}", hash_key(&format!("{workspace_id}:{commit_hash}"))),
+            assigned_worker: None,
+            assigned_runtime: RuntimeType::Unknown,
+            assigned_url: stable_workspace_url(&workspace_id, true),
+            state: WorkspaceState::Pending,
+            created_at: now,
+            updated_at: now,
+            quota: WorkspaceQuota::default(),
+        };
+        self.registry.upsert(record.clone());
+        self.events.push(WorkspaceRouterEvent {
+            workspace_id,
+            event_type: "workspace_created".to_string(),
+            timestamp: now,
+        });
+        record
+    }
+
     pub fn resolve_workspace(
         &self,
         registry: &WorkspaceRegistry,
@@ -6232,6 +6435,84 @@ impl WorkspaceRouter {
             .and_then(|record| record.assigned_worker.clone())
     }
 
+    pub fn bind_runtime(
+        &mut self,
+        workspace_id: &str,
+        binding: WorkspaceRuntimeBinding,
+        now: DateTime,
+    ) -> bool {
+        let Some(workspace) = self.registry.get_mut(workspace_id) else {
+            return false;
+        };
+        workspace.assigned_runtime = binding.runtime_type.to_runtime_type();
+        workspace.assigned_worker = Some(binding.runtime_instance_id.clone());
+        workspace.updated_at = now;
+        self.proxy
+            .bind(workspace_id, &binding.runtime_instance_id, binding.endpoint.clone());
+        self.resolver.bind(workspace_id, binding);
+        self.events.push(WorkspaceRouterEvent {
+            workspace_id: workspace_id.to_string(),
+            event_type: "runtime_bound".to_string(),
+            timestamp: now,
+        });
+        true
+    }
+
+    pub fn migrate_runtime(
+        &mut self,
+        workspace_id: &str,
+        binding: WorkspaceRuntimeBinding,
+        now: DateTime,
+    ) -> bool {
+        let Some(workspace) = self.registry.get_mut(workspace_id) else {
+            return false;
+        };
+        workspace.state = WorkspaceState::Migrating;
+        workspace.updated_at = now;
+        let preserved_url = workspace.assigned_url.clone();
+        if !self.bind_runtime(workspace_id, binding, now) {
+            return false;
+        }
+        if let Some(updated) = self.registry.get_mut(workspace_id) {
+            updated.assigned_url = preserved_url;
+            updated.state = WorkspaceState::Running;
+            updated.updated_at = now.saturating_add(1);
+        }
+        self.events.push(WorkspaceRouterEvent {
+            workspace_id: workspace_id.to_string(),
+            event_type: "runtime_migrated".to_string(),
+            timestamp: now,
+        });
+        true
+    }
+
+    pub fn mark_runtime_failed(&mut self, workspace_id: &str, now: DateTime) -> bool {
+        let Some(workspace) = self.registry.get_mut(workspace_id) else {
+            return false;
+        };
+        workspace.state = WorkspaceState::Degraded;
+        workspace.updated_at = now;
+        self.events.push(WorkspaceRouterEvent {
+            workspace_id: workspace_id.to_string(),
+            event_type: "runtime_failed".to_string(),
+            timestamp: now,
+        });
+        true
+    }
+
+    pub fn route_workspace_request(&mut self, request_target: &str, now: DateTime) -> Option<WorkspaceRoute> {
+        let route = self.route_request(&self.registry, &self.proxy, request_target)?;
+        self.events.push(WorkspaceRouterEvent {
+            workspace_id: route.workspace_id.clone(),
+            event_type: "url_resolved".to_string(),
+            timestamp: now,
+        });
+        let _ = self
+            .resolver
+            .update_health(&route.workspace_id, now, now, true);
+        Some(route)
+    }
+
     pub fn route_request(
         &self,
         registry: &WorkspaceRegistry,
@@ -6248,6 +6529,16 @@ impl WorkspaceRouter {
             runtime: workspace.assigned_runtime,
             target: binding.target.clone(),
         })
+    }
+
+    pub fn select_failover_runtime(
+        &self,
+        available: &[WorkspaceRuntimeType],
+    ) -> Option<WorkspaceRuntimeType> {
+        RUNTIME_FAILOVER_PRIORITY
+            .iter()
+            .copied()
+            .find(|candidate| available.contains(candidate))
     }
 }
 
@@ -9336,6 +9627,9 @@ impl Default for RestApiSpec {
     fn default() -> Self {
         let mut routes = vec![
             "POST /workspaces",
+            "GET /workspaces/{id}",
+            "POST /workspaces/{id}/bind",
+            "POST /workspaces/{id}/migrate",
             "POST /workspaces/{id}/stop",
             "POST /workspaces/{id}/restart",
             "GET /workspaces/{id}/logs",
@@ -11284,16 +11578,21 @@ fn current_unix_epoch_secs() -> u64 {
 }
 
 fn parse_workspace_id(request_target: &str) -> Option<String> {
-    if let Some(id) = request_target
+    let normalized = request_target
+        .strip_prefix("https://")
+        .or_else(|| request_target.strip_prefix("http://"))
+        .unwrap_or(request_target);
+
+    if let Some(id) = normalized
         .strip_prefix("workspace-")
         .and_then(|value| value.strip_suffix(".trythissoftware.com"))
     {
         return Some(id.to_string());
     }
 
-    request_target
+    normalized
         .strip_prefix("trythissoftware.com/w/")
-        .or_else(|| request_target.strip_prefix("/w/"))
+        .or_else(|| normalized.strip_prefix("/w/"))
         .map(|id| id.to_string())
 }
 
@@ -13161,6 +13460,10 @@ dependencies:
     #[test]
     fn rest_api_spec_includes_execution_api_layer_routes() {
         let spec = RestApiSpec::default();
+        assert!(spec.routes.contains(&"POST /workspaces"));
+        assert!(spec.routes.contains(&"GET /workspaces/{id}"));
+        assert!(spec.routes.contains(&"POST /workspaces/{id}/bind"));
+        assert!(spec.routes.contains(&"POST /workspaces/{id}/migrate"));
         assert!(spec.routes.contains(&"POST /api/v1/repositories/analyze"));
         assert!(spec.routes.contains(&"POST /api/v1/execution/plan"));
         assert!(spec.routes.contains(&"POST /api/v1/executions"));
@@ -13387,7 +13690,7 @@ dependencies:
         });
         let mut proxy = WorkspaceProxy::default();
         proxy.bind("a1b2", "worker-3", "http://worker-3:3012");
-        let router = WorkspaceRouter;
+        let router = WorkspaceRouter::default();
 
         let route = router
             .route_request(&registry, &proxy, "workspace-a1b2.trythissoftware.com")
@@ -13399,6 +13702,71 @@ dependencies:
                 .get("a1b2")
                 .map(|record| record.assigned_url.clone()),
             Some(WorkspaceUrl("workspace-a1b2.trythissoftware.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn workspace_router_migrates_runtime_without_url_change() {
+        let mut router = WorkspaceRouter::default();
+        let workspace = router.create_workspace("repo-1", "aaaaaaa", "user-1", 10);
+        assert!(router.bind_runtime(
+            &workspace.workspace_id,
+            WorkspaceRuntimeBinding {
+                runtime_type: WorkspaceRuntimeType::Dea,
+                runtime_instance_id: "dea-worker-1".to_string(),
+                endpoint: "http://dea-worker-1:3012".to_string(),
+                lease_expires_at: 20,
+                runtime_heartbeat: 10,
+                last_request_time: 10,
+                execution_health: true,
+            },
+            10
+        ));
+        let stable_url = router
+            .registry
+            .get(&workspace.workspace_id)
+            .expect("workspace must exist")
+            .assigned_url
+            .clone();
+
+        assert!(router.migrate_runtime(
+            &workspace.workspace_id,
+            WorkspaceRuntimeBinding {
+                runtime_type: WorkspaceRuntimeType::Cloud,
+                runtime_instance_id: "cloud-worker-9".to_string(),
+                endpoint: "https://cloud-worker-9.trythissoftware.com".to_string(),
+                lease_expires_at: 50,
+                runtime_heartbeat: 21,
+                last_request_time: 21,
+                execution_health: true,
+            },
+            21
+        ));
+        let route = router
+            .route_workspace_request(
+                &format!("workspace-{}.trythissoftware.com", workspace.workspace_id),
+                22,
+            )
+            .expect("workspace route should resolve after migration");
+        assert_eq!(route.target, "https://cloud-worker-9.trythissoftware.com");
+        assert_eq!(
+            router
+                .registry
+                .get(&workspace.workspace_id)
+                .expect("workspace must exist")
+                .assigned_url,
+            stable_url
+        );
+        assert!(router
+            .events
+            .iter()
+            .any(|event| event.event_type == "runtime_migrated"));
+        assert_eq!(
+            router.select_failover_runtime(&[
+                WorkspaceRuntimeType::Cloud,
+                WorkspaceRuntimeType::External
+            ]),
+            Some(WorkspaceRuntimeType::External)
         );
     }
 
@@ -13800,6 +14168,55 @@ services:
         assert_eq!(start_path, "/api/v1/executions");
         assert!(start_body.contains("\"status\":\"starting\""));
         assert!(start_body.contains("\"workspace_url\":\"https://workspace-"));
+
+        let (workspace_create_path, workspace_create_body) =
+            workspace_create_endpoint(&WorkspaceCreateRequest {
+                repository_id: "repo-1".to_string(),
+                commit_hash: "aaaaaaa".to_string(),
+                owner_id: "user-1".to_string(),
+            });
+        assert_eq!(workspace_create_path, "/workspaces");
+        assert!(workspace_create_body.contains("\"workspace_url\":\"workspace-"));
+
+        let mut workspace_router = WorkspaceRouter::default();
+        let workspace = workspace_router.create_workspace("repo-1", "aaaaaaa", "user-1", 1);
+        let (workspace_resolve_path, workspace_resolve_body) =
+            workspace_resolve_endpoint(&workspace.workspace_id, &workspace_router);
+        assert_eq!(
+            workspace_resolve_path,
+            format!("/workspaces/{}", workspace.workspace_id)
+        );
+        assert!(workspace_resolve_body.contains("\"workspace_id\""));
+
+        let (workspace_bind_path, workspace_bind_body) = workspace_bind_endpoint(
+            &workspace.workspace_id,
+            &WorkspaceRuntimeRequest {
+                runtime_type: "DEA".to_string(),
+                runtime_instance_id: "dea-1".to_string(),
+                endpoint: "http://dea-1:3012".to_string(),
+                lease_expires_at: 10,
+            },
+        );
+        assert_eq!(
+            workspace_bind_path,
+            format!("/workspaces/{}/bind", workspace.workspace_id)
+        );
+        assert!(workspace_bind_body.contains("\"runtime_type\":\"DEA\""));
+
+        let (workspace_migrate_path, workspace_migrate_body) = workspace_migrate_endpoint(
+            &workspace.workspace_id,
+            &WorkspaceRuntimeRequest {
+                runtime_type: "CLOUD".to_string(),
+                runtime_instance_id: "cloud-1".to_string(),
+                endpoint: "https://cloud-1.trythissoftware.com".to_string(),
+                lease_expires_at: 20,
+            },
+        );
+        assert_eq!(
+            workspace_migrate_path,
+            format!("/workspaces/{}/migrate", workspace.workspace_id)
+        );
+        assert!(workspace_migrate_body.contains("\"runtime_type\":\"CLOUD\""));
 
         let (status_path, status_body) = execution_status_endpoint("exec-1");
         assert_eq!(status_path, "/api/v1/executions/exec-1");
@@ -14598,6 +15015,8 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS warm_pool_usage"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS healing_attempts"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS url_allocations"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS workspaces"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS workspace_runtime_bindings"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS agents"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS journey_results"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS commit_execution_results"));

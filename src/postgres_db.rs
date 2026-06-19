@@ -262,6 +262,8 @@ impl ExecutionIntelligencePostgresStore {
                 DROP TABLE IF EXISTS commit_execution_results CASCADE;
                 DROP TABLE IF EXISTS journey_results CASCADE;
                 DROP TABLE IF EXISTS agents CASCADE;
+                DROP TABLE IF EXISTS workspace_runtime_bindings CASCADE;
+                DROP TABLE IF EXISTS workspaces CASCADE;
                 DROP TABLE IF EXISTS url_allocations CASCADE;
                 DROP TABLE IF EXISTS healing_attempts CASCADE;
                 DROP TABLE IF EXISTS warm_pool_usage CASCADE;
