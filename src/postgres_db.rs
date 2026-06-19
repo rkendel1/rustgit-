@@ -1,7 +1,7 @@
 use crate::{
     EidbCommitExecutionResultRecord, EidbCommitRecord, EidbExecutionEventRecord, EidbExecutionRecord,
     EidbHealingAttemptRecord, EidbJourneyResultRecord, EidbRepositoryRecord, EidbUrlAllocationRecord,
-    EidbWarmPoolUsageRecord, ExecutionIntelligenceDatabase,
+    EidbWarmPoolUsageRecord, EidbBillingEventRecord, ExecutionIntelligenceDatabase,
 };
 use postgres::NoTls;
 use r2d2::Pool;
@@ -80,6 +80,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "seed_bootstrap",
         sql: include_str!("../migrations/0003_seed_bootstrap.sql"),
     },
+    Migration {
+        version: "0004",
+        name: "billing_metering",
+        sql: include_str!("../migrations/0004_billing_metering.sql"),
+    },
 ];
 
 pub trait ExecutionIntelligenceReadStore {
@@ -110,6 +115,12 @@ pub trait ExecutionIntelligenceReadStore {
         &self,
         repository_id: &str,
     ) -> PersistenceResult<Vec<EidbHealingAttemptRecord>>;
+    fn billing_events_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
+    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
+    fn billing_events(&self) -> PersistenceResult<Vec<EidbBillingEventRecord>>;
     fn last_good_commit_for_repository(&self, repository_id: &str) -> PersistenceResult<Option<String>>;
 }
 
@@ -219,6 +230,31 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligenceDatabase {
             .collect())
     }
 
+    fn billing_events_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        Ok(self
+            .billing_events
+            .iter()
+            .filter(|event| event.execution_id == execution_id)
+            .cloned()
+            .collect())
+    }
+
+    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        Ok(self
+            .billing_events
+            .iter()
+            .filter(|event| event.org_id == org_id)
+            .cloned()
+            .collect())
+    }
+
+    fn billing_events(&self) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        Ok(self.billing_events.clone())
+    }
+
     fn last_good_commit_for_repository(&self, repository_id: &str) -> PersistenceResult<Option<String>> {
         Ok(self
             .last_good_commit_for_repository(repository_id)
@@ -265,6 +301,7 @@ impl ExecutionIntelligencePostgresStore {
                 DROP TABLE IF EXISTS agents CASCADE;
                 DROP TABLE IF EXISTS workspace_runtime_bindings CASCADE;
                 DROP TABLE IF EXISTS workspaces CASCADE;
+                DROP TABLE IF EXISTS billing_events CASCADE;
                 DROP TABLE IF EXISTS url_allocations CASCADE;
                 DROP TABLE IF EXISTS healing_attempts CASCADE;
                 DROP TABLE IF EXISTS warm_pool_usage CASCADE;
@@ -564,6 +601,45 @@ impl ExecutionIntelligencePostgresStore {
                     &record.success,
                     &(record.startup_time_ms as f64),
                     &(record.recorded_at as f64),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_billing_event(&self, record: &EidbBillingEventRecord) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            client.execute(
+                "INSERT INTO billing_events (
+                    event_id, org_id, user_id, workspace_id, execution_id,
+                    event_type, runtime_type, resource_usage, cost_units, timestamp
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    to_timestamp($10::double precision)
+                 )
+                 ON CONFLICT (event_id)
+                 DO UPDATE SET
+                    org_id = EXCLUDED.org_id,
+                    user_id = EXCLUDED.user_id,
+                    workspace_id = EXCLUDED.workspace_id,
+                    execution_id = EXCLUDED.execution_id,
+                    event_type = EXCLUDED.event_type,
+                    runtime_type = EXCLUDED.runtime_type,
+                    resource_usage = EXCLUDED.resource_usage,
+                    cost_units = EXCLUDED.cost_units,
+                    timestamp = EXCLUDED.timestamp",
+                &[
+                    &record.event_id,
+                    &record.org_id,
+                    &record.user_id,
+                    &record.workspace_id,
+                    &record.execution_id,
+                    &record.event_type,
+                    &record.runtime_type,
+                    &record.resource_usage,
+                    &(record.cost_units as f64),
+                    &(record.timestamp as f64),
                 ],
             )?;
             Ok(())
@@ -893,6 +969,101 @@ impl ExecutionIntelligenceReadStore for ExecutionIntelligencePostgresStore {
                         repair_strategy: row.get(3),
                         success: row.get(4),
                         created_at: Self::to_u64(row.get::<_, i64>(5))?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn billing_events_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        self.with_client(|client| {
+            let rows = client.query(
+                "SELECT event_id, org_id, user_id, workspace_id, execution_id,
+                        event_type, runtime_type, resource_usage, cost_units,
+                        EXTRACT(EPOCH FROM timestamp)::BIGINT
+                 FROM billing_events
+                 WHERE execution_id = $1
+                 ORDER BY timestamp",
+                &[&execution_id],
+            )?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(EidbBillingEventRecord {
+                        event_id: row.get(0),
+                        org_id: row.get(1),
+                        user_id: row.get(2),
+                        workspace_id: row.get(3),
+                        execution_id: row.get(4),
+                        event_type: row.get(5),
+                        runtime_type: row.get(6),
+                        resource_usage: row.get::<_, Value>(7),
+                        cost_units: row.get::<_, f64>(8),
+                        timestamp: Self::to_u64(row.get::<_, i64>(9))?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn billing_events_for_org(&self, org_id: &str) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        self.with_client(|client| {
+            let rows = client.query(
+                "SELECT event_id, org_id, user_id, workspace_id, execution_id,
+                        event_type, runtime_type, resource_usage, cost_units,
+                        EXTRACT(EPOCH FROM timestamp)::BIGINT
+                 FROM billing_events
+                 WHERE org_id = $1
+                 ORDER BY timestamp",
+                &[&org_id],
+            )?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(EidbBillingEventRecord {
+                        event_id: row.get(0),
+                        org_id: row.get(1),
+                        user_id: row.get(2),
+                        workspace_id: row.get(3),
+                        execution_id: row.get(4),
+                        event_type: row.get(5),
+                        runtime_type: row.get(6),
+                        resource_usage: row.get::<_, Value>(7),
+                        cost_units: row.get::<_, f64>(8),
+                        timestamp: Self::to_u64(row.get::<_, i64>(9))?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn billing_events(&self) -> PersistenceResult<Vec<EidbBillingEventRecord>> {
+        self.with_client(|client| {
+            let rows = client.query(
+                "SELECT event_id, org_id, user_id, workspace_id, execution_id,
+                        event_type, runtime_type, resource_usage, cost_units,
+                        EXTRACT(EPOCH FROM timestamp)::BIGINT
+                 FROM billing_events
+                 ORDER BY timestamp",
+                &[],
+            )?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(EidbBillingEventRecord {
+                        event_id: row.get(0),
+                        org_id: row.get(1),
+                        user_id: row.get(2),
+                        workspace_id: row.get(3),
+                        execution_id: row.get(4),
+                        event_type: row.get(5),
+                        runtime_type: row.get(6),
+                        resource_usage: row.get::<_, Value>(7),
+                        cost_units: row.get::<_, f64>(8),
+                        timestamp: Self::to_u64(row.get::<_, i64>(9))?,
                     })
                 })
                 .collect()

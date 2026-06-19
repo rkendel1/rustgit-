@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 mod architecture_docs;
@@ -1653,6 +1653,13 @@ fn is_verified_commit_hash(commit_hash: &str) -> bool {
             .all(|character| character.is_ascii_hexdigit())
 }
 
+fn now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepositoryClassification {
     pub class: RepoClass,
@@ -1674,6 +1681,149 @@ pub enum ExecutionTier {
     ExternalProvider,
     CloudPartner,
     DDockitCloud,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum RuntimeTier {
+    DeaLocal,
+    DockerLocal,
+    ExternalProvider,
+    CloudFallback,
+}
+
+impl RuntimeTier {
+    pub fn weight(self) -> f64 {
+        match self {
+            Self::DeaLocal => 1.0,
+            Self::DockerLocal => 2.0,
+            Self::ExternalProvider => 5.0,
+            Self::CloudFallback => 10.0,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeaLocal => "DEA_LOCAL",
+            Self::DockerLocal => "DOCKER_LOCAL",
+            Self::ExternalProvider => "EXTERNAL_PROVIDER",
+            Self::CloudFallback => "CLOUD_FALLBACK",
+        }
+    }
+
+    pub fn from_execution_tier(tier: ExecutionTier) -> Self {
+        match tier {
+            ExecutionTier::LocalMachine => Self::DeaLocal,
+            ExecutionTier::LocalDocker => Self::DockerLocal,
+            ExecutionTier::ExternalProvider => Self::ExternalProvider,
+            ExecutionTier::CloudPartner | ExecutionTier::DDockitCloud => Self::CloudFallback,
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "DEA" | "DEA_LOCAL" | "LOCAL_MACHINE" => Self::DeaLocal,
+            "DOCKER" | "DOCKER_LOCAL" | "LOCAL_DOCKER" => Self::DockerLocal,
+            "EXTERNAL" | "EXTERNAL_PROVIDER" => Self::ExternalProvider,
+            "CLOUD" | "CLOUD_FALLBACK" | "DDOCKIT_CLOUD" => Self::CloudFallback,
+            _ => Self::CloudFallback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExecutionCostBreakdown {
+    pub runtime_cost: f64,
+    pub duration_cost: f64,
+    pub retry_penalty: f64,
+    pub healing_cost: f64,
+    pub warm_pool_discount: f64,
+    pub total_cost_units: f64,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionMeter {
+    pub execution_id: String,
+    pub org_id: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub start_time: Instant,
+    pub runtime_tier: RuntimeTier,
+    pub retries: u32,
+    pub healing_cycles: u32,
+    pub warm_pool_hits: u32,
+    pub heartbeat_count: u32,
+    pub peak_cpu_usage: f32,
+    pub peak_memory_usage: f32,
+}
+
+impl ExecutionMeter {
+    pub fn new(
+        execution_id: impl Into<String>,
+        org_id: impl Into<String>,
+        user_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        runtime_tier: RuntimeTier,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            org_id: org_id.into(),
+            user_id: user_id.into(),
+            workspace_id: workspace_id.into(),
+            start_time: Instant::now(),
+            runtime_tier,
+            retries: 0,
+            healing_cycles: 0,
+            warm_pool_hits: 0,
+            heartbeat_count: 0,
+            peak_cpu_usage: 0.0,
+            peak_memory_usage: 0.0,
+        }
+    }
+
+    pub fn heartbeat(&mut self, cpu_usage: f32, memory_usage: f32) {
+        self.heartbeat_count = self.heartbeat_count.saturating_add(1);
+        self.peak_cpu_usage = self.peak_cpu_usage.max(cpu_usage);
+        self.peak_memory_usage = self.peak_memory_usage.max(memory_usage);
+    }
+
+    pub fn record_retry(&mut self) {
+        self.retries = self.retries.saturating_add(1);
+    }
+
+    pub fn record_healing_cycle(&mut self) {
+        self.healing_cycles = self.healing_cycles.saturating_add(1);
+    }
+
+    pub fn record_warm_pool_hit(&mut self) {
+        self.warm_pool_hits = self.warm_pool_hits.saturating_add(1);
+    }
+
+    pub fn complete_with_elapsed(&self, elapsed: Duration) -> ExecutionCostBreakdown {
+        let duration_seconds = elapsed.as_secs_f64().max(1.0);
+        let runtime_weight = self.runtime_tier.weight();
+        let runtime_cost = runtime_weight;
+        let duration_cost = (duration_seconds / 60.0) * runtime_weight;
+        let retry_penalty = f64::from(self.retries) * 0.25;
+        let healing_cost = f64::from(self.healing_cycles) * 0.5 * runtime_weight;
+        let warm_pool_discount = f64::from(self.warm_pool_hits) * 0.1 * runtime_weight;
+        let total_cost_units =
+            (runtime_cost + duration_cost + retry_penalty + healing_cost - warm_pool_discount).max(0.0);
+
+        ExecutionCostBreakdown {
+            runtime_cost,
+            duration_cost,
+            retry_penalty,
+            healing_cost,
+            warm_pool_discount,
+            total_cost_units,
+            duration_seconds,
+        }
+    }
+
+    pub fn complete(&self) -> ExecutionCostBreakdown {
+        self.complete_with_elapsed(self.start_time.elapsed())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6342,6 +6492,20 @@ pub struct EidbExecutionEventRecord {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EidbBillingEventRecord {
+    pub event_id: String,
+    pub org_id: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub execution_id: String,
+    pub event_type: String,
+    pub runtime_type: String,
+    pub resource_usage: Value,
+    pub cost_units: f64,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EidbRuntimeImageRecord {
     pub image_id: String,
@@ -6410,6 +6574,7 @@ pub struct ExecutionIntelligenceDatabase {
     pub topologies: Vec<EidbTopologyRecord>,
     pub executions: Vec<EidbExecutionRecord>,
     pub execution_events: Vec<EidbExecutionEventRecord>,
+    pub billing_events: Vec<EidbBillingEventRecord>,
     pub runtime_images: Vec<EidbRuntimeImageRecord>,
     pub warm_pool_usage: Vec<EidbWarmPoolUsageRecord>,
     pub healing_attempts: Vec<EidbHealingAttemptRecord>,
@@ -6425,6 +6590,7 @@ impl ExecutionIntelligenceDatabase {
             include_str!("../migrations/0001_baseline_schema.sql"),
             include_str!("../migrations/0002_indexes_and_constraints.sql"),
             include_str!("../migrations/0003_seed_bootstrap.sql"),
+            include_str!("../migrations/0004_billing_metering.sql"),
         ]
     }
 
@@ -6434,6 +6600,10 @@ impl ExecutionIntelligenceDatabase {
 
     pub fn record_execution_event(&mut self, event: EidbExecutionEventRecord) {
         self.execution_events.push(event);
+    }
+
+    pub fn record_billing_event(&mut self, event: EidbBillingEventRecord) {
+        self.billing_events.push(event);
     }
 
     pub fn record_healing_attempt(&mut self, attempt: EidbHealingAttemptRecord) {
@@ -6528,6 +6698,7 @@ pub fn execution_history_endpoint_with_store(
         json!({
             "execution": store.execution(execution_id)?,
             "events": store.events_for_execution(execution_id)?,
+            "billing_events": store.billing_events_for_execution(execution_id)?,
             "url_allocations": store.url_allocations_for_execution(execution_id)?,
             "healing_attempts": store.healing_attempts_for_execution(execution_id)?,
             "warm_pool_usage": store.warm_pool_usage_for_execution(execution_id)?,
@@ -6575,6 +6746,124 @@ pub fn repository_last_good_commit_endpoint_with_store(
         json!({
             "repository_id": repository_id,
             "commit_hash": store.last_good_commit_for_repository(repository_id)?,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn billing_usage_endpoint(
+    org_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    billing_usage_endpoint_with_store(org_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn billing_usage_endpoint_with_store(
+    org_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let events = store.billing_events_for_org(org_id)?;
+    let total_cost_units: f64 = events.iter().map(|event| event.cost_units).sum();
+    let run_count = events
+        .iter()
+        .filter(|event| event.event_type.eq_ignore_ascii_case("EXECUTION_COMPLETED"))
+        .count();
+    let free_tier_usage = run_count.min(10);
+    let pro_tier_usage = run_count.saturating_sub(10).min(1_000);
+    let enterprise_usage = run_count.saturating_sub(1_010);
+
+    Ok((
+        format!("/billing/usage?org_id={org_id}"),
+        json!({
+            "org_id": org_id,
+            "events": events,
+            "total_cost_units": total_cost_units,
+            "quota": {
+                "free_runs_per_day": 10,
+                "pro_runs_per_day": 1000,
+                "enterprise_runs_per_day": "unlimited",
+            },
+            "usage_buckets": {
+                "free_tier_usage": free_tier_usage,
+                "pro_tier_usage": pro_tier_usage,
+                "enterprise_usage": enterprise_usage,
+            },
+            "quota_exceeded": run_count > 1000,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn billing_summary_endpoint(database: &ExecutionIntelligenceDatabase) -> (String, String) {
+    billing_summary_endpoint_with_store(database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn billing_summary_endpoint_with_store(
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let events = store.billing_events()?;
+    let mut org_usage_history: HashMap<String, f64> = HashMap::new();
+    let mut runtime_distribution_costs: HashMap<String, f64> = HashMap::new();
+    let mut execution_cost_history: HashMap<String, f64> = HashMap::new();
+    let mut healing_costs = 0.0;
+
+    for event in &events {
+        *org_usage_history.entry(event.org_id.clone()).or_insert(0.0) += event.cost_units;
+        *runtime_distribution_costs
+            .entry(event.runtime_type.clone())
+            .or_insert(0.0) += event.cost_units;
+        *execution_cost_history
+            .entry(event.execution_id.clone())
+            .or_insert(0.0) += event.cost_units;
+        if event.event_type.contains("HEALING") {
+            healing_costs += event.cost_units;
+        }
+    }
+
+    Ok((
+        "/billing/summary".to_string(),
+        json!({
+            "org_usage_history": org_usage_history,
+            "runtime_distribution_costs": runtime_distribution_costs,
+            "execution_cost_history": execution_cost_history,
+            "healing_costs": healing_costs,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn billing_invoice_endpoint(
+    org_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    billing_invoice_endpoint_with_store(org_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn billing_invoice_endpoint_with_store(
+    org_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let events = store.billing_events_for_org(org_id)?;
+    let total_cost_units: f64 = events.iter().map(|event| event.cost_units).sum();
+    let mut execution_costs: HashMap<String, f64> = HashMap::new();
+    for event in &events {
+        *execution_costs.entry(event.execution_id.clone()).or_insert(0.0) += event.cost_units;
+    }
+
+    let invoice_id = format!("invoice-{org_id}-{}", now_epoch_seconds());
+
+    Ok((
+        "/billing/invoice".to_string(),
+        json!({
+            "invoice_id": invoice_id,
+            "org_id": org_id,
+            "event_count": events.len(),
+            "total_cost_units": total_cost_units,
+            "line_items": execution_costs,
+            "generated_at": now_epoch_seconds(),
         })
         .to_string(),
     ))
@@ -10014,6 +10303,9 @@ impl Default for RestApiSpec {
             "GET /executions/{id}/history",
             "GET /repositories/{id}/healing",
             "GET /repositories/{id}/last-good",
+            "GET /billing/usage?org_id={org_id}",
+            "GET /billing/summary",
+            "POST /billing/invoice",
             "GET /api/v1/dual-surface/contract",
             "GET /api/v1/surfaces/extension/actions",
             "GET /api/v1/surfaces/portal/navigation",
@@ -13847,6 +14139,9 @@ dependencies:
         assert!(spec.routes.contains(&"GET /executions/{id}/history"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
+        assert!(spec.routes.contains(&"GET /billing/usage?org_id={org_id}"));
+        assert!(spec.routes.contains(&"GET /billing/summary"));
+        assert!(spec.routes.contains(&"POST /billing/invoice"));
         assert!(spec.routes.contains(&"GET /api/v1/dual-surface/contract"));
         assert!(spec
             .routes
@@ -15516,6 +15811,7 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS topologies"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS executions"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS execution_events"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS billing_events"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS runtime_images"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS warm_pool_usage"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS healing_attempts"));
@@ -15565,6 +15861,22 @@ services:
             event_type: "STARTED".to_string(),
             created_at: 11,
         });
+        database.record_billing_event(EidbBillingEventRecord {
+            event_id: "bill-1".to_string(),
+            org_id: "org-1".to_string(),
+            user_id: "user-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            event_type: "EXECUTION_COMPLETED".to_string(),
+            runtime_type: "DEA_LOCAL".to_string(),
+            resource_usage: json!({
+                "duration_seconds": 60.0,
+                "healing_cycles": 1,
+                "warm_pool_hits": 0,
+            }),
+            cost_units: 2.5,
+            timestamp: 12,
+        });
         database.record_healing_attempt(EidbHealingAttemptRecord {
             repository_id: "repo-eidb".to_string(),
             execution_id: "exec-1".to_string(),
@@ -15595,6 +15907,7 @@ services:
             execution_history_endpoint("exec-1", &database);
         assert_eq!(execution_history_path, "/executions/exec-1/history");
         assert!(execution_history_body.contains("\"event_type\":\"STARTED\""));
+        assert!(execution_history_body.contains("\"cost_units\":2.5"));
         assert!(execution_history_body.contains("workspace-1.trythissoftware.com"));
 
         let (healing_path, healing_body) =
@@ -15634,6 +15947,82 @@ services:
             database.last_good_commit_for_repository("repo-eidb"),
             Some("bbbbbbb")
         );
+    }
+
+    #[test]
+    fn execution_meter_computes_cost_breakdown() {
+        let mut meter = ExecutionMeter::new(
+            "exec-meter-1",
+            "org-meter-1",
+            "user-meter-1",
+            "ws-meter-1",
+            RuntimeTier::DockerLocal,
+        );
+        meter.heartbeat(0.4, 256.0);
+        meter.heartbeat(0.8, 512.0);
+        meter.record_retry();
+        meter.record_healing_cycle();
+        meter.record_warm_pool_hit();
+
+        let cost = meter.complete_with_elapsed(Duration::from_secs(120));
+        assert!(cost.duration_cost > 0.0);
+        assert_eq!(cost.runtime_cost, 2.0);
+        assert_eq!(cost.retry_penalty, 0.25);
+        assert_eq!(cost.healing_cost, 1.0);
+        assert!(cost.warm_pool_discount > 0.0);
+        assert!(cost.total_cost_units > 0.0);
+    }
+
+    #[test]
+    fn billing_endpoints_emit_usage_summary_and_invoice_payloads() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.record_billing_event(EidbBillingEventRecord {
+            event_id: "bill-usage-1".to_string(),
+            org_id: "org-usage-1".to_string(),
+            user_id: "user-usage-1".to_string(),
+            workspace_id: "ws-usage-1".to_string(),
+            execution_id: "exec-usage-1".to_string(),
+            event_type: "EXECUTION_COMPLETED".to_string(),
+            runtime_type: "DEA_LOCAL".to_string(),
+            resource_usage: json!({
+                "duration_seconds": 30.0,
+                "healing_cycles": 0,
+                "warm_pool_hits": 1,
+            }),
+            cost_units: 1.2,
+            timestamp: 20,
+        });
+        database.record_billing_event(EidbBillingEventRecord {
+            event_id: "bill-usage-2".to_string(),
+            org_id: "org-usage-1".to_string(),
+            user_id: "user-usage-1".to_string(),
+            workspace_id: "ws-usage-1".to_string(),
+            execution_id: "exec-usage-2".to_string(),
+            event_type: "EXECUTION_HEALING_ATTEMPTED".to_string(),
+            runtime_type: "CLOUD_FALLBACK".to_string(),
+            resource_usage: json!({
+                "duration_seconds": 90.0,
+                "healing_cycles": 2,
+                "warm_pool_hits": 0,
+            }),
+            cost_units: 4.8,
+            timestamp: 21,
+        });
+
+        let (usage_path, usage_body) = billing_usage_endpoint("org-usage-1", &database);
+        assert_eq!(usage_path, "/billing/usage?org_id=org-usage-1");
+        assert!(usage_body.contains("\"free_tier_usage\""));
+        assert!(usage_body.contains("\"total_cost_units\":6.0"));
+
+        let (summary_path, summary_body) = billing_summary_endpoint(&database);
+        assert_eq!(summary_path, "/billing/summary");
+        assert!(summary_body.contains("\"runtime_distribution_costs\""));
+        assert!(summary_body.contains("\"healing_costs\":4.8"));
+
+        let (invoice_path, invoice_body) = billing_invoice_endpoint("org-usage-1", &database);
+        assert_eq!(invoice_path, "/billing/invoice");
+        assert!(invoice_body.contains("\"total_cost_units\":6.0"));
+        assert!(invoice_body.contains("exec-usage-1"));
     }
 
     #[test]
