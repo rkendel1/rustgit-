@@ -163,6 +163,121 @@ pub struct RepositoryFingerprint {
 
 pub type LanguageKind = Language;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRuntimeKind {
+    Node,
+    Python,
+    Rust,
+    Bun,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameworkKind {
+    NextJs,
+    React,
+    Vite,
+    NestJs,
+    Express,
+    Remix,
+    FastApi,
+    Django,
+    Flask,
+    Streamlit,
+    Celery,
+    Axum,
+    Actix,
+    Rocket,
+    BunVite,
+    BunServer,
+    Turborepo,
+    Nx,
+    PnpmWorkspace,
+    YarnWorkspace,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManagerKind {
+    Npm,
+    Pnpm,
+    Yarn,
+    Bun,
+    Cargo,
+    Pip,
+    Uv,
+    Poetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryStrategy {
+    NodeScript { command: String },
+    PythonModule { module: String },
+    RustBinary { target: String },
+    BunScript { command: String },
+    DockerEntrypoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStep {
+    InstallDependencies,
+    Compile,
+    GenerateArtifacts,
+    LinkCache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxModel {
+    ProcessIsolated,
+    DockerContainer,
+    WasmIsolated,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentSpec {
+    pub variables: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachePolicy {
+    pub key: String,
+    pub deterministic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildStrategy {
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionImageSpec {
+    pub spec_version: String,
+    pub language: LanguageKind,
+    pub runtime: ImageRuntimeKind,
+    pub runtime_version: String,
+    pub framework: Option<FrameworkKind>,
+    pub package_manager: Option<PackageManagerKind>,
+    pub entry_strategy: EntryStrategy,
+    pub build_steps: Vec<BuildStep>,
+    pub environment: EnvironmentSpec,
+    pub caching_policy: CachePolicy,
+    pub sandbox_model: SandboxModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledExecutionImage {
+    pub image_spec: ExecutionImageSpec,
+    pub build_strategy: BuildStrategy,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExecutionImageCompiler;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheKeyEngineV2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionImage {
     pub image_id: String,
@@ -192,47 +307,35 @@ pub struct ExecutionMatchEngine;
 
 impl ExecutionMatchEngine {
     pub fn match_repository(fingerprint: &RepositoryFingerprint) -> ExecutionImageMatch {
-        let framework = fingerprint
-            .framework_signature
-            .as_deref()
-            .unwrap_or(UNKNOWN_SIGNATURE)
-            .to_ascii_lowercase();
+        let compiled = ExecutionImageCompiler::compile(fingerprint);
+        let runtime = runtime_type_from_image_runtime(compiled.image_spec.runtime);
+        let framework = compiled
+            .image_spec
+            .framework
+            .map(framework_kind_label)
+            .unwrap_or(UNKNOWN_SIGNATURE);
         let language = fingerprint.language_signature.to_ascii_lowercase();
 
-        let (runtime, confidence) = if framework.contains("nextjs") {
-            (RuntimeType::Node, 97)
-        } else if framework.contains("fastapi") {
-            (RuntimeType::Python, 95)
-        } else if framework.contains("django") {
-            (RuntimeType::Python, 93)
-        } else if framework.contains("rust") {
-            (RuntimeType::Rust, 94)
-        } else if framework.contains("vite") || framework.contains("react") {
-            (RuntimeType::Node, 92)
-        } else if language.contains("rust") {
-            (RuntimeType::Rust, 90)
-        } else if language.contains("python") {
-            (RuntimeType::Python, 89)
-        } else if language.contains("javascript") || language.contains("typescript") {
-            (RuntimeType::Node, 88)
-        } else {
-            (RuntimeType::Unknown, 40)
-        };
-
         let image_id = format!(
-            "{}-{}-warm-v1",
-            runtime_type_to_agent_label(runtime),
-            framework_tag(&framework)
+            "{}-{}-warm-{}",
+            image_runtime_kind_label(compiled.image_spec.runtime),
+            framework_tag(framework),
+            compiled.image_spec.spec_version
         );
-        let version = EXECUTION_IMAGE_VERSION.to_string();
-        let cache_key = hash_key(&format!(
-            "{}:{}:{}:{}",
-            image_id, fingerprint.repo_hash, fingerprint.language_signature, version
-        ));
+        let version = compiled.image_spec.spec_version.clone();
+        let cache_key = CacheKeyEngineV2::derive_cache_key(
+            fingerprint,
+            &compiled.image_spec,
+            &compiled.build_strategy,
+        );
         let base_layers = vec![
-            format!("runtime:{}", runtime_type_to_agent_label(runtime)),
+            format!(
+                "runtime:{}",
+                image_runtime_kind_label(compiled.image_spec.runtime)
+            ),
+            format!("runtime-version:{}", compiled.image_spec.runtime_version),
             format!("language:{}", language_tag(&language)),
-            format!("framework:{}", framework_tag(&framework)),
+            format!("framework:{}", framework_tag(framework)),
         ];
 
         ExecutionImageMatch {
@@ -240,14 +343,139 @@ impl ExecutionMatchEngine {
                 image_id,
                 runtime,
                 language: language_kind_from_signature(&language),
-                framework: (framework != UNKNOWN_SIGNATURE).then_some(framework),
+                framework: (framework != UNKNOWN_SIGNATURE).then_some(framework.to_string()),
                 version,
                 base_layers,
                 preinstalled_dependencies: true,
                 cache_key,
             },
+            confidence: compiled.confidence,
+        }
+    }
+}
+
+impl ExecutionImageCompiler {
+    pub fn compile(fingerprint: &RepositoryFingerprint) -> CompiledExecutionImage {
+        let framework = framework_kind_from_fingerprint(fingerprint);
+        let runtime = image_runtime_for_framework(framework, fingerprint);
+        let language =
+            language_kind_from_signature(&fingerprint.language_signature.to_ascii_lowercase());
+        let package_manager = package_manager_for_framework(framework, runtime, fingerprint);
+        let runtime_version = runtime_version_for(runtime).to_string();
+        let entry_strategy = entry_strategy_for(runtime, framework, package_manager);
+        let build_steps = vec![
+            BuildStep::InstallDependencies,
+            BuildStep::Compile,
+            BuildStep::GenerateArtifacts,
+            BuildStep::LinkCache,
+        ];
+        let build_strategy = BuildStrategyPlanner::plan(runtime, package_manager);
+        let confidence = confidence_for_compiler(framework, runtime, language);
+
+        let mut environment_vars = BTreeSet::new();
+        environment_vars.insert("CI=true".to_string());
+        if matches!(runtime, ImageRuntimeKind::Node | ImageRuntimeKind::Bun) {
+            environment_vars.insert("NODE_ENV=production".to_string());
+        }
+        if runtime == ImageRuntimeKind::Python {
+            environment_vars.insert("PYTHONUNBUFFERED=1".to_string());
+        }
+
+        let mut image_spec = ExecutionImageSpec {
+            spec_version: EXECUTION_IMAGE_VERSION.to_string(),
+            language,
+            runtime,
+            runtime_version,
+            framework: framework.filter(|value| *value != FrameworkKind::Unknown),
+            package_manager,
+            entry_strategy,
+            build_steps,
+            environment: EnvironmentSpec {
+                variables: environment_vars,
+            },
+            caching_policy: CachePolicy {
+                key: String::new(),
+                deterministic: true,
+            },
+            sandbox_model: sandbox_model_for_runtime(runtime),
+        };
+        let cache_key =
+            CacheKeyEngineV2::derive_cache_key(fingerprint, &image_spec, &build_strategy);
+        image_spec.caching_policy.key = cache_key;
+
+        CompiledExecutionImage {
+            image_spec,
+            build_strategy,
             confidence,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BuildStrategyPlanner;
+
+impl BuildStrategyPlanner {
+    fn plan(
+        runtime: ImageRuntimeKind,
+        package_manager: Option<PackageManagerKind>,
+    ) -> BuildStrategy {
+        let mut commands = Vec::new();
+        match runtime {
+            ImageRuntimeKind::Node => match package_manager.unwrap_or(PackageManagerKind::Npm) {
+                PackageManagerKind::Pnpm => commands.extend([
+                    "pnpm install --frozen-lockfile".to_string(),
+                    "pnpm run build".to_string(),
+                ]),
+                PackageManagerKind::Yarn => commands.extend([
+                    "yarn install --frozen-lockfile".to_string(),
+                    "yarn build".to_string(),
+                ]),
+                PackageManagerKind::Bun => commands.extend([
+                    "bun install --frozen-lockfile".to_string(),
+                    "bun run build".to_string(),
+                ]),
+                _ => commands.extend(["npm ci".to_string(), "npm run build".to_string()]),
+            },
+            ImageRuntimeKind::Python => match package_manager.unwrap_or(PackageManagerKind::Pip) {
+                PackageManagerKind::Uv => commands.extend([
+                    "uv pip install -r requirements.txt".to_string(),
+                    "python -m compileall .".to_string(),
+                ]),
+                PackageManagerKind::Poetry => commands.extend([
+                    "poetry install --no-interaction".to_string(),
+                    "python -m compileall .".to_string(),
+                ]),
+                _ => commands.extend([
+                    "python -m pip install -r requirements.txt".to_string(),
+                    "python -m compileall .".to_string(),
+                ]),
+            },
+            ImageRuntimeKind::Rust => commands.extend([
+                "cargo fetch --locked".to_string(),
+                "cargo build --release".to_string(),
+            ]),
+            ImageRuntimeKind::Bun => commands.extend([
+                "bun install --frozen-lockfile".to_string(),
+                "bun run build".to_string(),
+            ]),
+            ImageRuntimeKind::Unknown => {}
+        }
+        BuildStrategy { commands }
+    }
+}
+
+impl CacheKeyEngineV2 {
+    fn derive_cache_key(
+        fingerprint: &RepositoryFingerprint,
+        image_spec: &ExecutionImageSpec,
+        build_strategy: &BuildStrategy,
+    ) -> String {
+        hash_key(&format!(
+            "fingerprint:{}|spec:{}|strategy:{}",
+            repository_fingerprint_material(fingerprint),
+            execution_image_spec_material(image_spec),
+            build_strategy.commands.join("||")
+        ))
     }
 }
 
@@ -3220,6 +3448,7 @@ pub fn execution_image_endpoint(
     fingerprint: &RepositoryFingerprint,
 ) -> (String, String) {
     let matched = registry.resolve_for_fingerprint(repo_id, fingerprint);
+    let compiled = ExecutionImageCompiler::compile(fingerprint);
     let framework = matched.image.framework.clone().unwrap_or_default();
     (
         format!("/execution-image/{repo_id}"),
@@ -3228,7 +3457,28 @@ pub fn execution_image_endpoint(
             "framework": framework,
             "runtime": runtime_type_to_agent_label(matched.image.runtime),
             "image": matched.image.image_id,
-            "confidence": matched.confidence
+            "confidence": f64::from(matched.confidence) / 100.0,
+            "confidence_raw": matched.confidence,
+            "image_spec": execution_image_spec_payload(&compiled.image_spec)
+        })
+        .to_string(),
+    )
+}
+
+pub fn execution_image_compile_endpoint(
+    repo_url: &str,
+    branch: &str,
+    fingerprint: &RepositoryFingerprint,
+) -> (String, String) {
+    let compiled = ExecutionImageCompiler::compile(fingerprint);
+    (
+        "/execution-image/compile".to_string(),
+        json!({
+            "repo_url": repo_url,
+            "branch": branch,
+            "image_spec": execution_image_spec_payload(&compiled.image_spec),
+            "confidence": f64::from(compiled.confidence) / 100.0,
+            "confidence_raw": compiled.confidence
         })
         .to_string(),
     )
@@ -5256,6 +5506,7 @@ impl Default for RestApiSpec {
                 "GET /workspaces/{id}/logs",
                 "GET /workspaces/{id}/ports",
                 "GET /workspaces/{id}/filesystem/*path",
+                "POST /execution-image/compile",
                 "GET /execution-image/{repo_id}",
                 "GET /warm-pool/status",
                 "POST /warm-pool/prewarm",
@@ -5967,6 +6218,393 @@ fn language_kind_from_signature(language: &str) -> LanguageKind {
         value if value.contains("python") => Language::Python,
         _ => Language::Unknown,
     }
+}
+
+fn framework_kind_from_fingerprint(fingerprint: &RepositoryFingerprint) -> Option<FrameworkKind> {
+    let framework = fingerprint
+        .framework_signature
+        .as_deref()
+        .unwrap_or(UNKNOWN_SIGNATURE)
+        .to_ascii_lowercase();
+    if framework.contains("nextjs") {
+        Some(FrameworkKind::NextJs)
+    } else if framework.contains("react") {
+        Some(FrameworkKind::React)
+    } else if framework.contains("vite") {
+        Some(FrameworkKind::Vite)
+    } else if framework.contains("nestjs") {
+        Some(FrameworkKind::NestJs)
+    } else if framework.contains("express") {
+        Some(FrameworkKind::Express)
+    } else if framework.contains("remix") {
+        Some(FrameworkKind::Remix)
+    } else if framework.contains("fastapi") {
+        Some(FrameworkKind::FastApi)
+    } else if framework.contains("django") {
+        Some(FrameworkKind::Django)
+    } else if framework.contains("flask") {
+        Some(FrameworkKind::Flask)
+    } else if framework.contains("streamlit") {
+        Some(FrameworkKind::Streamlit)
+    } else if framework.contains("celery") {
+        Some(FrameworkKind::Celery)
+    } else if framework.contains("axum") {
+        Some(FrameworkKind::Axum)
+    } else if framework.contains("actix") {
+        Some(FrameworkKind::Actix)
+    } else if framework.contains("rocket") {
+        Some(FrameworkKind::Rocket)
+    } else if framework.contains("bun") && framework.contains("vite") {
+        Some(FrameworkKind::BunVite)
+    } else if framework.contains("bun") {
+        Some(FrameworkKind::BunServer)
+    } else if framework.contains("turborepo") {
+        Some(FrameworkKind::Turborepo)
+    } else if framework.contains("nx") {
+        Some(FrameworkKind::Nx)
+    } else if framework.contains("pnpm-workspace") {
+        Some(FrameworkKind::PnpmWorkspace)
+    } else if framework.contains("yarn-workspace") {
+        Some(FrameworkKind::YarnWorkspace)
+    } else {
+        Some(FrameworkKind::Unknown)
+    }
+}
+
+fn framework_kind_label(framework: FrameworkKind) -> &'static str {
+    match framework {
+        FrameworkKind::NextJs => "nextjs",
+        FrameworkKind::React => "react",
+        FrameworkKind::Vite => "vite",
+        FrameworkKind::NestJs => "nestjs",
+        FrameworkKind::Express => "express",
+        FrameworkKind::Remix => "remix",
+        FrameworkKind::FastApi => "fastapi",
+        FrameworkKind::Django => "django",
+        FrameworkKind::Flask => "flask",
+        FrameworkKind::Streamlit => "streamlit",
+        FrameworkKind::Celery => "celery",
+        FrameworkKind::Axum => "axum",
+        FrameworkKind::Actix => "actix",
+        FrameworkKind::Rocket => "rocket",
+        FrameworkKind::BunVite => "bun-vite",
+        FrameworkKind::BunServer => "bun-server",
+        FrameworkKind::Turborepo => "turborepo",
+        FrameworkKind::Nx => "nx",
+        FrameworkKind::PnpmWorkspace => "pnpm-workspace",
+        FrameworkKind::YarnWorkspace => "yarn-workspace",
+        FrameworkKind::Unknown => UNKNOWN_SIGNATURE,
+    }
+}
+
+fn image_runtime_for_framework(
+    framework: Option<FrameworkKind>,
+    fingerprint: &RepositoryFingerprint,
+) -> ImageRuntimeKind {
+    match framework.unwrap_or(FrameworkKind::Unknown) {
+        FrameworkKind::NextJs
+        | FrameworkKind::React
+        | FrameworkKind::Vite
+        | FrameworkKind::NestJs
+        | FrameworkKind::Express
+        | FrameworkKind::Remix
+        | FrameworkKind::Turborepo
+        | FrameworkKind::Nx
+        | FrameworkKind::PnpmWorkspace
+        | FrameworkKind::YarnWorkspace => ImageRuntimeKind::Node,
+        FrameworkKind::FastApi
+        | FrameworkKind::Django
+        | FrameworkKind::Flask
+        | FrameworkKind::Streamlit
+        | FrameworkKind::Celery => ImageRuntimeKind::Python,
+        FrameworkKind::Axum | FrameworkKind::Actix | FrameworkKind::Rocket => {
+            ImageRuntimeKind::Rust
+        }
+        FrameworkKind::BunVite | FrameworkKind::BunServer => ImageRuntimeKind::Bun,
+        FrameworkKind::Unknown => {
+            let language = fingerprint.language_signature.to_ascii_lowercase();
+            if language.contains("rust") {
+                ImageRuntimeKind::Rust
+            } else if language.contains("python") {
+                ImageRuntimeKind::Python
+            } else if language.contains("javascript") || language.contains("typescript") {
+                ImageRuntimeKind::Node
+            } else {
+                ImageRuntimeKind::Unknown
+            }
+        }
+    }
+}
+
+fn package_manager_for_framework(
+    framework: Option<FrameworkKind>,
+    runtime: ImageRuntimeKind,
+    fingerprint: &RepositoryFingerprint,
+) -> Option<PackageManagerKind> {
+    let framework = framework.unwrap_or(FrameworkKind::Unknown);
+    if matches!(framework, FrameworkKind::BunVite | FrameworkKind::BunServer) {
+        return Some(PackageManagerKind::Bun);
+    }
+
+    let lockfile_hint = fingerprint
+        .lockfile_hash
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if lockfile_hint.contains("pnpm") {
+        return Some(PackageManagerKind::Pnpm);
+    }
+    if lockfile_hint.contains("yarn") {
+        return Some(PackageManagerKind::Yarn);
+    }
+    if framework == FrameworkKind::NextJs {
+        return Some(PackageManagerKind::Pnpm);
+    }
+
+    match runtime {
+        ImageRuntimeKind::Node => Some(PackageManagerKind::Npm),
+        ImageRuntimeKind::Python => Some(PackageManagerKind::Pip),
+        ImageRuntimeKind::Rust => Some(PackageManagerKind::Cargo),
+        ImageRuntimeKind::Bun => Some(PackageManagerKind::Bun),
+        ImageRuntimeKind::Unknown => None,
+    }
+}
+
+fn runtime_version_for(runtime: ImageRuntimeKind) -> &'static str {
+    match runtime {
+        ImageRuntimeKind::Node => "20",
+        ImageRuntimeKind::Python => "3.11",
+        ImageRuntimeKind::Rust => "stable",
+        ImageRuntimeKind::Bun => "1.1",
+        ImageRuntimeKind::Unknown => UNKNOWN_SIGNATURE,
+    }
+}
+
+fn entry_strategy_for(
+    runtime: ImageRuntimeKind,
+    framework: Option<FrameworkKind>,
+    package_manager: Option<PackageManagerKind>,
+) -> EntryStrategy {
+    match runtime {
+        ImageRuntimeKind::Node => EntryStrategy::NodeScript {
+            command: if matches!(framework, Some(FrameworkKind::NextJs)) {
+                match package_manager.unwrap_or(PackageManagerKind::Pnpm) {
+                    PackageManagerKind::Yarn => "yarn dev".to_string(),
+                    PackageManagerKind::Bun => "bun run dev".to_string(),
+                    PackageManagerKind::Npm => "npm run dev".to_string(),
+                    _ => "pnpm run dev".to_string(),
+                }
+            } else {
+                "node server.js".to_string()
+            },
+        },
+        ImageRuntimeKind::Python => EntryStrategy::PythonModule {
+            module: if matches!(framework, Some(FrameworkKind::FastApi)) {
+                "uvicorn app:app".to_string()
+            } else if matches!(framework, Some(FrameworkKind::Django)) {
+                "gunicorn app.wsgi".to_string()
+            } else {
+                "app".to_string()
+            },
+        },
+        ImageRuntimeKind::Rust => EntryStrategy::RustBinary {
+            target: "./target/release/<binary>".to_string(),
+        },
+        ImageRuntimeKind::Bun => EntryStrategy::BunScript {
+            command: "bun run dev".to_string(),
+        },
+        ImageRuntimeKind::Unknown => EntryStrategy::DockerEntrypoint,
+    }
+}
+
+fn sandbox_model_for_runtime(runtime: ImageRuntimeKind) -> SandboxModel {
+    match runtime {
+        ImageRuntimeKind::Node | ImageRuntimeKind::Python | ImageRuntimeKind::Rust => {
+            SandboxModel::ProcessIsolated
+        }
+        ImageRuntimeKind::Bun => SandboxModel::Hybrid,
+        ImageRuntimeKind::Unknown => SandboxModel::DockerContainer,
+    }
+}
+
+fn confidence_for_compiler(
+    framework: Option<FrameworkKind>,
+    runtime: ImageRuntimeKind,
+    language: LanguageKind,
+) -> u8 {
+    match framework.unwrap_or(FrameworkKind::Unknown) {
+        FrameworkKind::NextJs => 97,
+        FrameworkKind::FastApi => 95,
+        FrameworkKind::Django => 93,
+        FrameworkKind::Axum | FrameworkKind::Actix | FrameworkKind::Rocket => 94,
+        FrameworkKind::Vite | FrameworkKind::React => 92,
+        FrameworkKind::BunVite | FrameworkKind::BunServer => 91,
+        FrameworkKind::Unknown => match (runtime, language) {
+            (ImageRuntimeKind::Rust, _) => 90,
+            (ImageRuntimeKind::Python, _) => 89,
+            (ImageRuntimeKind::Node, Language::JavaScript | Language::TypeScript) => 88,
+            _ => 40,
+        },
+        _ => 90,
+    }
+}
+
+fn image_runtime_kind_label(runtime: ImageRuntimeKind) -> &'static str {
+    match runtime {
+        ImageRuntimeKind::Node => "node",
+        ImageRuntimeKind::Python => "python",
+        ImageRuntimeKind::Rust => "rust",
+        ImageRuntimeKind::Bun => "bun",
+        ImageRuntimeKind::Unknown => UNKNOWN_SIGNATURE,
+    }
+}
+
+fn runtime_type_from_image_runtime(runtime: ImageRuntimeKind) -> RuntimeType {
+    match runtime {
+        ImageRuntimeKind::Node | ImageRuntimeKind::Bun => RuntimeType::Node,
+        ImageRuntimeKind::Python => RuntimeType::Python,
+        ImageRuntimeKind::Rust => RuntimeType::Rust,
+        ImageRuntimeKind::Unknown => RuntimeType::Unknown,
+    }
+}
+
+fn package_manager_kind_label(package_manager: PackageManagerKind) -> &'static str {
+    match package_manager {
+        PackageManagerKind::Npm => "npm",
+        PackageManagerKind::Pnpm => "pnpm",
+        PackageManagerKind::Yarn => "yarn",
+        PackageManagerKind::Bun => "bun",
+        PackageManagerKind::Cargo => "cargo",
+        PackageManagerKind::Pip => "pip",
+        PackageManagerKind::Uv => "uv",
+        PackageManagerKind::Poetry => "poetry",
+    }
+}
+
+fn language_kind_label(language: LanguageKind) -> &'static str {
+    match language {
+        Language::JavaScript => "javascript",
+        Language::TypeScript => "typescript",
+        Language::Rust => "rust",
+        Language::Go => "go",
+        Language::Python => "python",
+        Language::Unknown => UNKNOWN_SIGNATURE,
+    }
+}
+
+fn entry_strategy_label(strategy: &EntryStrategy) -> &str {
+    match strategy {
+        EntryStrategy::NodeScript { command } => command.as_str(),
+        EntryStrategy::PythonModule { module } => module.as_str(),
+        EntryStrategy::RustBinary { target } => target.as_str(),
+        EntryStrategy::BunScript { command } => command.as_str(),
+        EntryStrategy::DockerEntrypoint => "docker-entrypoint",
+    }
+}
+
+fn build_step_label(step: BuildStep) -> &'static str {
+    match step {
+        BuildStep::InstallDependencies => "install-dependencies",
+        BuildStep::Compile => "compile",
+        BuildStep::GenerateArtifacts => "generate-artifacts",
+        BuildStep::LinkCache => "link-cache",
+    }
+}
+
+fn sandbox_model_label(model: SandboxModel) -> &'static str {
+    match model {
+        SandboxModel::ProcessIsolated => "process-isolated",
+        SandboxModel::DockerContainer => "docker-container",
+        SandboxModel::WasmIsolated => "wasm-isolated",
+        SandboxModel::Hybrid => "hybrid",
+    }
+}
+
+fn repository_fingerprint_material(fingerprint: &RepositoryFingerprint) -> String {
+    format!(
+        "repo={}|lock={}|deps={}|lang={}|framework={}",
+        fingerprint.repo_hash,
+        fingerprint
+            .lockfile_hash
+            .as_deref()
+            .unwrap_or(UNKNOWN_SIGNATURE),
+        fingerprint
+            .dependency_hash
+            .as_deref()
+            .unwrap_or(UNKNOWN_SIGNATURE),
+        fingerprint.language_signature,
+        fingerprint
+            .framework_signature
+            .as_deref()
+            .unwrap_or(UNKNOWN_SIGNATURE)
+            .to_ascii_lowercase()
+    )
+}
+
+fn execution_image_spec_material(spec: &ExecutionImageSpec) -> String {
+    let framework = spec
+        .framework
+        .map(framework_kind_label)
+        .unwrap_or(UNKNOWN_SIGNATURE);
+    let package_manager = spec
+        .package_manager
+        .map(package_manager_kind_label)
+        .unwrap_or(UNKNOWN_SIGNATURE);
+    let build_steps = spec
+        .build_steps
+        .iter()
+        .copied()
+        .map(build_step_label)
+        .collect::<Vec<_>>()
+        .join(",");
+    let environment = spec
+        .environment
+        .variables
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "version={}|language={}|runtime={}|runtime_version={}|framework={}|package_manager={}|entry={}|build_steps={}|env={}|sandbox={}|deterministic={}",
+        spec.spec_version,
+        language_kind_label(spec.language),
+        image_runtime_kind_label(spec.runtime),
+        spec.runtime_version,
+        framework,
+        package_manager,
+        entry_strategy_label(&spec.entry_strategy),
+        build_steps,
+        environment,
+        sandbox_model_label(spec.sandbox_model),
+        spec.caching_policy.deterministic
+    )
+}
+
+fn execution_image_spec_payload(spec: &ExecutionImageSpec) -> Value {
+    let framework = spec
+        .framework
+        .map(framework_kind_label)
+        .unwrap_or(UNKNOWN_SIGNATURE);
+    let package_manager = spec
+        .package_manager
+        .map(package_manager_kind_label)
+        .unwrap_or(UNKNOWN_SIGNATURE);
+    json!({
+        "spec_version": spec.spec_version,
+        "language": language_kind_label(spec.language),
+        "runtime": image_runtime_kind_label(spec.runtime),
+        "runtime_version": spec.runtime_version,
+        "framework": framework,
+        "package_manager": package_manager,
+        "entry_strategy": entry_strategy_label(&spec.entry_strategy),
+        "build_steps": spec.build_steps.iter().copied().map(build_step_label).collect::<Vec<_>>(),
+        "environment": spec.environment.variables.iter().collect::<Vec<_>>(),
+        "caching_policy": {
+            "key": spec.caching_policy.key,
+            "deterministic": spec.caching_policy.deterministic,
+        },
+        "sandbox_model": sandbox_model_label(spec.sandbox_model),
+    })
 }
 
 fn warm_cache_binding_key(repo_hash: &str, image_id: &str) -> String {
@@ -8851,6 +9489,58 @@ mod tests {
     }
 
     #[test]
+    fn execution_image_compiler_emits_deterministic_eis_spec() {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo-next".to_string(),
+            lockfile_hash: Some("pnpm-lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "javascript".to_string(),
+            framework_signature: Some("nextjs".to_string()),
+        };
+
+        let compiled = ExecutionImageCompiler::compile(&fingerprint);
+        assert_eq!(compiled.image_spec.spec_version, EXECUTION_IMAGE_VERSION);
+        assert_eq!(compiled.image_spec.runtime, ImageRuntimeKind::Node);
+        assert_eq!(compiled.image_spec.runtime_version, "20");
+        assert_eq!(compiled.image_spec.framework, Some(FrameworkKind::NextJs));
+        assert_eq!(
+            compiled.image_spec.package_manager,
+            Some(PackageManagerKind::Pnpm)
+        );
+        assert!(compiled
+            .build_strategy
+            .commands
+            .contains(&"pnpm run build".to_string()));
+
+        let compiled_again = ExecutionImageCompiler::compile(&fingerprint);
+        assert_eq!(
+            compiled.image_spec.caching_policy.key,
+            compiled_again.image_spec.caching_policy.key
+        );
+    }
+
+    #[test]
+    fn execution_image_compile_endpoint_returns_compiled_spec_payload() {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo-fastapi".to_string(),
+            lockfile_hash: Some("uv-lock".to_string()),
+            dependency_hash: Some("deps".to_string()),
+            language_signature: "python".to_string(),
+            framework_signature: Some("fastapi".to_string()),
+        };
+
+        let (path, body) = execution_image_compile_endpoint(
+            "https://github.com/rkendel1/rustgit-",
+            "main",
+            &fingerprint,
+        );
+        assert_eq!(path, "/execution-image/compile");
+        assert!(body.contains("\"image_spec\""));
+        assert!(body.contains("\"runtime\":\"python\""));
+        assert!(body.contains("\"confidence\":0."));
+    }
+
+    #[test]
     fn warm_pool_manager_tracks_prewarm_allocation_release_and_cache_binding() {
         let fingerprint = RepositoryFingerprint {
             repo_hash: "repo-fastapi".to_string(),
@@ -8895,6 +9585,7 @@ mod tests {
         assert_eq!(image_path, "/execution-image/repo-rust");
         assert!(image_body.contains("\"repo_id\":\"repo-rust\""));
         assert!(image_body.contains("\"image\""));
+        assert!(image_body.contains("\"image_spec\""));
 
         let image = registry
             .image_for_repo("repo-rust")
@@ -8908,6 +9599,9 @@ mod tests {
         let (status_path, status_body) = warm_pool_status_endpoint(&pool);
         assert_eq!(status_path, "/warm-pool/status");
         assert!(status_body.contains("\"warm_containers\":1"));
+        assert!(RestApiSpec::default()
+            .routes
+            .contains(&"POST /execution-image/compile"));
         assert!(RestApiSpec::default()
             .routes
             .contains(&"GET /execution-image/{repo_id}"));
