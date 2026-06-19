@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use wasmtime::{Config, Engine, Instance, Module, Store};
 
 const WASM_FULL_MEMORY_LIMIT_MB: u64 = 512;
 const WASM_FULL_CPU_LIMIT_UNITS: u32 = 1_000;
@@ -33,6 +34,7 @@ pub enum RuntimeError {
         to: WorkspaceState,
     },
     InvalidPath(String),
+    WasmRuntime(String),
     Io(io::Error),
     CommandFailed(String),
 }
@@ -49,6 +51,7 @@ impl Display for RuntimeError {
                 write!(f, "invalid workspace transition: {:?} -> {:?}", from, to)
             }
             Self::InvalidPath(path) => write!(f, "invalid path: {path}"),
+            Self::WasmRuntime(message) => write!(f, "wasm runtime error: {message}"),
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::CommandFailed(message) => write!(f, "command failed: {message}"),
         }
@@ -161,6 +164,173 @@ pub struct WasmSandbox {
     pub memory_limit: u64,
     pub time_limit_ms: u64,
     pub filesystem_scope: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WasiContext {
+    pub env: HashMap<String, String>,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmExecutionResult {
+    pub exported_functions: Vec<String>,
+}
+
+pub struct WasmRuntimeEngine {
+    engine: Engine,
+}
+
+impl WasmRuntimeEngine {
+    pub fn new() -> Result<Self> {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config)
+            .map_err(|err| RuntimeError::WasmRuntime(format!("failed to initialize engine: {err}")))?;
+        Ok(Self { engine })
+    }
+
+    pub fn execute_module(
+        &self,
+        wasm_bytes: &[u8],
+        spec: &WasmRuntimeSpec,
+        wasi: &WasiContext,
+    ) -> Result<WasmExecutionResult> {
+        if !spec.enabled {
+            return Err(RuntimeError::WasmRuntime(
+                "attempted to execute disabled wasm runtime spec".to_string(),
+            ));
+        }
+
+        let module = Module::from_binary(&self.engine, wasm_bytes)
+            .map_err(|err| RuntimeError::WasmRuntime(format!("module compilation failed: {err}")))?;
+        self.enforce_memory_limits(&module, spec)?;
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(u64::from(spec.cpu_limit_units))
+            .map_err(|err| RuntimeError::WasmRuntime(format!("failed to set fuel limits: {err}")))?;
+        let instance = Instance::new(&mut store, &module, &[])
+            .map_err(|err| RuntimeError::WasmRuntime(format!("module instantiation failed: {err}")))?;
+
+        if let Some(entrypoint) = instance.get_typed_func::<(), ()>(&mut store, "_start").ok() {
+            entrypoint
+                .call(&mut store, ())
+                .map_err(|err| RuntimeError::WasmRuntime(format!("module execution failed: {err}")))?;
+        }
+
+        let mut exported_functions = Vec::new();
+        for export in module.exports() {
+            if matches!(export.ty(), wasmtime::ExternType::Func(_)) {
+                exported_functions.push(export.name().to_string());
+            }
+        }
+
+        let _ = wasi;
+        Ok(WasmExecutionResult { exported_functions })
+    }
+
+    fn enforce_memory_limits(&self, module: &Module, spec: &WasmRuntimeSpec) -> Result<()> {
+        let max_pages = (spec.memory_limit_mb.saturating_mul(BYTES_PER_MB)) / (64 * 1024);
+        for export in module.exports() {
+            let wasmtime::ExternType::Memory(memory_type) = export.ty() else {
+                continue;
+            };
+            let min = memory_type.minimum();
+            if min > max_pages {
+                return Err(RuntimeError::WasmRuntime(format!(
+                    "module memory minimum ({min} pages) exceeds limit ({max_pages} pages)"
+                )));
+            }
+            if let Some(max) = memory_type.maximum() {
+                if max > max_pages {
+                    return Err(RuntimeError::WasmRuntime(format!(
+                        "module memory maximum ({max} pages) exceeds limit ({max_pages} pages)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeExecutionRequest {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub env: HashMap<String, String>,
+}
+
+pub struct NativeRuntimeEngine;
+
+impl NativeRuntimeEngine {
+    pub fn execute(
+        &self,
+        request: &NativeExecutionRequest,
+        resources: &ResourceQuotas,
+        network: &NetworkPolicy,
+    ) -> Result<ProcessHandle> {
+        let cwd = Path::new(&request.cwd);
+        if !cwd.is_absolute() {
+            return Err(RuntimeError::InvalidPath(request.cwd.clone()));
+        }
+        if resources.max_memory_mb == 0 || resources.max_cpu_millis == 0 {
+            return Err(RuntimeError::CommandFailed(
+                "native runtime resource quotas must be non-zero".to_string(),
+            ));
+        }
+        let _ = network;
+        Ok(ProcessHandle {
+            pid_hint: format!(
+                "native:{}:{}:{}",
+                request.command,
+                resources.max_memory_mb,
+                resources.max_cpu_millis
+            ),
+        })
+    }
+}
+
+pub struct HybridExecutionBridge {
+    wasm: WasmRuntimeEngine,
+    native: NativeRuntimeEngine,
+}
+
+impl HybridExecutionBridge {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            wasm: WasmRuntimeEngine::new()?,
+            native: NativeRuntimeEngine,
+        })
+    }
+
+    pub fn dispatch(
+        &self,
+        node: &ExecutionNode,
+        ctx: &ExecutionContext,
+        wasi: &WasiContext,
+        wasm_bytes: &[u8],
+    ) -> Result<ProcessHandle> {
+        match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
+            ExecutionTarget::Wasm(spec) => {
+                self.wasm.execute_module(wasm_bytes, &spec, wasi)?;
+                Ok(ProcessHandle {
+                    pid_hint: format!("wasm:{}", ctx.execution_graph.cache_key()),
+                })
+            }
+            ExecutionTarget::Native | ExecutionTarget::Static => self.native.execute(
+                &NativeExecutionRequest {
+                    command: node.command.clone().unwrap_or_else(|| "noop".to_string()),
+                    args: vec![],
+                    cwd: ctx.repo_path.clone(),
+                    env: HashMap::new(),
+                },
+                &ctx.resources,
+                &ctx.network,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2619,8 +2789,23 @@ impl ExecutionProvider for WasmExecutionProvider {
     }
 
     fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
-        Ok(ProcessHandle {
-            pid_hint: format!("wasm:{}", ctx.execution_graph.cache_key()),
+        let bridge = HybridExecutionBridge::new()?;
+        let wasi = WasiContext {
+            env: HashMap::from([("RUSTGIT_WORKSPACE_ID".to_string(), ctx.workspace_id.clone())]),
+            args: vec!["rustgit-runtime".to_string()],
+        };
+        let ordered_ids = ctx.execution_graph.ordered_node_ids();
+        let mut last_handle = None;
+        for node_id in ordered_ids {
+            let Some(node) = ctx.execution_graph.nodes.iter().find(|node| node.id == node_id) else {
+                continue;
+            };
+            let wasm_module = load_compiled_wasm_module(ctx, node)?;
+            let handle = bridge.dispatch(node, ctx, &wasi, &wasm_module)?;
+            last_handle = Some(handle);
+        }
+        last_handle.ok_or_else(|| {
+            RuntimeError::CommandFailed("execution graph contains no dispatchable nodes".to_string())
         })
     }
 
@@ -2783,6 +2968,67 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Wasm => "wasm",
         ExecutionMode::Hybrid => "hybrid",
     }
+}
+
+fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Result<Vec<u8>> {
+    let repo_root = Path::new(&ctx.repo_path);
+    if !repo_root.is_absolute() {
+        return Err(RuntimeError::InvalidPath(ctx.repo_path.clone()));
+    }
+
+    let mut search_roots = vec![];
+    for output in &node.outputs {
+        if output.contains("://") {
+            continue;
+        }
+        search_roots.push(repo_root.join(output));
+    }
+    search_roots.push(repo_root.to_path_buf());
+
+    for root in search_roots {
+        let Some(module_path) = first_wasm_module_in(&root)? else {
+            continue;
+        };
+        return fs::read(&module_path).map_err(RuntimeError::from);
+    }
+
+    Err(RuntimeError::WasmRuntime(format!(
+        "no compiled wasm artifact found for node {}",
+        node.id
+    )))
+}
+
+fn first_wasm_module_in(root: &Path) -> Result<Option<PathBuf>> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    if root.is_file() {
+        return Ok(is_wasm_module(root).then(|| root.to_path_buf()));
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut wasm_modules = vec![];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else if is_wasm_module(&path) {
+                wasm_modules.push(path);
+            }
+        }
+    }
+
+    wasm_modules.sort();
+    Ok(wasm_modules.into_iter().next())
+}
+
+fn is_wasm_module(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+        .unwrap_or(false)
 }
 
 fn wasm_sandbox_for(spec: &WasmRuntimeSpec, repo_path: &str) -> WasmSandbox {
@@ -2984,6 +3230,7 @@ fn current_unix_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wat::parse_str;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2996,6 +3243,53 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn test_analysis(
+        graph: ExecutionGraph,
+        compatibility: WasmCompatibility,
+        framework: Framework,
+    ) -> RepositoryAnalysis {
+        let fingerprint = RepositoryFingerprint {
+            repo_hash: "repo".to_string(),
+            lockfile_hash: None,
+            dependency_hash: None,
+            language_signature: "Unknown".to_string(),
+            framework_signature: Some(format!("{framework:?}")),
+        };
+        let classification = RepositoryClassification {
+            class: RepoClass::StaticSite,
+            confidence: 1.0,
+            primary_runtime: RuntimeType::Static,
+            secondary_runtimes: vec![],
+        };
+        let execution_profile = ExecutionProfile {
+            fingerprint: fingerprint.clone(),
+            classification: classification.clone(),
+            recommended_graph_strategy: GraphStrategy::Linear,
+            runtime_affinity: RuntimeAffinity {
+                preferred_provider: "WasmExecutionProvider".to_string(),
+                fallback_providers: vec!["StaticRuntimeProvider".to_string()],
+            },
+            wasm_compatibility: compatibility,
+        };
+        RepositoryAnalysis {
+            root: PathBuf::from("/tmp/repo"),
+            framework,
+            language: Language::Unknown,
+            dependency_files: vec![],
+            fingerprint,
+            classification,
+            execution_profile,
+            build_intelligence: BuildIntelligence {
+                framework,
+                package_manager: None,
+                build_tooling: vec![],
+                entrypoints: vec![],
+                scripts: HashMap::new(),
+            },
+            execution_graph: graph,
+        }
     }
 
     #[test]
@@ -3590,6 +3884,179 @@ mod tests {
             }
             other => panic!("expected wasm routing target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wasm_runtime_engine_executes_module_and_reports_exports() {
+        let wasm_bytes = parse_str(
+            r#"
+            (module
+                (func (export "run"))
+            )
+            "#,
+        )
+        .expect("compile wat");
+        let spec = WasmRuntimeSpec {
+            enabled: true,
+            wasi: true,
+            memory_limit_mb: 64,
+            cpu_limit_units: 2_000,
+            allowed_syscalls: vec!["fd_read".to_string(), "fd_write".to_string()],
+        };
+        let runtime = WasmRuntimeEngine::new().expect("create wasm runtime engine");
+        let result = runtime
+            .execute_module(&wasm_bytes, &spec, &WasiContext::default())
+            .expect("execute wasm module");
+
+        assert!(result.exported_functions.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn wasm_runtime_engine_enforces_memory_limit() {
+        let wasm_bytes = parse_str(
+            r#"
+            (module
+                (memory (export "memory") 32)
+            )
+            "#,
+        )
+        .expect("compile wat");
+        let spec = WasmRuntimeSpec {
+            enabled: true,
+            wasi: true,
+            memory_limit_mb: 1,
+            cpu_limit_units: 1_000,
+            allowed_syscalls: vec![],
+        };
+        let runtime = WasmRuntimeEngine::new().expect("create wasm runtime engine");
+        let err = runtime
+            .execute_module(&wasm_bytes, &spec, &WasiContext::default())
+            .expect_err("memory limit should be enforced");
+
+        assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("exceeds limit")));
+    }
+
+    #[test]
+    fn hybrid_execution_bridge_dispatches_wasm_nodes() {
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec![],
+            cache_key: None,
+        };
+        let graph = ExecutionGraph {
+            nodes: vec![node.clone()],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+        let bridge = HybridExecutionBridge::new().expect("create hybrid bridge");
+        let wasm_bytes = parse_str("(module (func (export \"run\")))").expect("compile wat");
+
+        let handle = bridge
+            .dispatch(&node, &ctx, &WasiContext::default(), &wasm_bytes)
+            .expect("dispatch wasm node");
+        assert!(handle.pid_hint.starts_with("wasm:"));
+    }
+
+    #[test]
+    fn wasm_execution_provider_uses_compiled_wasm_artifact() {
+        let repo_root = temp_dir("wasm-provider-artifact");
+        let pkg = repo_root.join("pkg");
+        fs::create_dir_all(&pkg).expect("create wasm output dir");
+        let wasm_bytes = parse_str("(module (func (export \"run\")))").expect("compile wat");
+        fs::write(pkg.join("app_bg.wasm"), wasm_bytes).expect("write wasm artifact");
+
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec!["pkg".to_string()],
+            cache_key: None,
+        };
+        let graph = ExecutionGraph {
+            nodes: vec![node],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: repo_root.to_string_lossy().to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let provider = WasmExecutionProvider;
+        let handle = provider.start(&ctx).expect("start wasm provider");
+        assert!(handle.pid_hint.starts_with("wasm:"));
+    }
+
+    #[test]
+    fn wasm_execution_provider_requires_compiled_wasm_artifact() {
+        let repo_root = temp_dir("wasm-provider-missing-artifact");
+        let node = ExecutionNode {
+            id: "serve".to_string(),
+            node_type: ExecutionNodeType::StaticServe,
+            command: Some("serve".to_string()),
+            execution_mode: ExecutionMode::Wasm,
+            inputs: vec![],
+            outputs: vec!["pkg".to_string()],
+            cache_key: None,
+        };
+        let graph = ExecutionGraph {
+            nodes: vec![node],
+            edges: vec![],
+        }
+        .with_cache_keys();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-1".to_string(),
+            repo_path: repo_root.to_string_lossy().to_string(),
+            analysis: test_analysis(graph.clone(), WasmCompatibility::Full, Framework::StaticWeb),
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let provider = WasmExecutionProvider;
+        let err = provider
+            .start(&ctx)
+            .expect_err("expected missing artifact to fail");
+        assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("no compiled wasm artifact found")));
     }
 
     #[test]
