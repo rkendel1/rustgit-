@@ -234,14 +234,38 @@ impl WasmRuntimeEngine {
                 "attempted to execute disabled wasm runtime spec".to_string(),
             ));
         }
+        if ctx.node_id.is_empty() || ctx.env.workspace_id.is_empty() {
+            return Err(RuntimeError::WasmRuntime(
+                "wasm execution context requires non-empty node and workspace identifiers".to_string(),
+            ));
+        }
+        if !Path::new(&ctx.env.repo_path).is_absolute() {
+            return Err(RuntimeError::InvalidPath(ctx.env.repo_path.clone()));
+        }
+        if !ctx.sandbox.filesystem_scope.iter().any(|scope| scope == &ctx.env.repo_path) {
+            return Err(RuntimeError::WasmRuntime(format!(
+                "sandbox scope does not include repo path {}",
+                ctx.env.repo_path
+            )));
+        }
+        let sandbox_limit_mb = ctx.sandbox.memory_limit / BYTES_PER_MB;
+        if sandbox_limit_mb == 0 {
+            return Err(RuntimeError::WasmRuntime(
+                "sandbox memory limit must be non-zero".to_string(),
+            ));
+        }
+        let effective_spec = WasmRuntimeSpec {
+            memory_limit_mb: ctx.spec.memory_limit_mb.min(sandbox_limit_mb),
+            ..ctx.spec.clone()
+        };
 
         let module = Module::from_binary(&self.engine, &ctx.module.bytes)
             .map_err(|err| RuntimeError::WasmRuntime(format!("module compilation failed: {err}")))?;
-        self.enforce_memory_limits(&module, &ctx.spec)?;
+        self.enforce_memory_limits(&module, &effective_spec)?;
 
         let mut store = Store::new(&self.engine, ());
         store
-            .set_fuel(u64::from(ctx.spec.cpu_limit_units))
+            .set_fuel(u64::from(effective_spec.cpu_limit_units))
             .map_err(|err| RuntimeError::WasmRuntime(format!("failed to set fuel limits: {err}")))?;
         let instance = self
             .linker
@@ -260,8 +284,6 @@ impl WasmRuntimeEngine {
                 exported_functions.push(export.name().to_string());
             }
         }
-
-        let _ = (&ctx.node_id, &ctx.wasi, &ctx.env, &ctx.sandbox);
         Ok(WasmExecutionResult { exported_functions })
     }
 
@@ -1701,12 +1723,20 @@ impl ExecutionEngine {
             ) {
                 self.artifact_store
                     .register_wasm_artifact_binding(wasm_artifact_binding(ctx, node, key));
-                if let Ok(module) = load_compiled_wasm_module(ctx, node) {
-                    self.artifact_store.register_wasm_artifact(WasmArtifact {
-                        node_id: node.id.clone(),
-                        module_path: module.path,
-                        hash: module.hash,
-                    });
+                match load_compiled_wasm_module(ctx, node) {
+                    Ok(module) => {
+                        self.artifact_store.register_wasm_artifact(WasmArtifact {
+                            node_id: node.id.clone(),
+                            module_path: module.path,
+                            hash: module.hash,
+                        });
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "wasm artifact for node {} not yet available during priming: {err}",
+                            node.id
+                        );
+                    }
                 }
             }
         }
@@ -2852,7 +2882,7 @@ impl BuildPlanner {
                         node_type: ExecutionNodeType::WasmCompile,
                         command: Some("wasm-pack build --target web".to_string()),
                         execution_mode: ExecutionMode::Native,
-                        inputs: vec!["index.html|src".to_string()],
+                        inputs: vec!["index.html".to_string(), "src".to_string()],
                         outputs: vec!["pkg/app_bg.wasm".to_string()],
                         cache_key: None,
                     },
@@ -2960,12 +2990,21 @@ struct StaticRuntimeProvider;
 
 impl ExecutionProvider for WasmExecutionProvider {
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        !ctx.execution_graph.nodes.is_empty()
-            && ctx.execution_graph.nodes.iter().any(|node| {
-                matches!(
-                    ExecutionRouter::route(node, &ctx.analysis.execution_profile),
-                    ExecutionTarget::Wasm(_)
-                )
+        if ctx.execution_graph.nodes.is_empty() {
+            return false;
+        }
+        let has_wasm = ctx.execution_graph.nodes.iter().any(|node| {
+            matches!(
+                ExecutionRouter::route(node, &ctx.analysis.execution_profile),
+                ExecutionTarget::Wasm(_)
+            )
+        });
+        has_wasm
+            && ctx.execution_graph.nodes.iter().all(|node| {
+                match ExecutionRouter::route(node, &ctx.analysis.execution_profile) {
+                    ExecutionTarget::Wasm(_) => true,
+                    ExecutionTarget::Native | ExecutionTarget::Static => node.command.is_some(),
+                }
             })
     }
 
@@ -3022,9 +3061,15 @@ impl ExecutionProvider for WasmExecutionProvider {
                     });
                 }
                 ExecutionTarget::Native | ExecutionTarget::Static => {
+                    let Some(command) = node.command.clone() else {
+                        return Err(RuntimeError::CommandFailed(format!(
+                            "node {} is missing a command for native/static execution",
+                            node.id
+                        )));
+                    };
                     let handle = native.execute(
                         &NativeExecutionRequest {
-                            command: node.command.clone().unwrap_or_else(|| "noop".to_string()),
+                            command,
                             args: vec![],
                             cwd: ctx.repo_path.clone(),
                             env: HashMap::new(),
@@ -3210,8 +3255,20 @@ fn load_compiled_wasm_module(ctx: &ExecutionContext, node: &ExecutionNode) -> Re
     }
 
     let mut search_roots = vec![];
-    for location in node.outputs.iter().chain(node.inputs.iter()) {
+    // Prefer declared outputs first, then fall back to wasm-like inputs so a serve
+    // node can bind to a module produced by a prior WasmCompile node.
+    for location in &node.outputs {
         if location.contains("://") {
+            continue;
+        }
+        search_roots.push(repo_root.join(location));
+    }
+    for location in &node.inputs {
+        if location.contains("://")
+            || (!location.ends_with(".wasm")
+                && !location.contains("wasm")
+                && !location.contains("pkg"))
+        {
             continue;
         }
         search_roots.push(repo_root.join(location));
