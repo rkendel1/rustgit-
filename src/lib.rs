@@ -5384,7 +5384,9 @@ pub struct EidbRepositoryRecord {
     pub repo_id: String,
     pub repo_url: String,
     pub default_branch: String,
+    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
     pub first_seen: u64,
+    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
     pub last_seen: u64,
 }
 
@@ -5392,6 +5394,7 @@ pub struct EidbRepositoryRecord {
 pub struct EidbCommitRecord {
     pub commit_hash: String,
     pub repository_id: String,
+    /// Unix timestamp in seconds, persisted as TIMESTAMPTZ in PostgreSQL.
     pub author_date: u64,
     pub message: String,
     pub parent_commit: Option<String>,
@@ -5584,11 +5587,18 @@ impl ExecutionIntelligenceDatabase {
                     .rev()
                     .find(|execution| {
                         execution.repository_id == repository_id
-                            && execution.status.eq_ignore_ascii_case("success")
+                            && eidb_execution_status_is_success(&execution.status)
                     })
                     .map(|execution| execution.commit_hash.as_str())
             })
     }
+}
+
+fn eidb_execution_status_is_success(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "success" | "succeeded" | "healthy"
+    )
 }
 
 pub fn repository_history_endpoint(
@@ -13931,7 +13941,7 @@ services:
             "repo-eidb".to_string(),
             EidbRepositoryRecord {
                 repo_id: "repo-eidb".to_string(),
-                repo_url: "https://github.com/rkendel1/rustgit-".to_string(),
+                repo_url: "https://github.com/rkendel1/rustgit-example".to_string(),
                 default_branch: "main".to_string(),
                 first_seen: 1,
                 last_seen: 2,
@@ -13996,6 +14006,31 @@ services:
         let (last_good_path, last_good_body) = repository_last_good_commit_endpoint("repo-eidb", &database);
         assert_eq!(last_good_path, "/repositories/repo-eidb/last-good");
         assert!(last_good_body.contains("\"commit_hash\":\"aaaaaaa\""));
+    }
+
+    #[test]
+    fn eidb_last_good_commit_falls_back_to_successful_execution_status() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.commits.push(EidbCommitRecord {
+            commit_hash: "bbbbbbb".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            author_date: 10,
+            message: "run".to_string(),
+            parent_commit: None,
+        });
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-2".to_string(),
+            repository_id: "repo-eidb".to_string(),
+            commit_hash: "bbbbbbb".to_string(),
+            started_at: 11,
+            completed_at: Some(12),
+            status: "Succeeded".to_string(),
+            execution_tier: "DEA".to_string(),
+        });
+        assert_eq!(
+            database.last_good_commit_for_repository("repo-eidb"),
+            Some("bbbbbbb")
+        );
     }
 
     #[test]
