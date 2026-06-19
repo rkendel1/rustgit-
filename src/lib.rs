@@ -4274,7 +4274,7 @@ impl RbacPolicyEngine {
         }
         let granted: std::collections::HashSet<Permission> =
             claims.permissions.iter().copied().collect();
-        if required.iter().any(|permission| !granted.contains(permission)) {
+        if !required.iter().all(|permission| granted.contains(permission)) {
             return None;
         }
         Some(AuthContext {
@@ -5324,7 +5324,14 @@ pub fn auth_me_endpoint(context: &AuthContext) -> (String, String) {
 }
 
 pub fn org_create_endpoint(request: &OrganizationCreateRequest) -> (String, String) {
-    let org_id = format!("org-{}", hash_key(&format!("{}:{}", request.slug, request.created_by)));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let org_id = format!(
+        "org-{}",
+        hash_key(&format!("{}:{}:{now}", request.slug, request.created_by))
+    );
     (
         "/orgs".to_string(),
         json!({

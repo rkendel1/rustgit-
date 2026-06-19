@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS executions (
     execution_id TEXT PRIMARY KEY,
     org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE RESTRICT,
-    workspace_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
     repository_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
     commit_hash TEXT NOT NULL REFERENCES commits(commit_hash) ON DELETE CASCADE,
     started_at TIMESTAMPTZ NOT NULL,

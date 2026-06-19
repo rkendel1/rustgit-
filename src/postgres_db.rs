@@ -355,6 +355,60 @@ impl ExecutionIntelligencePostgresStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_workspace(
+        &self,
+        workspace_id: &str,
+        org_id: &str,
+        repository_id: &str,
+        commit_hash: &str,
+        created_by: &str,
+        visibility: &str,
+        current_runtime: &str,
+        status: &str,
+        created_at: u64,
+        last_healthy_at: Option<u64>,
+    ) -> PersistenceResult<()> {
+        self.with_client(|client| {
+            let last_healthy_at = Self::optional_epoch_to_pg(last_healthy_at);
+            client.execute(
+                "INSERT INTO workspaces (
+                    workspace_id, org_id, repository_id, commit_hash, created_by, visibility,
+                    current_runtime, status, created_at, last_healthy_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    to_timestamp($9::double precision),
+                    CASE WHEN $10 IS NULL THEN NULL ELSE to_timestamp($10::double precision) END
+                 )
+                 ON CONFLICT (workspace_id)
+                 DO UPDATE SET
+                    org_id = EXCLUDED.org_id,
+                    repository_id = EXCLUDED.repository_id,
+                    commit_hash = EXCLUDED.commit_hash,
+                    created_by = EXCLUDED.created_by,
+                    visibility = EXCLUDED.visibility,
+                    current_runtime = EXCLUDED.current_runtime,
+                    status = EXCLUDED.status,
+                    created_at = EXCLUDED.created_at,
+                    last_healthy_at = EXCLUDED.last_healthy_at",
+                &[
+                    &workspace_id,
+                    &org_id,
+                    &repository_id,
+                    &commit_hash,
+                    &created_by,
+                    &visibility,
+                    &current_runtime,
+                    &status,
+                    &(created_at as f64),
+                    &last_healthy_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn insert_execution(&self, record: &EidbExecutionRecord) -> PersistenceResult<()> {
         self.with_client(|client| {
             let completed_at = Self::optional_epoch_to_pg(record.completed_at);

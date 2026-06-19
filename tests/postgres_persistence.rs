@@ -67,6 +67,19 @@ fn postgres_store_round_trips_history_endpoints() -> Result<(), Box<dyn std::err
         parent_commit: None,
     })?;
 
+    store.upsert_workspace(
+        "ws-1",
+        "org-bootstrap",
+        "repo-eidb",
+        "aaaaaaa",
+        "user-bootstrap",
+        "private",
+        "DEA",
+        "running",
+        11,
+        Some(11),
+    )?;
+
     store.insert_execution(&EidbExecutionRecord {
         execution_id: "exec-1".to_string(),
         org_id: "org-bootstrap".to_string(),
