@@ -5924,6 +5924,244 @@ pub struct OrganizationMembershipCreateRequest {
     pub role: MembershipRole,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubOAuthCallbackRequest {
+    pub code: String,
+    pub state: Option<String>,
+    pub extension_id: Option<String>,
+    pub github_id: u64,
+    pub github_login: String,
+    pub github_email: Option<String>,
+    pub existing_user_id: Option<String>,
+    pub existing_org_id: Option<String>,
+    pub role: MembershipRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoogleOAuthCallbackRequest {
+    pub code: String,
+    pub state: Option<String>,
+    pub extension_id: Option<String>,
+    pub google_sub: String,
+    pub google_email: String,
+    pub google_name: String,
+    pub existing_user_id: Option<String>,
+    pub existing_org_id: Option<String>,
+    pub role: MembershipRole,
+}
+
+fn provider_name(provider: AuthProvider) -> &'static str {
+    match provider {
+        AuthProvider::Github => "github",
+        AuthProvider::Google => "google",
+        AuthProvider::Microsoft => "microsoft",
+    }
+}
+
+fn oauth_org_slug(seed: &str, unique_hint: &str) -> String {
+    let mut slug = String::with_capacity(seed.len());
+    let mut previous_dash = false;
+    for ch in seed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        let suffix = &hash_key(unique_hint)[..8];
+        format!("org-{suffix}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn oauth_redirect_targets(token: &str, extension_id: Option<&str>) -> (String, Option<String>, String) {
+    let extension_redirect = extension_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("chrome-extension://{value}/auth/success?token={token}"));
+    let portal_redirect = format!("https://trythissoftware.com/auth/success?token={token}");
+    let selected_redirect = extension_redirect
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| portal_redirect.clone());
+    (selected_redirect, extension_redirect, portal_redirect)
+}
+
+pub fn github_oauth_callback_endpoint(request: &GithubOAuthCallbackRequest) -> (String, String) {
+    let user_id = request
+        .existing_user_id
+        .clone()
+        .unwrap_or_else(|| format!("user-gh-{}", hash_key(&request.github_id.to_string())));
+    let user_created = request.existing_user_id.is_none();
+    let org_name = format!("{}-org", request.github_login);
+    let org_slug = oauth_org_slug(&org_name, &request.github_id.to_string());
+    let org_id = request.existing_org_id.clone().unwrap_or_else(|| {
+        format!(
+            "org-{}",
+            hash_key(&format!("github:{}:{}", org_slug, request.github_id))
+        )
+    });
+    let org_created = request.existing_org_id.is_none();
+    let provider = AuthProvider::Github;
+    let provider_value = provider_name(provider);
+    let email = request
+        .github_email
+        .clone()
+        .unwrap_or_else(|| format!("{}@users.noreply.github.com", request.github_login));
+    let jwt = format!(
+        "jwt-{}",
+        hash_key(&format!(
+            "{}:{}:{}:{}:{}",
+            user_id,
+            org_id,
+            provider_value,
+            request.code,
+            request.state.as_deref().unwrap_or_default()
+        ))
+    );
+    let (redirect_to, extension_redirect, portal_redirect) =
+        oauth_redirect_targets(&jwt, request.extension_id.as_deref());
+    (
+        "/auth/github/callback".to_string(),
+        json!({
+            "token_exchange": {
+                "url": "https://github.com/login/oauth/access_token",
+                "grant_type": "authorization_code",
+                "code": &request.code
+            },
+            "identity_fetch": {
+                "url": "https://api.github.com/user",
+                "github_id": request.github_id,
+                "login": &request.github_login,
+                "email": &email
+            },
+            "user": {
+                "user_id": user_id,
+                "email": email,
+                "name": &request.github_login,
+                "provider": provider_value,
+                "status": if user_created { "created" } else { "existing" }
+            },
+            "org": {
+                "org_id": org_id,
+                "name": org_name,
+                "slug": org_slug,
+                "status": if org_created { "created" } else { "existing" }
+            },
+            "jwt": {
+                "token_type": "jwt",
+                "token": &jwt,
+                "claims": {
+                    "user_id": user_id,
+                    "org_id": org_id,
+                    "provider": provider_value,
+                    "role": request.role
+                }
+            },
+            "redirect": {
+                "to": redirect_to,
+                "portal": portal_redirect,
+                "extension": extension_redirect
+            },
+            "state": &request.state
+        })
+        .to_string(),
+    )
+}
+
+pub fn google_oauth_callback_endpoint(request: &GoogleOAuthCallbackRequest) -> (String, String) {
+    let user_id = request
+        .existing_user_id
+        .clone()
+        .unwrap_or_else(|| format!("user-goog-{}", hash_key(&request.google_sub)));
+    let user_created = request.existing_user_id.is_none();
+    let email_prefix = request
+        .google_email
+        .split_once('@')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(request.google_email.as_str());
+    let org_prefix = if email_prefix.is_empty() {
+        request.google_name.as_str()
+    } else {
+        email_prefix
+    };
+    let org_name = format!("{org_prefix}-org");
+    let org_slug = oauth_org_slug(&org_name, &request.google_sub);
+    let org_id = request.existing_org_id.clone().unwrap_or_else(|| {
+        format!(
+            "org-{}",
+            hash_key(&format!("google:{}:{}", org_slug, request.google_sub))
+        )
+    });
+    let org_created = request.existing_org_id.is_none();
+    let provider = AuthProvider::Google;
+    let provider_value = provider_name(provider);
+    let jwt = format!(
+        "jwt-{}",
+        hash_key(&format!(
+            "{}:{}:{}:{}:{}",
+            user_id,
+            org_id,
+            provider_value,
+            request.code,
+            request.state.as_deref().unwrap_or_default()
+        ))
+    );
+    let (redirect_to, extension_redirect, portal_redirect) =
+        oauth_redirect_targets(&jwt, request.extension_id.as_deref());
+    (
+        "/auth/google/callback".to_string(),
+        json!({
+            "token_exchange": {
+                "url": "https://oauth2.googleapis.com/token",
+                "grant_type": "authorization_code",
+                "code": &request.code
+            },
+            "identity_fetch": {
+                "url": "https://openidconnect.googleapis.com/v1/userinfo",
+                "sub": &request.google_sub,
+                "email": &request.google_email,
+                "name": &request.google_name
+            },
+            "user": {
+                "user_id": user_id,
+                "email": &request.google_email,
+                "name": &request.google_name,
+                "provider": provider_value,
+                "status": if user_created { "created" } else { "existing" }
+            },
+            "org": {
+                "org_id": org_id,
+                "name": org_name,
+                "slug": org_slug,
+                "status": if org_created { "created" } else { "existing" }
+            },
+            "jwt": {
+                "token_type": "jwt",
+                "token": &jwt,
+                "claims": {
+                    "user_id": user_id,
+                    "org_id": org_id,
+                    "provider": provider_value,
+                    "role": request.role
+                }
+            },
+            "redirect": {
+                "to": redirect_to,
+                "portal": portal_redirect,
+                "extension": extension_redirect
+            },
+            "state": &request.state
+        })
+        .to_string(),
+    )
+}
+
 pub fn auth_login_endpoint(request: &AuthLoginRequest) -> (String, String) {
     let claims = AuthClaims {
         user_id: request.user.user_id.clone(),
@@ -10770,6 +11008,8 @@ impl Default for RestApiSpec {
             "POST /auth/login",
             "POST /auth/logout",
             "GET /auth/me",
+            "GET /auth/github/callback",
+            "GET /auth/google/callback",
             "POST /orgs",
             "GET /orgs/{org_id}",
             "POST /orgs/{org_id}/members",
@@ -14850,6 +15090,8 @@ dependencies:
         assert!(spec.routes.contains(&"POST /auth/login"));
         assert!(spec.routes.contains(&"POST /auth/logout"));
         assert!(spec.routes.contains(&"GET /auth/me"));
+        assert!(spec.routes.contains(&"GET /auth/github/callback"));
+        assert!(spec.routes.contains(&"GET /auth/google/callback"));
         assert!(spec.routes.contains(&"POST /orgs"));
         assert!(spec.routes.contains(&"GET /orgs/{org_id}"));
         assert!(spec.routes.contains(&"POST /orgs/{org_id}/members"));
@@ -15735,6 +15977,48 @@ services:
         });
         assert_eq!(member_path, "/orgs/org-1/members");
         assert!(member_body.contains("\"role\":\"developer\""));
+    }
+
+    #[test]
+    fn oauth_callback_endpoints_emit_token_exchange_identity_org_and_redirect_payloads() {
+        let (github_path, github_body) = github_oauth_callback_endpoint(&GithubOAuthCallbackRequest {
+            code: "github-code".to_string(),
+            state: Some("state-1".to_string()),
+            extension_id: None,
+            github_id: 123_456,
+            github_login: "octocat".to_string(),
+            github_email: Some("octocat@github.com".to_string()),
+            existing_user_id: None,
+            existing_org_id: None,
+            role: MembershipRole::Admin,
+        });
+        assert_eq!(github_path, "/auth/github/callback");
+        assert!(github_body.contains("\"url\":\"https://github.com/login/oauth/access_token\""));
+        assert!(github_body.contains("\"url\":\"https://api.github.com/user\""));
+        assert!(github_body.contains("\"name\":\"octocat-org\""));
+        assert!(github_body.contains("\"provider\":\"github\""));
+        assert!(github_body.contains("https://trythissoftware.com/auth/success?token="));
+
+        let (google_path, google_body) = google_oauth_callback_endpoint(&GoogleOAuthCallbackRequest {
+            code: "google-code".to_string(),
+            state: Some("state-2".to_string()),
+            extension_id: Some("abcdefghijklmnop".to_string()),
+            google_sub: "google-sub-1".to_string(),
+            google_email: "person@example.com".to_string(),
+            google_name: "Person One".to_string(),
+            existing_user_id: Some("user-existing".to_string()),
+            existing_org_id: Some("org-existing".to_string()),
+            role: MembershipRole::Developer,
+        });
+        assert_eq!(google_path, "/auth/google/callback");
+        assert!(google_body.contains("\"url\":\"https://oauth2.googleapis.com/token\""));
+        assert!(google_body.contains("\"url\":\"https://openidconnect.googleapis.com/v1/userinfo\""));
+        assert!(google_body.contains("\"status\":\"existing\""));
+        assert!(google_body.contains("\"provider\":\"google\""));
+        assert!(google_body.contains(
+            "chrome-extension://abcdefghijklmnop/auth/success?token="
+        ));
+        assert!(google_body.contains("\"org_id\":\"org-existing\""));
     }
 
     #[test]

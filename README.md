@@ -77,6 +77,11 @@ Required runtime environment variables:
 - API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`
 - Portal: `NEXT_PUBLIC_API_URL=https://api.trythissoftware.com`, `NEXT_PUBLIC_BASE_DOMAIN=trythissoftware.com`
 
+OAuth callback endpoints (API):
+
+- `GET https://api.trythissoftware.com/auth/github/callback`
+- `GET https://api.trythissoftware.com/auth/google/callback`
+
 Store API credentials/secrets (`DATABASE_URL`, `REDIS_URL`, GitHub OAuth secrets, `JWT_SECRET`) as Fly secrets (`fly secrets set ...`) instead of committing them to Fly config files.
 
 ### Local initialization example
