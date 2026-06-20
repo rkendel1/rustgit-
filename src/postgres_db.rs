@@ -90,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "anonymous_execution_identity",
         sql: include_str!("../migrations/0005_anonymous_execution_identity.sql"),
     },
+    Migration {
+        version: "0006",
+        name: "repository_identity_and_healing_repairs",
+        sql: include_str!("../migrations/0006_repository_identity_and_healing_repairs.sql"),
+    },
 ];
 
 pub trait ExecutionIntelligenceReadStore {
@@ -307,6 +312,10 @@ impl ExecutionIntelligencePostgresStore {
                 DROP TABLE IF EXISTS workspace_runtime_bindings CASCADE;
                 DROP TABLE IF EXISTS workspaces CASCADE;
                 DROP TABLE IF EXISTS billing_events CASCADE;
+                DROP TABLE IF EXISTS repair_artifacts CASCADE;
+                DROP TABLE IF EXISTS repair_outcomes CASCADE;
+                DROP TABLE IF EXISTS repair_plans CASCADE;
+                DROP TABLE IF EXISTS repository_identities CASCADE;
                 DROP TABLE IF EXISTS url_allocations CASCADE;
                 DROP TABLE IF EXISTS healing_attempts CASCADE;
                 DROP TABLE IF EXISTS warm_pool_usage CASCADE;

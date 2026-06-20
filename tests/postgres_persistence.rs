@@ -21,7 +21,7 @@ fn postgres_migrations_apply_and_enforce_foreign_keys() -> Result<(), Box<dyn st
     let store = ExecutionIntelligencePostgresStore::connect(&database_url)?;
     store.reset_for_development()?;
 
-    assert_eq!(store.migration_count()?, 5);
+    assert_eq!(store.migration_count()?, 6);
     assert!(store.table_exists("users")?);
     assert!(store.table_exists("organizations")?);
     assert!(store.table_exists("memberships")?);
@@ -31,6 +31,10 @@ fn postgres_migrations_apply_and_enforce_foreign_keys() -> Result<(), Box<dyn st
     assert!(store.table_exists("audit_logs")?);
     assert!(store.table_exists("workspace_runtime_bindings")?);
     assert!(store.table_exists("billing_events")?);
+    assert!(store.table_exists("repository_identities")?);
+    assert!(store.table_exists("repair_plans")?);
+    assert!(store.table_exists("repair_outcomes")?);
+    assert!(store.table_exists("repair_artifacts")?);
     assert!(store.table_exists("schema_migrations")?);
 
     let missing_repo_commit = store.insert_commit(&EidbCommitRecord {

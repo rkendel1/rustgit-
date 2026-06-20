@@ -36,10 +36,11 @@ Surface UI contracts are rendered through a shared Surface Rendering System (SRS
 
 The API surface now includes a badge-driven execution seed flow:
 
-- `POST /api/badge/generate` — portal badge generator for markdown, HTML, badge URL, and seed trigger snippets
-- `GET /badge/{owner}/{repo}.svg` — dynamic runtime status badge (ready / needs setup / broken / healed / not tested)
+- `POST /api/badges/generate` — portal badge generator for markdown, HTML, badge URL, and seed trigger snippets
+- `GET /badge/{owner}/{repo}.svg` — dynamic runtime status badge (untested / runnable / verified / healed / production ready)
 - `GET /badge/healed/{owner}/{repo}.svg` — healed badge variant
 - `GET /seed/{owner}/{repo}` — badge click bootstrap into anonymous execution + analyze/plan/start pipeline
+- `GET /api/repositories/{id}/intelligence` — repository intelligence panel data (execution score, runtime, launch/heal/adopt actions)
 
 Example badge embed:
 

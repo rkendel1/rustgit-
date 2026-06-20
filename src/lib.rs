@@ -5979,7 +5979,7 @@ fn normalize_badge_visibility(visibility: Option<&str>) -> &'static str {
 }
 
 pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, String) {
-    let endpoint = "/api/badge/generate".to_string();
+    let endpoint = "/api/badges/generate".to_string();
     let Some(context) = parse_badge_repository_context(&request.repo_url) else {
         return (
             endpoint,
@@ -6038,6 +6038,7 @@ pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, Strin
                 "analysis_status": "pending",
                 "analyze_endpoint": "/api/v1/repositories/analyze"
             },
+            "legacy_generate_api": "/api/badge/generate",
             "config_variants": {
                 "runtime_preference": ["auto", "wasm", "docker"],
                 "visibility_mode": ["public", "private"]
@@ -6585,11 +6586,36 @@ pub fn executions_start_endpoint(request: &ExecutionStartRequest) -> (String, St
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BadgeRuntimeState {
-    Ready,
-    NeedsSetup,
-    Broken,
+    Runnable,
+    Verified,
     Healed,
-    NotTested,
+    Untested,
+    ProductionReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerificationState {
+    Unverified,
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryIdentity {
+    pub id: String,
+    pub github_owner: String,
+    pub github_repo: String,
+    pub default_branch: String,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub repository_fingerprint: String,
+    pub health_score: f32,
+    pub execution_score: f32,
+    pub healing_score: f32,
+    pub verification_state: VerificationState,
+    pub badge_state: BadgeRuntimeState,
+    pub current_workspace_id: Option<String>,
+    pub latest_execution_id: Option<String>,
+    pub latest_successful_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6603,11 +6629,11 @@ pub struct BadgeExecutionSnapshot {
 
 fn badge_state_label(state: BadgeRuntimeState) -> (&'static str, &'static str, &'static str) {
     match state {
-        BadgeRuntimeState::Ready => ("Ready", "#22c55e", "🟢"),
-        BadgeRuntimeState::NeedsSetup => ("Needs setup", "#facc15", "🟡"),
-        BadgeRuntimeState::Broken => ("Broken", "#ef4444", "🔴"),
+        BadgeRuntimeState::Runnable => ("Runnable", "#facc15", "🟡"),
+        BadgeRuntimeState::Verified => ("Verified", "#22c55e", "🟢"),
         BadgeRuntimeState::Healed => ("Healed", "#38bdf8", "🔵"),
-        BadgeRuntimeState::NotTested => ("Not tested", "#94a3b8", "⚪"),
+        BadgeRuntimeState::Untested => ("Untested", "#94a3b8", "⚪"),
+        BadgeRuntimeState::ProductionReady => ("Production Ready", "#16a34a", "🟢"),
     }
 }
 
@@ -6625,16 +6651,18 @@ pub fn derive_badge_runtime_state(snapshot: &BadgeExecutionSnapshot) -> BadgeRun
         return BadgeRuntimeState::Healed;
     }
     if !snapshot.has_execution_history {
-        return BadgeRuntimeState::NotTested;
+        return BadgeRuntimeState::Untested;
+    }
+    if snapshot.last_run_status.eq_ignore_ascii_case("success")
+        && snapshot.health_score >= 95.0
+        && snapshot.execution_readiness >= 0.9
+    {
+        return BadgeRuntimeState::ProductionReady;
     }
     if snapshot.last_run_status.eq_ignore_ascii_case("success") {
-        return BadgeRuntimeState::Ready;
+        return BadgeRuntimeState::Verified;
     }
-    if snapshot.execution_readiness < 0.7 {
-        BadgeRuntimeState::NeedsSetup
-    } else {
-        BadgeRuntimeState::Broken
-    }
+    BadgeRuntimeState::Runnable
 }
 
 const BADGE_PADDING_WIDTH: i32 = 32;
@@ -6962,6 +6990,14 @@ pub fn extension_overlay_ui_endpoint() -> (String, String) {
             "columns": ["frameworks", "services", "ports", "runtime", "topology"]
         }),
         json!({
+            "id": "repository_intelligence",
+            "type": "card",
+            "title": "Repository Intelligence",
+            "fields": ["Execution Score", "Framework", "Runtime", "Last Success"],
+            "actions": ["Launch", "Heal", "Adopt"],
+            "endpoint": "/api/repositories/{id}/intelligence"
+        }),
+        json!({
             "id": "commit_panel",
             "type": "table",
             "columns": ["current_commit", "last_good_commit", "run_previous_commit"]
@@ -7083,7 +7119,7 @@ pub fn portal_ui_endpoint() -> (String, String) {
                 "seed_link": "https://trythissoftware.com/seed/vercel/next.js"
             },
             "copy_to_clipboard": true,
-            "generate_api": "/api/badge/generate",
+            "generate_api": "/api/badges/generate",
             "notice": "This badge updates automatically based on repository execution health."
         }),
         json!({
@@ -7736,6 +7772,7 @@ impl ExecutionIntelligenceDatabase {
             include_str!("../migrations/0003_seed_bootstrap.sql"),
             include_str!("../migrations/0004_billing_metering.sql"),
             include_str!("../migrations/0005_anonymous_execution_identity.sql"),
+            include_str!("../migrations/0006_repository_identity_and_healing_repairs.sql"),
         ]
     }
 
@@ -7891,6 +7928,107 @@ pub fn repository_last_good_commit_endpoint_with_store(
         json!({
             "repository_id": repository_id,
             "commit_hash": store.last_good_commit_for_repository(repository_id)?,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_intelligence_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_intelligence_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_intelligence_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let repository = store.repository(repository_id)?;
+    let executions = store.executions_for_repository(repository_id)?;
+    let healing_attempts = store.healing_attempts_for_repository(repository_id)?;
+    let last_good_commit = store.last_good_commit_for_repository(repository_id)?;
+    let latest_execution = executions.last().cloned();
+    let latest_successful_execution = executions
+        .iter()
+        .rev()
+        .find(|execution| eidb_execution_status_is_success(&execution.status))
+        .cloned();
+
+    let execution_score = if executions.is_empty() {
+        0.0
+    } else {
+        let successful = executions
+            .iter()
+            .filter(|execution| eidb_execution_status_is_success(&execution.status))
+            .count() as f32;
+        (successful / executions.len() as f32) * 100.0
+    };
+    let healing_score = if healing_attempts.is_empty() {
+        0.0
+    } else {
+        let successful = healing_attempts.iter().filter(|attempt| attempt.success).count() as f32;
+        (successful / healing_attempts.len() as f32) * 100.0
+    };
+    let health_score = ((execution_score * 0.7) + (healing_score * 0.3)).min(100.0);
+    let badge_state = derive_badge_runtime_state(&BadgeExecutionSnapshot {
+        health_score,
+        execution_readiness: execution_score / 100.0,
+        last_run_status: latest_execution
+            .as_ref()
+            .map(|execution| execution.status.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+        has_execution_history: !executions.is_empty(),
+        healed_artifact_available: healing_attempts.iter().any(|attempt| attempt.success),
+    });
+
+    let repository_identity = repository.map(|record| {
+        let context = parse_badge_repository_context(&record.repo_url);
+        RepositoryIdentity {
+            id: record.repo_id.clone(),
+            github_owner: context.as_ref().map(|ctx| ctx.owner.clone()).unwrap_or_default(),
+            github_repo: context.as_ref().map(|ctx| ctx.repo.clone()).unwrap_or_default(),
+            default_branch: record.default_branch.clone(),
+            first_seen_at: record.first_seen,
+            last_seen_at: record.last_seen,
+            repository_fingerprint: hash_key(&record.repo_url),
+            health_score,
+            execution_score,
+            healing_score,
+            verification_state: if latest_successful_execution.is_some() {
+                VerificationState::Verified
+            } else {
+                VerificationState::Unverified
+            },
+            badge_state,
+            current_workspace_id: latest_execution.as_ref().map(|execution| execution.workspace_id.clone()),
+            latest_execution_id: latest_execution.as_ref().map(|execution| execution.execution_id.clone()),
+            latest_successful_execution_id: latest_successful_execution
+                .as_ref()
+                .map(|execution| execution.execution_id.clone()),
+        }
+    });
+
+    Ok((
+        format!("/api/repositories/{repository_id}/intelligence"),
+        json!({
+            "repository_id": repository_id,
+            "repository_identity": repository_identity,
+            "execution_score": execution_score,
+            "healing_score": healing_score,
+            "health_score": health_score,
+            "runtime": latest_execution.as_ref().map(|execution| execution.execution_tier.clone()).unwrap_or_else(|| "unknown".to_string()),
+            "framework": "unknown",
+            "last_success": latest_successful_execution
+                .as_ref()
+                .map(|execution| execution.execution_id.clone())
+                .or(last_good_commit),
+            "actions": {
+                "launch": format!("/seed/{{owner}}/{{repo}}"),
+                "heal": format!("/repositories/{repository_id}/healing"),
+                "adopt": format!("/api/repositories/{repository_id}/adopt")
+            }
         })
         .to_string(),
     ))
@@ -11460,6 +11598,7 @@ impl Default for RestApiSpec {
             "GET /executions/{id}/history",
             "GET /repositories/{id}/healing",
             "GET /repositories/{id}/last-good",
+            "GET /api/repositories/{id}/intelligence",
             "GET /billing/usage?org_id={org_id}",
             "GET /billing/summary",
             "POST /billing/invoice",
@@ -11468,6 +11607,7 @@ impl Default for RestApiSpec {
             "GET /api/v1/surfaces/portal/navigation",
             "GET /api/v1/surfaces/extension/ui",
             "GET /api/v1/surfaces/portal/ui",
+            "POST /api/badges/generate",
             "POST /api/badge/generate",
             "GET /badge/{owner}/{repo}.svg",
             "GET /badge/healed/{owner}/{repo}.svg",
@@ -15568,6 +15708,9 @@ dependencies:
         assert!(spec.routes.contains(&"GET /executions/{id}/history"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/healing"));
         assert!(spec.routes.contains(&"GET /repositories/{id}/last-good"));
+        assert!(spec
+            .routes
+            .contains(&"GET /api/repositories/{id}/intelligence"));
         assert!(spec.routes.contains(&"GET /billing/usage?org_id={org_id}"));
         assert!(spec.routes.contains(&"GET /billing/summary"));
         assert!(spec.routes.contains(&"POST /billing/invoice"));
@@ -15580,6 +15723,7 @@ dependencies:
             .contains(&"GET /api/v1/surfaces/portal/navigation"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/extension/ui"));
         assert!(spec.routes.contains(&"GET /api/v1/surfaces/portal/ui"));
+        assert!(spec.routes.contains(&"POST /api/badges/generate"));
         assert!(spec.routes.contains(&"POST /api/badge/generate"));
         assert!(spec.routes.contains(&"GET /badge/{owner}/{repo}.svg"));
         assert!(spec
@@ -16411,7 +16555,7 @@ services:
         );
         assert_eq!(badge_path, "/badge/octocat/hello-world.svg");
         assert!(badge_body.contains("<svg"));
-        assert!(badge_body.contains("🟢 Ready"));
+        assert!(badge_body.contains("🟢 Production Ready"));
         assert!(badge_body.contains("octocat/hello-world"));
 
         let (healed_path, healed_body) = healed_badge_variant_endpoint("octocat", "hello-world");
@@ -16443,7 +16587,7 @@ services:
             visibility: Some("private".to_string()),
         };
         let (path, body) = badge_generate_endpoint(&request);
-        assert_eq!(path, "/api/badge/generate");
+        assert_eq!(path, "/api/badges/generate");
 
         let payload: Value = serde_json::from_str(&body).expect("badge payload json");
         assert_eq!(
@@ -16519,7 +16663,7 @@ services:
             visibility: None,
         };
         let (path, body) = badge_generate_endpoint(&request);
-        assert_eq!(path, "/api/badge/generate");
+        assert_eq!(path, "/api/badges/generate");
         assert!(body.contains("\"error\":\"invalid_github_repo_url\""));
     }
 
@@ -16843,7 +16987,7 @@ services:
         assert!(portal_ui_body.contains("\"executions\""));
         assert!(portal_ui_body.contains("\"agents\""));
         assert!(portal_ui_body.contains("\"badge_generator_studio\""));
-        assert!(portal_ui_body.contains("\"generate_api\":\"/api/badge/generate\""));
+        assert!(portal_ui_body.contains("\"generate_api\":\"/api/badges/generate\""));
         assert!(portal_ui_body
             .contains("\"notice\":\"This badge updates automatically based on repository execution health.\""));
         assert!(portal_ui_body.contains("\"component_registry\""));
@@ -17507,6 +17651,10 @@ services:
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS runtime_images"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS warm_pool_usage"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS healing_attempts"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repository_identities"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repair_plans"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repair_outcomes"));
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS repair_artifacts"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS url_allocations"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS workspaces"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS workspace_runtime_bindings"));
@@ -17612,6 +17760,53 @@ services:
             repository_last_good_commit_endpoint("repo-eidb", &database);
         assert_eq!(last_good_path, "/repositories/repo-eidb/last-good");
         assert!(last_good_body.contains("\"commit_hash\":\"aaaaaaa\""));
+    }
+
+    #[test]
+    fn repository_intelligence_endpoint_emits_identity_and_actions() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.repositories.insert(
+            "repo-id".to_string(),
+            EidbRepositoryRecord {
+                repo_id: "repo-id".to_string(),
+                repo_url: "https://github.com/octocat/hello-world".to_string(),
+                default_branch: "main".to_string(),
+                first_seen: 1,
+                last_seen: 2,
+            },
+        );
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon".to_string()),
+            workspace_id: "ws-1".to_string(),
+            repository_id: "repo-id".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: "success".to_string(),
+            execution_tier: "WASM".to_string(),
+        });
+        database.record_healing_attempt(EidbHealingAttemptRecord {
+            repository_id: "repo-id".to_string(),
+            execution_id: "exec-1".to_string(),
+            failure_class: "Dependency".to_string(),
+            repair_strategy: "pin_version".to_string(),
+            success: true,
+            created_at: 3,
+        });
+
+        let (path, body) = repository_intelligence_endpoint("repo-id", &database);
+        assert_eq!(path, "/api/repositories/repo-id/intelligence");
+        assert!(body.contains("\"github_owner\":\"octocat\""));
+        assert!(body.contains("\"github_repo\":\"hello-world\""));
+        assert!(body.contains("\"execution_score\":100.0"));
+        assert!(body.contains("\"healing_score\":100.0"));
+        assert!(body.contains("\"actions\""));
+        assert!(body.contains("\"launch\":\"/seed/{owner}/{repo}\""));
+        assert!(body.contains("\"heal\":\"/repositories/repo-id/healing\""));
+        assert!(body.contains("\"adopt\":\"/api/repositories/repo-id/adopt\""));
     }
 
     #[test]
