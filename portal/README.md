@@ -31,5 +31,5 @@ Build and run the standalone server used by deployment:
 
 ```bash
 npm run build
-npm run start
+HOSTNAME=0.0.0.0 npm run start
 ```
