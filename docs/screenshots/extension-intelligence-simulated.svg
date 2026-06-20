@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-label="Web extension repository intelligence screenshot">
+  <rect width="1200" height="700" fill="#0f172a"/>
+  <rect x="40" y="40" width="1120" height="620" rx="14" fill="#111827" stroke="#334155"/>
+  <text x="80" y="102" fill="#e2e8f0" font-size="36" font-family="Arial, sans-serif" font-weight="700">GitHub Overlay Extension — Repository Intelligence</text>
+  <rect x="80" y="130" width="1040" height="58" rx="8" fill="#1e293b" stroke="#475569"/>
+  <text x="110" y="166" fill="#93c5fd" font-size="22" font-family="Arial, sans-serif">GET /api/v1/surfaces/extension/ui + /api/repositories/{id}/intelligence</text>
+
+  <rect x="80" y="215" width="520" height="250" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="110" y="255" fill="#bae6fd" font-size="25" font-family="Arial, sans-serif" font-weight="700">Repository card</text>
+  <text x="110" y="292" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">owner/repo: octocat/hello-world</text>
+  <text x="110" y="324" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Execution Score: 88.0</text>
+  <text x="110" y="356" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Framework: unknown</text>
+  <text x="110" y="388" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Runtime: wasm</text>
+  <text x="110" y="420" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Last Success: exec-5cc2</text>
+
+  <rect x="620" y="215" width="500" height="250" rx="10" fill="#0b1220" stroke="#475569"/>
+  <text x="650" y="255" fill="#bae6fd" font-size="25" font-family="Arial, sans-serif" font-weight="700">Quick Actions</text>
+  <rect x="650" y="282" width="120" height="48" rx="8" fill="#22c55e"/>
+  <text x="685" y="313" fill="#052e16" font-size="22" font-family="Arial, sans-serif" font-weight="700">Run</text>
+  <rect x="790" y="282" width="140" height="48" rx="8" fill="#38bdf8"/>
+  <text x="818" y="313" fill="#082f49" font-size="22" font-family="Arial, sans-serif" font-weight="700">Analyze</text>
+  <rect x="950" y="282" width="140" height="48" rx="8" fill="#facc15"/>
+  <text x="988" y="313" fill="#422006" font-size="22" font-family="Arial, sans-serif" font-weight="700">Heal</text>
+  <text x="650" y="370" fill="#cbd5e1" font-size="22" font-family="Arial, sans-serif">Prompt: "How can this be healed?"</text>
+  <text x="650" y="402" fill="#bbf7d0" font-size="21" font-family="Arial, sans-serif">Recommended repair starts with 'pin package version'</text>
+  <text x="650" y="432" fill="#bbf7d0" font-size="21" font-family="Arial, sans-serif">for failure class 'Dependency', based on prior history.</text>
+
+  <rect x="80" y="490" width="1040" height="130" rx="10" fill="#1e293b" stroke="#475569"/>
+  <text x="110" y="530" fill="#e2e8f0" font-size="24" font-family="Arial, sans-serif" font-weight="700">Simulated response contract</text>
+  <text x="110" y="565" fill="#cbd5e1" font-size="21" font-family="Arial, sans-serif">answer • confidence • evidence[file/execution/failure/repair] • related_executions • related_failures • related_healings</text>
+</svg>

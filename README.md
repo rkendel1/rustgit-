@@ -115,6 +115,11 @@ Portal screenshot:
 
 ![TryThisSoftware portal](docs/screenshots/portal-home.png)
 
+Dual-surface intelligence screenshots (simulated from current data model + prompting behavior):
+
+![Portal intelligence simulated response](docs/screenshots/portal-intelligence-simulated.svg)
+![Web extension intelligence simulated response](docs/screenshots/extension-intelligence-simulated.svg)
+
 ## PostgreSQL persistence
 
 This repository now includes SQL migrations and a production-style PostgreSQL persistence layer for Execution Intelligence history.

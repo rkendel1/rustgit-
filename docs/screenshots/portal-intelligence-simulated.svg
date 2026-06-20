@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-label="Portal repository intelligence screenshot">
+  <rect width="1200" height="700" fill="#f8fafc"/>
+  <rect x="40" y="40" width="1120" height="620" rx="14" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="80" y="102" fill="#0f172a" font-size="36" font-family="Arial, sans-serif" font-weight="700">TryThisSoftware Portal — Repository Intelligence</text>
+  <rect x="80" y="130" width="1040" height="58" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="110" y="166" fill="#1d4ed8" font-size="22" font-family="Arial, sans-serif">GET /api/repositories/repo-id/intelligence</text>
+
+  <rect x="80" y="215" width="500" height="180" rx="10" fill="#0b1220" stroke="#334155"/>
+  <text x="110" y="255" fill="#bae6fd" font-size="25" font-family="Arial, sans-serif" font-weight="700">Model-driven signals</text>
+  <text x="110" y="295" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Execution Score: 92.0</text>
+  <text x="110" y="327" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Runtime: wasm</text>
+  <text x="110" y="359" fill="#e2e8f0" font-size="22" font-family="Arial, sans-serif">Last Success: exec-9a1f</text>
+
+  <rect x="620" y="215" width="500" height="180" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="650" y="255" fill="#0f172a" font-size="25" font-family="Arial, sans-serif" font-weight="700">Actions</text>
+  <rect x="650" y="280" width="120" height="48" rx="8" fill="#22c55e"/>
+  <text x="685" y="311" fill="#052e16" font-size="22" font-family="Arial, sans-serif" font-weight="700">Launch</text>
+  <rect x="790" y="280" width="100" height="48" rx="8" fill="#facc15"/>
+  <text x="821" y="311" fill="#422006" font-size="22" font-family="Arial, sans-serif" font-weight="700">Heal</text>
+  <rect x="910" y="280" width="110" height="48" rx="8" fill="#38bdf8"/>
+  <text x="940" y="311" fill="#082f49" font-size="22" font-family="Arial, sans-serif" font-weight="700">Adopt</text>
+
+  <rect x="80" y="420" width="1040" height="200" rx="10" fill="#111827" stroke="#334155"/>
+  <text x="110" y="460" fill="#e2e8f0" font-size="25" font-family="Arial, sans-serif" font-weight="700">Simulated Ask Repository responses (prompted from EIDB model)</text>
+  <text x="110" y="500" fill="#bbf7d0" font-size="22" font-family="Arial, sans-serif">Q: Can this repository run?</text>
+  <text x="130" y="530" fill="#e2e8f0" font-size="21" font-family="Arial, sans-serif">A: Yes. This repository has prior successful executions and can run with the previously successful runtime.</text>
+  <text x="110" y="564" fill="#bae6fd" font-size="22" font-family="Arial, sans-serif">Q: Why did the last build fail?</text>
+  <text x="130" y="594" fill="#e2e8f0" font-size="21" font-family="Arial, sans-serif">A: The latest failure class was Dependency on execution exec-7b21. The most recent repair strategy was pin package version.</text>
+</svg>
