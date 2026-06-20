@@ -94,7 +94,7 @@ impl From<io::Error> for RuntimeError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Framework {
     Node,
     StaticWeb,
@@ -2225,7 +2225,7 @@ pub struct RepoDelta {
     pub modified_files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum WorkspaceState {
     Created,
     Materializing,
@@ -2245,7 +2245,7 @@ pub enum WorkspaceState {
     Destroyed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PortInfo {
     pub port: u16,
     pub protocol: String,
@@ -4776,13 +4776,13 @@ pub struct HealthStatus {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceQuotas {
     pub max_memory_mb: u32,
     pub max_cpu_millis: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkPolicy {
     pub allow_outbound: bool,
     pub allowed_hosts: Vec<String>,
@@ -8456,7 +8456,7 @@ impl CapacityScheduler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workspace {
     pub id: String,
     pub repo_url: String,
