@@ -2278,10 +2278,13 @@ impl CapabilityEngine {
                 _ => {}
             }
         }
-        if environment
-            .keys()
-            .any(|key| !capabilities.env.variables.iter().any(|allowed| allowed == key))
-        {
+        if environment.keys().any(|key| {
+            !capabilities
+                .env
+                .variables
+                .iter()
+                .any(|allowed| allowed == key)
+        }) {
             return Err(RuntimeError::WasmRuntime(
                 "environment variable outside capability policy".to_string(),
             ));
@@ -2494,8 +2497,10 @@ impl WasiKernel {
         )?;
 
         self.observability.stage("component-linking");
-        let resolved_links =
-            WasiLinker::resolve(&request.component_graph.imports, &request.component_graph.exports);
+        let resolved_links = WasiLinker::resolve(
+            &request.component_graph.imports,
+            &request.component_graph.exports,
+        );
         let execution_graph_diff = resolved_links
             .iter()
             .filter(|link| !request.component_graph.links.contains(link))
@@ -2510,7 +2515,11 @@ impl WasiKernel {
         self.observability.stage("sandbox-setup");
         self.filesystem = KernelVirtualFs::from_snapshot(&request.filesystem_snapshot);
         self.network.configure(&request.capabilities.network);
-        for host in &request.component_graph.runtime_constraints.network_allowlist {
+        for host in &request
+            .component_graph
+            .runtime_constraints
+            .network_allowlist
+        {
             self.network.intercept_request(host)?;
         }
         self.process.configure(&request.capabilities.process);
@@ -2544,11 +2553,13 @@ impl WasiKernel {
         self.observability.stage("observe");
         self.observability
             .metric("execution_ms", started.elapsed().as_secs_f64() * 1_000.0);
-        self.observability
-            .metric("exported_function_count", result.exported_functions.len() as f64);
-        self.observability.memory_profile.push(
-            u64::from(request.runtime_spec.memory_limit_mb).saturating_mul(BYTES_PER_MB),
+        self.observability.metric(
+            "exported_function_count",
+            result.exported_functions.len() as f64,
         );
+        self.observability
+            .memory_profile
+            .push(u64::from(request.runtime_spec.memory_limit_mb).saturating_mul(BYTES_PER_MB));
         self.scheduler.complete(&trace_id);
 
         Ok(WasiKernelExecutionResponse {
@@ -3577,8 +3588,49 @@ impl WasiLinker {
     }
 
     pub fn optimize_graph(graph: &mut WasiComponentGraph) {
-        graph.components.sort_by(|a, b| a.id.cmp(&b.id));
-        graph.components.dedup_by(|a, b| a.id == b.id);
+        Self::normalize_components(&mut graph.components);
+        Self::collapse_duplicate_components(&mut graph.components);
+
+        let mut required_capabilities = graph.capabilities.needs.clone();
+        required_capabilities.extend(graph.links.iter().map(|link| link.capability.clone()));
+        required_capabilities.extend(
+            graph
+                .imports
+                .iter()
+                .filter_map(|entry| parse_link_entry("import:", entry.as_str()))
+                .map(|(_, capability)| capability.to_string()),
+        );
+
+        let mut live_component_ids = Self::collect_live_components(graph, &required_capabilities);
+        if live_component_ids.is_empty() {
+            live_component_ids.extend(
+                graph
+                    .components
+                    .iter()
+                    .map(|component| component.id.clone()),
+            );
+        }
+        graph
+            .components
+            .retain(|component| live_component_ids.contains(component.id.as_str()));
+
+        for component in &mut graph.components {
+            component
+                .capabilities
+                .retain(|capability| required_capabilities.contains(capability));
+            component.capabilities.sort();
+            component.capabilities.dedup();
+        }
+
+        let component_ids = graph
+            .components
+            .iter()
+            .map(|component| component.id.as_str())
+            .collect::<HashSet<_>>();
+        graph.links.retain(|link| {
+            component_ids.contains(link.from_component.as_str())
+                && component_ids.contains(link.to_component.as_str())
+        });
         graph.links.sort_by(|a, b| {
             (&a.from_component, &a.to_component, &a.capability).cmp(&(
                 &b.from_component,
@@ -3587,10 +3639,127 @@ impl WasiLinker {
             ))
         });
         graph.links.dedup();
+
+        graph.imports.retain(|entry| {
+            parse_link_entry("import:", entry.as_str())
+                .map(|(component_id, _)| component_ids.contains(component_id))
+                .unwrap_or(false)
+        });
         graph.imports.sort();
         graph.imports.dedup();
+        graph.exports.retain(|entry| {
+            parse_link_entry("export:", entry.as_str())
+                .map(|(component_id, _)| component_ids.contains(component_id))
+                .unwrap_or(false)
+        });
         graph.exports.sort();
         graph.exports.dedup();
+
+        let available_capabilities = graph
+            .components
+            .iter()
+            .flat_map(|component| component.capabilities.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        graph
+            .capabilities
+            .needs
+            .retain(|need| available_capabilities.contains(need));
+
+        if graph.components.iter().any(Self::requires_dependency_cache) {
+            graph
+                .runtime_constraints
+                .read_only_paths
+                .push("/cache/dependency".to_string());
+            graph
+                .runtime_constraints
+                .read_only_paths
+                .push("/runtime/warm".to_string());
+        }
+
+        graph.execution_plan.startup_order =
+            component_startup_order(&graph.components, &graph.links);
+        graph.execution_plan.ordered_nodes = graph.execution_plan.startup_order.clone();
+    }
+
+    fn normalize_components(components: &mut [WasiComponent]) {
+        for component in components {
+            component.imports.sort();
+            component.imports.dedup();
+            component.exports.sort();
+            component.exports.dedup();
+            component.capabilities.sort();
+            component.capabilities.dedup();
+        }
+    }
+
+    fn collapse_duplicate_components(components: &mut Vec<WasiComponent>) {
+        components.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut collapsed = Vec::new();
+        for component in components.drain(..) {
+            if let Some(existing) = collapsed
+                .iter_mut()
+                .find(|existing: &&mut WasiComponent| existing.id == component.id)
+            {
+                if existing.module.is_empty() && !component.module.is_empty() {
+                    existing.module = component.module.clone();
+                }
+                existing.imports.extend(component.imports);
+                existing.exports.extend(component.exports);
+                existing.capabilities.extend(component.capabilities);
+                existing.imports.sort();
+                existing.imports.dedup();
+                existing.exports.sort();
+                existing.exports.dedup();
+                existing.capabilities.sort();
+                existing.capabilities.dedup();
+            } else {
+                collapsed.push(component);
+            }
+        }
+        *components = collapsed;
+    }
+
+    fn collect_live_components(
+        graph: &WasiComponentGraph,
+        required_capabilities: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut live = BTreeSet::new();
+        live.extend(
+            graph
+                .links
+                .iter()
+                .flat_map(|link| [link.from_component.clone(), link.to_component.clone()]),
+        );
+        live.extend(
+            graph
+                .imports
+                .iter()
+                .filter_map(|entry| parse_link_entry("import:", entry.as_str()))
+                .map(|(component_id, _)| component_id.to_string()),
+        );
+        live.extend(
+            graph
+                .components
+                .iter()
+                .filter(|component| {
+                    component
+                        .capabilities
+                        .iter()
+                        .any(|capability| required_capabilities.contains(capability))
+                })
+                .map(|component| component.id.clone()),
+        );
+        live
+    }
+
+    fn requires_dependency_cache(component: &WasiComponent) -> bool {
+        component.capabilities.iter().any(|capability| {
+            let normalized = capability.to_ascii_lowercase();
+            normalized.contains("build")
+                || normalized.contains("compile")
+                || normalized.contains("install")
+                || normalized.contains("package_manager")
+        })
     }
 }
 
@@ -3685,7 +3854,8 @@ impl CapabilityValidator {
         if !WasiLinker::validate(&graph.capabilities, graph) {
             return false;
         }
-        if graph.runtime_constraints.max_memory_mb == 0 || graph.runtime_constraints.max_cpu_units == 0
+        if graph.runtime_constraints.max_memory_mb == 0
+            || graph.runtime_constraints.max_cpu_units == 0
         {
             return false;
         }
@@ -3745,7 +3915,11 @@ pub struct WasiComponentLoader {
 }
 
 impl WasiComponentLoader {
-    fn compute_cache_key(components: &[WasiComponent], imports: &[String], exports: &[String]) -> String {
+    fn compute_cache_key(
+        components: &[WasiComponent],
+        imports: &[String],
+        exports: &[String],
+    ) -> String {
         hash_key(&format!(
             "{}:{}",
             hash_key(
@@ -5332,8 +5506,7 @@ impl MeshScheduler {
         for component in &wasi_graph.components {
             let preferred_node_type = Self::preferred_node_type(component);
             let constraints = Self::constraints_for(component);
-            let fallback_nodes =
-                router.candidate_nodes(preferred_node_type, &constraints, nodes);
+            let fallback_nodes = router.candidate_nodes(preferred_node_type, &constraints, nodes);
             let placement = ComponentPlacement {
                 component_id: component.id.clone(),
                 preferred_node_type,
@@ -5422,9 +5595,9 @@ impl MeshScheduler {
             network: capabilities
                 .iter()
                 .any(|capability| capability.contains("network") || capability.contains("http")),
-            filesystem: capabilities
-                .iter()
-                .any(|capability| capability.contains("filesystem") || capability.contains("build")),
+            filesystem: capabilities.iter().any(|capability| {
+                capability.contains("filesystem") || capability.contains("build")
+            }),
             latency_sensitive: capabilities
                 .iter()
                 .any(|capability| capability.contains("latency") || capability.contains("serve")),
@@ -5522,9 +5695,7 @@ impl MeshExecutionRouter {
         candidates.sort_by(|a, b| {
             let a_preferred = a.node_type == preferred_node_type;
             let b_preferred = b.node_type == preferred_node_type;
-            b_preferred
-                .cmp(&a_preferred)
-                .then_with(|| a.id.cmp(&b.id))
+            b_preferred.cmp(&a_preferred).then_with(|| a.id.cmp(&b.id))
         });
         candidates.into_iter().map(|node| node.id).collect()
     }
@@ -13521,7 +13692,10 @@ impl ExecutionRuntimeSpecCompiler {
         let dependencies = analysis
             .dependency_files
             .iter()
-            .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
             .collect::<Vec<_>>();
         let framework_label = format!("{:?}", analysis.framework).to_ascii_lowercase();
         let language_label = format!("{:?}", analysis.language).to_ascii_lowercase();
@@ -13564,7 +13738,8 @@ impl ExecutionRuntimeSpecCompiler {
             .unwrap_or_else(|| {
                 vec![RuntimeServicePlan {
                     id: "default".to_string(),
-                    runtime: runtime_kind_label(analysis.classification.primary_runtime).to_string(),
+                    runtime: runtime_kind_label(analysis.classification.primary_runtime)
+                        .to_string(),
                     framework: Some(framework_label.clone()),
                     working_directory: ".".to_string(),
                     start_command: analysis
@@ -13632,7 +13807,10 @@ impl ExecutionRuntimeSpecCompiler {
             "RUSTGIT_RUNTIME".to_string(),
             runtime_kind_label(analysis.classification.primary_runtime).to_string(),
         );
-        if matches!(analysis.language, Language::JavaScript | Language::TypeScript) {
+        if matches!(
+            analysis.language,
+            Language::JavaScript | Language::TypeScript
+        ) {
             environment.insert("NODE_ENV".to_string(), "production".to_string());
         }
         if analysis.language == Language::Python {
@@ -13684,9 +13862,7 @@ impl WasmRuntimeCompiler {
             "lang={}|framework={}|pm={}|deps={}|ports={}|build={}|exec={}|cache={}|wasm={}",
             spec.language,
             spec.framework,
-            spec.package_manager
-                .as_deref()
-                .unwrap_or(UNKNOWN_SIGNATURE),
+            spec.package_manager.as_deref().unwrap_or(UNKNOWN_SIGNATURE),
             spec.dependencies.join(","),
             spec.ports
                 .iter()
@@ -13757,8 +13933,14 @@ impl WasmRuntimeCompiler {
                 id: "filesystem".to_string(),
                 module: "filesystem.wasm".to_string(),
                 imports: vec![],
-                exports: vec!["filesystem.read".to_string(), "filesystem.write".to_string()],
-                capabilities: vec!["filesystem.read".to_string(), "filesystem.write".to_string()],
+                exports: vec![
+                    "filesystem.read".to_string(),
+                    "filesystem.write".to_string(),
+                ],
+                capabilities: vec![
+                    "filesystem.read".to_string(),
+                    "filesystem.write".to_string(),
+                ],
             },
             WasiComponent {
                 id: "network".to_string(),
@@ -13890,7 +14072,9 @@ fn component_startup_order(components: &[WasiComponent], links: &[WasiLink]) -> 
         if link.from_component == link.to_component {
             continue;
         }
-        if !in_degree.contains_key(&link.from_component) || !in_degree.contains_key(&link.to_component) {
+        if !in_degree.contains_key(&link.from_component)
+            || !in_degree.contains_key(&link.to_component)
+        {
             continue;
         }
         if dependents
@@ -14729,22 +14913,24 @@ impl ExecutionProvider for NodeRuntimeProvider {
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
-        matches!(ctx.runtime_spec.language.as_str(), "javascript" | "typescript")
-            || matches!(
-                ctx.analysis.framework,
-                Framework::Node
-                    | Framework::Vite
-                    | Framework::React
-                    | Framework::Vue
-                    | Framework::Svelte
-                    | Framework::SvelteKit
-                    | Framework::NextJs
-                    | Framework::Nuxt
-                    | Framework::Astro
-                    | Framework::Remix
-                    | Framework::Express
-                    | Framework::NestJs
-            )
+        matches!(
+            ctx.runtime_spec.language.as_str(),
+            "javascript" | "typescript"
+        ) || matches!(
+            ctx.analysis.framework,
+            Framework::Node
+                | Framework::Vite
+                | Framework::React
+                | Framework::Vue
+                | Framework::Svelte
+                | Framework::SvelteKit
+                | Framework::NextJs
+                | Framework::Nuxt
+                | Framework::Astro
+                | Framework::Remix
+                | Framework::Express
+                | Framework::NestJs
+        )
     }
 
     fn prepare(&self, _ctx: &mut ExecutionContext) -> Result<()> {
@@ -16942,7 +17128,10 @@ dependencies:
             .runtime_spec
             .cache_layers
             .contains(&"dependency-cache".to_string()));
-        assert!(analysis.compiled_runtime.environment_id.starts_with("uwef-"));
+        assert!(analysis
+            .compiled_runtime
+            .environment_id
+            .starts_with("uwef-"));
         assert!(analysis
             .compiled_runtime
             .component_graph
@@ -17010,8 +17199,14 @@ dependencies:
             .read_only_paths
             .push("/workspace".to_string());
         WasiLinker::enforce_security_model(&mut graph);
-        assert!(graph.components.iter().any(|component| component.id == "rust"));
-        assert!(graph.components.iter().any(|component| component.id == "cargo"));
+        assert!(graph
+            .components
+            .iter()
+            .any(|component| component.id == "rust"));
+        assert!(graph
+            .components
+            .iter()
+            .any(|component| component.id == "cargo"));
         assert!(graph
             .runtime_constraints
             .network_allowlist
@@ -17097,6 +17292,93 @@ dependencies:
         );
         assert_eq!(first, second);
         assert_eq!(loader.cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn wasi_optimizer_prunes_dead_components_and_rebuilds_execution_plan() {
+        let mut graph = WasiComponentGraph {
+            components: vec![
+                WasiComponent {
+                    id: "filesystem".to_string(),
+                    module: "filesystem.wasm".to_string(),
+                    imports: vec![],
+                    exports: vec!["filesystem.read".to_string()],
+                    capabilities: vec![
+                        "filesystem.read".to_string(),
+                        "filesystem.write".to_string(),
+                    ],
+                },
+                WasiComponent {
+                    id: "filesystem".to_string(),
+                    module: "filesystem-v2.wasm".to_string(),
+                    imports: vec![],
+                    exports: vec!["filesystem.read".to_string()],
+                    capabilities: vec!["filesystem.read".to_string()],
+                },
+                WasiComponent {
+                    id: "builder".to_string(),
+                    module: "builder.wasm".to_string(),
+                    imports: vec!["filesystem.read".to_string()],
+                    exports: vec![],
+                    capabilities: vec!["build.compile".to_string()],
+                },
+                WasiComponent {
+                    id: "terminal".to_string(),
+                    module: "terminal.wasm".to_string(),
+                    imports: vec![],
+                    exports: vec!["process.spawn".to_string()],
+                    capabilities: vec!["process.spawn".to_string()],
+                },
+            ],
+            links: vec![WasiLink {
+                from_component: "filesystem".to_string(),
+                to_component: "builder".to_string(),
+                capability: "filesystem.read".to_string(),
+            }],
+            capabilities: CapabilitySet {
+                needs: BTreeSet::from(["filesystem.read".to_string(), "build.compile".to_string()]),
+            },
+            imports: vec!["import:builder:filesystem.read".to_string()],
+            exports: vec![
+                "export:filesystem:filesystem.read".to_string(),
+                "export:terminal:process.spawn".to_string(),
+            ],
+            runtime_constraints: RuntimeConstraints::default(),
+            execution_plan: ExecutionPlan::default(),
+        };
+
+        WasiLinker::optimize_graph(&mut graph);
+        WasiLinker::enforce_security_model(&mut graph);
+
+        assert_eq!(
+            graph
+                .components
+                .iter()
+                .map(|component| component.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["builder", "filesystem"]
+        );
+        assert!(graph
+            .components
+            .iter()
+            .all(|component| component.id.as_str() != "terminal"));
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(
+            graph.execution_plan.startup_order,
+            vec!["filesystem".to_string(), "builder".to_string()]
+        );
+        assert_eq!(
+            graph.execution_plan.ordered_nodes,
+            graph.execution_plan.startup_order
+        );
+        assert!(graph
+            .runtime_constraints
+            .read_only_paths
+            .contains(&"/cache/dependency".to_string()));
+        assert!(graph
+            .runtime_constraints
+            .read_only_paths
+            .contains(&"/runtime/warm".to_string()));
     }
 
     #[test]
@@ -18461,8 +18743,11 @@ dependencies:
             edges: vec![],
         }
         .with_cache_keys();
-        let mut analysis =
-            test_analysis(graph.clone(), WasmCompatibility::Partial, Framework::Unknown);
+        let mut analysis = test_analysis(
+            graph.clone(),
+            WasmCompatibility::Partial,
+            Framework::Unknown,
+        );
         analysis.runtime_spec.language = "rust".to_string();
         analysis.runtime_spec.framework = "unknown".to_string();
         analysis.execution_profile.runtime_affinity = RuntimeAffinity {
@@ -18488,8 +18773,10 @@ dependencies:
                 allowed_hosts: vec![],
             },
         };
-        let router =
-            ExecutionRouter::new(vec![Box::new(NodeRuntimeProvider), Box::new(RustRuntimeProvider)]);
+        let router = ExecutionRouter::new(vec![
+            Box::new(NodeRuntimeProvider),
+            Box::new(RustRuntimeProvider),
+        ]);
         let selection = router.select(&ctx).expect("select provider");
         assert_eq!(selection.provider_id, "RustRuntimeProvider");
     }
@@ -19323,8 +19610,14 @@ dependencies:
 
         assert_eq!(build.preferred_node_type, MeshNodeType::Cloud);
         assert_eq!(serve.preferred_node_type, MeshNodeType::Edge);
-        assert_eq!(build.fallback_nodes.first().map(String::as_str), Some("cloud-1"));
-        assert_eq!(serve.fallback_nodes.first().map(String::as_str), Some("edge-1"));
+        assert_eq!(
+            build.fallback_nodes.first().map(String::as_str),
+            Some("cloud-1")
+        );
+        assert_eq!(
+            serve.fallback_nodes.first().map(String::as_str),
+            Some("edge-1")
+        );
         assert!(planned
             .partitions
             .iter()
