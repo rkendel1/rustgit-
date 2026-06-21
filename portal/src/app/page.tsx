@@ -18,7 +18,9 @@ const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
 const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
 const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
-const ANALYZE_WORKSPACES_FALLBACK_PATH = "/api/proxy/workspaces";
+const ANALYZE_WORKSPACES_FALLBACK_PATH_V1 = "/api/proxy/api/v1/workspaces";
+const ANALYZE_WORKSPACES_FALLBACK_PATH_API = "/api/proxy/api/workspaces";
+const ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT = "/api/proxy/workspaces";
 
 type AnalyzeEndpointResponseKind = "analyze" | "workspace";
 type AnalyzeEndpointConfig = {
@@ -29,7 +31,9 @@ type AnalyzeEndpointConfig = {
 const ANALYZE_ENDPOINTS: AnalyzeEndpointConfig[] = [
   { path: ANALYZE_V1_PATH, responseKind: "analyze" },
   { path: ANALYZE_LEGACY_PATH, responseKind: "analyze" },
-  { path: ANALYZE_WORKSPACES_FALLBACK_PATH, responseKind: "workspace" },
+  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_V1, responseKind: "workspace" },
+  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_API, responseKind: "workspace" },
+  { path: ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT, responseKind: "workspace" },
 ];
 
 type RepoContext = {
@@ -111,10 +115,16 @@ function parseRepositoryInput(input: string): RepoContext | null {
       }
       const owner = segments[0];
       const repo = segments[1];
+      const username = url.username;
+      const password = url.password;
+      const credentials =
+        username || password
+          ? `${username}${password ? `:${password}` : ""}@`
+          : "";
       return {
         owner,
         repo,
-        repoUrl: `https://github.com/${owner}/${repo}.git`,
+        repoUrl: `https://${credentials}github.com/${owner}/${repo}.git`,
       };
     } catch {
       return null;

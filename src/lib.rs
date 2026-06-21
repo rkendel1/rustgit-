@@ -12229,18 +12229,35 @@ impl WorkspaceManager {
         if looks_like_local_path(repo_url) {
             copy_directory(Path::new(repo_url), destination)?;
         } else {
-            let status = Command::new("git")
+            let mut clone_command = Command::new("git");
+            clone_command
+                .arg("-c")
+                .arg("credential.helper=")
+                .arg("-c")
+                .arg("credential.username=")
                 .arg("clone")
                 .arg("--depth")
-                .arg("1")
+                .arg("1");
+            clone_command.env("GIT_TERMINAL_PROMPT", "0");
+            if let Some(extra_header) = github_clone_extra_header(repo_url) {
+                clone_command
+                    .arg("-c")
+                    .arg(format!(
+                        "http.https://github.com/.extraheader={extra_header}"
+                    ));
+            }
+            let output = clone_command
                 .arg(repo_url)
                 .arg(destination)
-                .status()
+                .output()
                 .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
 
-            if !status.success() {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let reason = github_clone_error_reason(repo_url, &stderr);
                 return Err(RuntimeError::CommandFailed(format!(
-                    "git clone exited with status {status}"
+                    "git clone exited with status {}: {}",
+                    output.status, reason
                 )));
             }
         }
@@ -13824,9 +13841,8 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
             framework = framework_for_runtime(discovered.runtime);
             language = language_for_runtime(discovered.runtime);
         } else {
-            return Err(RuntimeError::UnsupportedRepository(
-                "unable to infer execution strategy".to_string(),
-            ));
+            framework = Framework::Node;
+            language = Language::JavaScript;
         }
     }
 
@@ -15996,6 +16012,55 @@ fn looks_like_local_path(repo_url: &str) -> bool {
     repo_url.starts_with('/') || repo_url.starts_with("./") || repo_url.starts_with("../")
 }
 
+fn github_clone_extra_header(repo_url: &str) -> Option<String> {
+    github_clone_extra_header_with_token(
+        repo_url,
+        std::env::var("RUSTGIT_GITHUB_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("GITHUB_PAT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("GH_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .as_deref(),
+    )
+}
+
+fn github_clone_extra_header_with_token(repo_url: &str, token: Option<&str>) -> Option<String> {
+    let token = token.map(str::trim).filter(|value| !value.is_empty())?;
+    if !repo_url.starts_with("https://github.com/")
+        && !repo_url.starts_with("https://www.github.com/")
+    {
+        return None;
+    }
+    let mut header = String::from("Authorization: Bearer ");
+    header.push_str(token);
+    Some(header)
+}
+
+fn github_clone_error_reason(repo_url: &str, stderr: &str) -> String {
+    if repo_url.starts_with("https://github.com/") || repo_url.starts_with("https://www.github.com/")
+    {
+        if stderr.contains("could not read Username for 'https://github.com'")
+            || stderr.contains("could not read Password for 'https://github.com'")
+        {
+            return "GitHub authentication is required in this environment; set RUSTGIT_GITHUB_TOKEN/GITHUB_PAT/GH_TOKEN or pass a credentialed repo URL such as https://<token>@github.com/owner/repo.git".to_string();
+        }
+    }
+
+    if stderr.is_empty() {
+        "git clone failed with no stderr output".to_string()
+    } else {
+        stderr.to_string()
+    }
+}
+
 fn node_type_name(node_type: ExecutionNodeType) -> &'static str {
     match node_type {
         ExecutionNodeType::InstallDependencies => "install-dependencies",
@@ -17632,6 +17697,11 @@ mod tests {
         let analysis = analyze_repository(&repo).expect("analyze repo");
         assert_eq!(analysis.framework, Framework::React);
         assert_eq!(analysis.language, Language::JavaScript);
+        assert!(analysis
+            .execution_graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "install"));
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("npm run dev -- --host 0.0.0.0")
@@ -17704,6 +17774,21 @@ mod tests {
             analysis.execution_graph.primary_run_command().as_deref(),
             Some("uvicorn app:app --host 0.0.0.0 --port 8000")
         );
+    }
+
+    #[test]
+    fn falls_back_to_node_strategy_when_repository_shape_is_unknown() {
+        let repo = temp_dir("unknown-repo-fallback");
+        fs::write(repo.join("README.md"), "# Hello World\n").expect("write readme");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        assert_eq!(analysis.framework, Framework::Node);
+        assert_eq!(analysis.language, Language::JavaScript);
+        assert_eq!(
+            analysis.execution_graph.primary_run_command().as_deref(),
+            Some("npm run dev -- --host 0.0.0.0")
+        );
+        assert!(analysis.topology.is_none());
     }
 
     #[test]
@@ -23169,5 +23254,50 @@ all = ["network"]
         let (recompute_path, recompute_body) = fingerprint_recompute_endpoint(&fingerprint);
         assert_eq!(recompute_path, "/fingerprint/recompute");
         assert!(recompute_body.contains("\"status\":\"recomputed\""));
+    }
+
+    #[test]
+    fn github_clone_extra_header_includes_bearer_token_for_github_https_repos() {
+        let header = github_clone_extra_header_with_token(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            Some("ghp_test123"),
+        )
+        .expect("expected auth header");
+
+        assert!(header.starts_with("Authorization: Bearer "));
+        assert!(header.ends_with("ghp_test123"));
+    }
+
+    #[test]
+    fn github_clone_extra_header_ignores_non_github_urls() {
+        let header =
+            github_clone_extra_header_with_token("https://gitlab.com/group/repo.git", Some("token"));
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn github_clone_extra_header_ignores_empty_token() {
+        let header = github_clone_extra_header_with_token(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            Some("   "),
+        );
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn github_clone_error_reason_surfaces_auth_guidance_for_github_username_prompt_failure() {
+        let reason = github_clone_error_reason(
+            "https://github.com/rkendel1/new_vue-healed4.git",
+            "fatal: could not read Username for 'https://github.com': No such device or address",
+        );
+        assert!(reason.contains("GitHub authentication is required"));
+        assert!(reason.contains("RUSTGIT_GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn github_clone_error_reason_preserves_non_auth_stderr() {
+        let stderr = "fatal: repository 'https://github.com/rkendel1/missing.git/' not found";
+        let reason = github_clone_error_reason("https://github.com/rkendel1/missing.git", stderr);
+        assert_eq!(reason, stderr);
     }
 }

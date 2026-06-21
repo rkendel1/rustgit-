@@ -274,6 +274,12 @@ launched workspace ws-1782010560853-0 for https://github.com/rkendel1/new_vue.gi
 elapsed_seconds=0.33
 ```
 
+### Customer journey E2E evidence (new_vue-healed4)
+
+Captured analyze payload + endpoint order and CLI launch artifact for `https://github.com/rkendel1/new_vue-healed4.git`:
+
+- `docs/new_vue-healed4-evidence.md`
+
 ## Portal (Next.js)
 
 The management portal now lives in `./portal` as a standalone Next.js app.
