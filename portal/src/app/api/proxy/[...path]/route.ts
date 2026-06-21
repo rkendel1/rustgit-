@@ -30,6 +30,12 @@ function resolveApiBaseUrl(request: NextRequest): string {
   }
 }
 
+function appendSearchParams(source: URLSearchParams, target: URL): void {
+  source.forEach((value, key) => {
+    target.searchParams.append(key, value);
+  });
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
@@ -39,9 +45,7 @@ async function proxyRequest(
   const apiBaseUrl = resolveApiBaseUrl(request);
   const upstreamUrl = new URL(`${apiBaseUrl}/${joinedPath}`);
 
-  request.nextUrl.searchParams.forEach((value, key) => {
-    upstreamUrl.searchParams.append(key, value);
-  });
+  appendSearchParams(request.nextUrl.searchParams, upstreamUrl);
 
   const requestHeaders = new Headers();
   const contentType = request.headers.get("content-type");
@@ -68,12 +72,13 @@ async function proxyRequest(
     });
 
   let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
-  const canRetryWithProxyPrefix = !joinedPath.startsWith(`${UPSTREAM_PROXY_PREFIX}/`);
+  const hasProxyPrefix =
+    joinedPath === UPSTREAM_PROXY_PREFIX ||
+    joinedPath.startsWith(`${UPSTREAM_PROXY_PREFIX}/`);
+  const canRetryWithProxyPrefix = !hasProxyPrefix;
   if (upstreamResponse.status === 404 && canRetryWithProxyPrefix) {
     const proxiedUpstreamUrl = new URL(`${apiBaseUrl}/${UPSTREAM_PROXY_PREFIX}/${joinedPath}`);
-    request.nextUrl.searchParams.forEach((value, key) => {
-      proxiedUpstreamUrl.searchParams.append(key, value);
-    });
+    appendSearchParams(request.nextUrl.searchParams, proxiedUpstreamUrl);
     upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
   }
 
