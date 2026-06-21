@@ -10,6 +10,8 @@ const API_BASE_URL =
     : "https://api.trythissoftware.com");
 
 const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
+const SCORE_DECIMAL_PLACES = 1;
+const CONFIDENCE_DECIMAL_PLACES = 2;
 
 type RepoContext = {
   owner: string;
@@ -59,10 +61,10 @@ function createAnonymousId(prefix: string): string {
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
-    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
     return `${prefix}-${hex}`;
   }
-  return `${prefix}-${Date.now()}`;
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function parseRepositoryInput(input: string): RepoContext | null {
@@ -118,7 +120,12 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     throw new Error(`Request failed (${response.status}): ${text || "no response body"}`);
   }
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown parse error";
+    throw new Error(`Invalid JSON response: ${message}`);
+  }
 }
 
 export default function Home() {
@@ -140,6 +147,37 @@ export default function Home() {
     Boolean(parsedRepo) &&
     Boolean(analyzeResult) &&
     analyzedRepoUrl === parsedRepo?.repoUrl;
+
+  function resetResults(nextRepositoryValue: string) {
+    setRepository(nextRepositoryValue);
+    setAnalyzeResult(null);
+    setAnalyzedRepoUrl(null);
+    setIntelligence(null);
+    setRepoAnswer(null);
+    setRunResult(null);
+    setError(null);
+  }
+
+  function scoreValue(
+    identityScore: number | undefined,
+    responseScore: number | undefined,
+  ): number | null {
+    if (typeof identityScore === "number") {
+      return identityScore;
+    }
+    if (typeof responseScore === "number") {
+      return responseScore;
+    }
+    return null;
+  }
+
+  function formatScore(score: number | null): string {
+    return score === null ? "n/a" : score.toFixed(SCORE_DECIMAL_PLACES);
+  }
+
+  function formatConfidence(value: number | undefined): string {
+    return typeof value === "number" ? value.toFixed(CONFIDENCE_DECIMAL_PLACES) : "n/a";
+  }
 
   async function handleAnalyze() {
     if (!parsedRepo) {
@@ -183,7 +221,15 @@ export default function Home() {
           intelligenceResponse,
         );
         setIntelligence(intelligenceBody);
+      } catch (caught) {
+        setError(
+          caught instanceof Error
+            ? `Analysis succeeded, but repository intelligence could not be loaded: ${caught.message}`
+            : "Analysis succeeded, but repository intelligence could not be loaded.",
+        );
+      }
 
+      try {
         const askResponse = await fetch(
           `/api/proxy/api/repositories/${encodeURIComponent(analyzed.fingerprint_id)}/ask`,
           {
@@ -197,10 +243,11 @@ export default function Home() {
         const askBody = await readJsonResponse<RepositoryAskResponse>(askResponse);
         setRepoAnswer(askBody);
       } catch (caught) {
+        setRepoAnswer(null);
         setError(
           caught instanceof Error
-            ? `Repository analysis completed, but extended intelligence failed: ${caught.message}`
-            : "Repository analysis completed, but extended intelligence failed.",
+            ? `Analysis succeeded, but repository summary could not be loaded: ${caught.message}`
+            : "Analysis succeeded, but repository summary could not be loaded.",
         );
       }
     } catch (caught) {
@@ -250,10 +297,18 @@ export default function Home() {
     }
   }
 
-  const healthScore = intelligence?.repository_identity?.health_score ?? intelligence?.health_score;
-  const executionScore =
-    intelligence?.repository_identity?.execution_score ?? intelligence?.execution_score;
-  const healingScore = intelligence?.repository_identity?.healing_score ?? intelligence?.healing_score;
+  const healthScore = scoreValue(
+    intelligence?.repository_identity?.health_score,
+    intelligence?.health_score,
+  );
+  const executionScore = scoreValue(
+    intelligence?.repository_identity?.execution_score,
+    intelligence?.execution_score,
+  );
+  const healingScore = scoreValue(
+    intelligence?.repository_identity?.healing_score,
+    intelligence?.healing_score,
+  );
 
   return (
     <main className={styles.page}>
@@ -267,21 +322,13 @@ export default function Home() {
 
       <section className={styles.panel}>
         <h2>1) Repository input</h2>
-        <label htmlFor="repo" className={styles.label}>
-          GitHub repository URL
+        <label htmlFor="github-repo-url" className={styles.label}>
+          GitHub repository URL or owner/repo
         </label>
         <input
-          id="repo"
+          id="github-repo-url"
           value={repository}
-          onChange={(event) => {
-            setRepository(event.target.value);
-            setAnalyzeResult(null);
-            setAnalyzedRepoUrl(null);
-            setIntelligence(null);
-            setRepoAnswer(null);
-            setRunResult(null);
-            setError(null);
-          }}
+          onChange={(event) => resetResults(event.target.value)}
           placeholder="https://github.com/owner/repo"
           className={styles.input}
         />
@@ -340,15 +387,15 @@ export default function Home() {
             </div>
             <div className={styles.tile}>
               <strong>Health score</strong>
-              <span>{typeof healthScore === "number" ? healthScore.toFixed(1) : "n/a"}</span>
+              <span>{formatScore(healthScore)}</span>
             </div>
             <div className={styles.tile}>
               <strong>Execution score</strong>
-              <span>{typeof executionScore === "number" ? executionScore.toFixed(1) : "n/a"}</span>
+              <span>{formatScore(executionScore)}</span>
             </div>
             <div className={styles.tile}>
               <strong>Healing score</strong>
-              <span>{typeof healingScore === "number" ? healingScore.toFixed(1) : "n/a"}</span>
+              <span>{formatScore(healingScore)}</span>
             </div>
             <div className={styles.tile}>
               <strong>Runtime</strong>
@@ -361,7 +408,7 @@ export default function Home() {
               <h3>Repo summary</h3>
               <p>{repoAnswer.answer}</p>
               <p className={styles.hint}>
-                Confidence: {typeof repoAnswer.confidence === "number" ? repoAnswer.confidence.toFixed(2) : "n/a"}
+                Confidence: {formatConfidence(repoAnswer.confidence)}
               </p>
             </div>
           ) : null}
@@ -387,7 +434,12 @@ export default function Home() {
             <div className={styles.tile}>
               <strong>Workspace URL</strong>
               {runResult.workspace_url ? (
-                <a href={runResult.workspace_url} target="_blank" rel="noreferrer">
+                <a
+                  href={runResult.workspace_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  aria-label="Open workspace in a new tab"
+                >
                   Open workspace
                 </a>
               ) : (

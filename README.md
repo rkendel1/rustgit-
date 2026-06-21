@@ -111,9 +111,11 @@ By default, the portal uses `http://localhost:8080` for API requests in developm
 
 Production/Fly deploy for the portal uses `portal/Dockerfile` through `deploy/fly/portal.fly.toml`.
 
-Portal screenshot:
+Portal screenshots:
 
-![TryThisSoftware portal](docs/screenshots/portal-home.png)
+![TryThisSoftware portal (current usable layout)](docs/screenshots/portal-home-usable.png)
+![TryThisSoftware portal (repository prefilled)](docs/screenshots/portal-home-usable-filled.png)
+![TryThisSoftware portal (local home)](docs/screenshots/portal-home.png)
 
 Dual-surface intelligence screenshots (simulated from current data model + prompting behavior):
 
