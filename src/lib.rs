@@ -81,6 +81,17 @@ const PRO_PLAN_RUNS_PER_DAY: usize = 1_000;
 const EXECUTION_IMAGE_VERSION: &str = "v1";
 const UNKNOWN_SIGNATURE: &str = "unknown";
 const CJVF_CANONICAL_HOST: &str = "trythissoftware.com";
+const PREFLIGHT_REPOSITORY_HEALTH_WITH_DEPS: u8 = 98;
+const PREFLIGHT_REPOSITORY_HEALTH_NO_DEPS: u8 = 88;
+const PREFLIGHT_DEPENDENCIES_CONFIDENCE_READY: u8 = 99;
+const PREFLIGHT_DEPENDENCIES_CONFIDENCE_UNKNOWN: u8 = 90;
+const PREFLIGHT_CAPABILITIES_CONFIDENCE_READY: u8 = 96;
+const PREFLIGHT_CAPABILITIES_CONFIDENCE_UNKNOWN: u8 = 90;
+const PREFLIGHT_ENVIRONMENT_CONFIDENCE_DISCOVERED: u8 = 95;
+const PREFLIGHT_ENVIRONMENT_CONFIDENCE_SYNTHESIZED: u8 = 85;
+const PREFLIGHT_RUNTIME_CONFIDENCE_WASM: u8 = 98;
+const PREFLIGHT_RUNTIME_CONFIDENCE_NATIVE: u8 = 99;
+const PREFLIGHT_FAILURE_PENALTY_PER_ISSUE: u8 = 2;
 pub const DDOCKIT_ANON_ID_COOKIE: &str = "ddockit_anon_id";
 pub const DDOCKIT_SESSION_ID_COOKIE: &str = "ddockit_session_id";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
@@ -7668,7 +7679,21 @@ fn simulated_failures(
     has_prisma: bool,
 ) -> Vec<Value> {
     let mut failures = Vec::new();
-    let missing_required_env = environment_graph.iter().any(|entry| {
+    let missing_database_url = environment_graph.iter().any(|entry| {
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == "DATABASE_URL")
+            && entry
+                .get("classification")
+                .and_then(Value::as_str)
+                .is_some_and(|class| class == "required")
+            && entry
+                .get("value_source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source == "synthesized")
+    });
+    let has_any_synthesized_required_env = environment_graph.iter().any(|entry| {
         entry
             .get("classification")
             .and_then(Value::as_str)
@@ -7678,11 +7703,18 @@ fn simulated_failures(
                 .and_then(Value::as_str)
                 .is_some_and(|source| source == "synthesized")
     });
-    if missing_required_env || (has_prisma && environment_files.is_empty()) {
+    if missing_database_url || (has_prisma && environment_files.is_empty()) {
         failures.push(json!({
             "failure": "Missing DATABASE_URL",
             "confidence": 98,
             "pre_heal": "synthesize local sqlite, then temporary postgres fallback"
+        }));
+    }
+    if has_any_synthesized_required_env {
+        failures.push(json!({
+            "failure": "Required environment synthesis needed",
+            "confidence": 92,
+            "pre_heal": "materialize synthesized required variables and validate startup contract"
         }));
     }
     if root.join(".nvmrc").exists() || root.join(".node-version").exists() {
@@ -7742,11 +7774,15 @@ fn environment_confidence_scores(
     analysis: &RepositoryAnalysis,
     expected_failures: &[Value],
 ) -> Value {
-    let repository_health: u8 = if dependency_files.is_empty() { 88 } else { 98 };
-    let dependencies: u8 = if analysis.runtime_spec.dependencies.is_empty() {
-        90
+    let repository_health: u8 = if dependency_files.is_empty() {
+        PREFLIGHT_REPOSITORY_HEALTH_NO_DEPS
     } else {
-        99
+        PREFLIGHT_REPOSITORY_HEALTH_WITH_DEPS
+    };
+    let dependencies: u8 = if analysis.runtime_spec.dependencies.is_empty() {
+        PREFLIGHT_DEPENDENCIES_CONFIDENCE_UNKNOWN
+    } else {
+        PREFLIGHT_DEPENDENCIES_CONFIDENCE_READY
     };
     let capabilities: u8 = if analysis
         .compiled_runtime
@@ -7755,15 +7791,19 @@ fn environment_confidence_scores(
         .needs
         .is_empty()
     {
-        90
+        PREFLIGHT_CAPABILITIES_CONFIDENCE_UNKNOWN
     } else {
-        96
+        PREFLIGHT_CAPABILITIES_CONFIDENCE_READY
     };
-    let environment: u8 = if environment_files.is_empty() { 85 } else { 95 };
-    let expected_runtime: u8 = if analysis.runtime_spec.requires_wasm {
-        98
+    let environment: u8 = if environment_files.is_empty() {
+        PREFLIGHT_ENVIRONMENT_CONFIDENCE_SYNTHESIZED
     } else {
-        99
+        PREFLIGHT_ENVIRONMENT_CONFIDENCE_DISCOVERED
+    };
+    let expected_runtime: u8 = if analysis.runtime_spec.requires_wasm {
+        PREFLIGHT_RUNTIME_CONFIDENCE_WASM
+    } else {
+        PREFLIGHT_RUNTIME_CONFIDENCE_NATIVE
     };
     let expected_success = ((repository_health as u16
         + dependencies as u16
@@ -7771,7 +7811,8 @@ fn environment_confidence_scores(
         + environment as u16
         + expected_runtime as u16)
         / 5) as u8;
-    let penalty = (expected_failures.len() as u8).saturating_mul(2);
+    let penalty =
+        (expected_failures.len() as u8).saturating_mul(PREFLIGHT_FAILURE_PENALTY_PER_ISSUE);
     json!({
         "repository_health": repository_health,
         "environment": environment,
