@@ -202,28 +202,26 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      let analyzeResponse: Response | null = null;
-      try {
-        const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
-        analyzeResponse =
-          analyzeV1Response.status === 404
-            ? await fetch(analyzeFallbackPath, analyzeRequest)
-            : analyzeV1Response;
-      } catch (primaryError) {
+      const analyzeResponse = await (async () => {
         try {
-          analyzeResponse = await fetch(analyzeFallbackPath, analyzeRequest);
-        } catch (fallbackError) {
-          const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
-          const fallbackMessage =
-            fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-          throw new Error(
-            `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
-          );
+          const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
+          return analyzeV1Response.status === 404
+            ? fetch(analyzeFallbackPath, analyzeRequest)
+            : analyzeV1Response;
+        } catch (primaryError) {
+          try {
+            return await fetch(analyzeFallbackPath, analyzeRequest);
+          } catch (fallbackError) {
+            const primaryMessage =
+              primaryError instanceof Error ? primaryError.message : String(primaryError);
+            const fallbackMessage =
+              fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            throw new Error(
+              `Analyze request failed for both endpoints: ${primaryMessage}; fallback: ${fallbackMessage}`,
+            );
+          }
         }
-      }
-      if (!analyzeResponse) {
-        throw new Error("Analyze request failed before receiving a response.");
-      }
+      })();
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
