@@ -57,6 +57,45 @@ Badge screenshots:
 
 This badge updates automatically based on repository execution health.
 
+## Repository intelligence (current state)
+
+### What we have
+
+- **Repository knowledge graph assembly** from execution, failure, healing, temporal recovery, dependency, and architecture data.
+- **Repository ask service** (`POST /api/repositories/{id}/ask`) that builds an answer with confidence and evidence links.
+- **Repository intelligence panel endpoint** (`GET /api/repositories/{id}/intelligence`) used by product surfaces for score/runtime/action summaries.
+- **Execution intelligence loop endpoints** for retrieval, learning, and optimization:
+  - `GET /intelligence/{execution}`
+  - `GET /intelligence/similar`
+  - `GET /intelligence/patterns`
+  - `GET /intelligence/repairs`
+  - `GET /intelligence/context`
+  - `POST /intelligence/retrieve`
+  - `POST /intelligence/learn`
+  - `POST /intelligence/optimize`
+
+### What it does
+
+- Aggregates repository history into an execution-aware context.
+- Uses prior outcomes to surface similar executions and repair patterns.
+- Produces operator-facing summaries (execution score, healing score, runtime, last success, recommended actions).
+- Tracks evidence categories for answers (`file`, `execution`, `failure`, `repair`) so responses can be grounded in observed signals.
+
+### What we can currently determine
+
+- Whether a repository has demonstrated successful execution history.
+- The most recent failure class and latest known repair strategy.
+- The best observed runtime tier by success ratio.
+- A compact health snapshot: execution count, failure count, healing count, and recovery snapshots.
+
+### Opportunities to deepen intelligence
+
+- Replace current keyword/rule-based answer routing with richer semantic retrieval and question intent handling.
+- Enrich embeddings and intelligence records with inferred language/framework/runtime metadata (currently defaulted to `unknown` in several learning paths).
+- Expand code context beyond root config files to include service boundaries, dependency hotspots, and ownership/churn signals.
+- Add trend and anomaly intelligence (failure drift, runtime regressions, repair success decay) across time windows.
+- Improve confidence scoring calibration with source-weighted signals and explicit uncertainty reasoning.
+
 ## User journey screenshots
 
 End-to-end GitHub-native execution flywheel journey:
