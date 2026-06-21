@@ -62,7 +62,7 @@ async function proxyRequest(
     fetch(url, {
       method: request.method,
       headers: requestHeaders,
-      body: requestBodyBytes ? new Uint8Array(requestBodyBytes) : undefined,
+      body: requestBodyBytes,
       cache: "no-store",
     });
 
