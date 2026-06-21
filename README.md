@@ -259,6 +259,16 @@ cargo test
 cargo run --bin wasm-workspace-cli -- launch /absolute/path/to/repo
 ```
 
+### Customer journey E2E evidence (new_vue)
+
+Validated against `https://github.com/rkendel1/new_vue.git`:
+
+```bash
+$ /usr/bin/time -f 'elapsed_seconds=%e' cargo run --bin wasm-workspace-cli -- launch https://github.com/rkendel1/new_vue.git
+launched workspace ws-1782010560853-0 for https://github.com/rkendel1/new_vue.git
+elapsed_seconds=0.33
+```
+
 ## Portal (Next.js)
 
 The management portal now lives in `./portal` as a standalone Next.js app.

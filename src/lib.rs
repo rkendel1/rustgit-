@@ -5626,6 +5626,8 @@ pub enum CustomerJourneyKind {
     DeaLocalExecution,
     CloudExecutionEscalation,
     RuntimeMigrationWithoutUrlChange,
+    PortalFrontendJourney,
+    BrowserExtensionOverlayJourney,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5687,6 +5689,16 @@ impl CustomerJourneyDefinition {
                 name: "journey-10-runtime-migration".to_string(),
                 kind: CustomerJourneyKind::RuntimeMigrationWithoutUrlChange,
                 repository_name: "turborepo-monorepo".to_string(),
+            },
+            Self {
+                name: "journey-11-portal-frontend".to_string(),
+                kind: CustomerJourneyKind::PortalFrontendJourney,
+                repository_name: "new-vue-frontend".to_string(),
+            },
+            Self {
+                name: "journey-12-browser-extension-overlay".to_string(),
+                kind: CustomerJourneyKind::BrowserExtensionOverlayJourney,
+                repository_name: "ddockit-browser-extension".to_string(),
             },
         ]
     }
@@ -5969,6 +5981,8 @@ fn startup_time_for(kind: CustomerJourneyKind) -> u64 {
         CustomerJourneyKind::DeaLocalExecution => 2100,
         CustomerJourneyKind::CloudExecutionEscalation => 3300,
         CustomerJourneyKind::RuntimeMigrationWithoutUrlChange => 3100,
+        CustomerJourneyKind::PortalFrontendJourney => 2600,
+        CustomerJourneyKind::BrowserExtensionOverlayJourney => 2300,
     }
 }
 
@@ -18906,7 +18920,7 @@ services:
             load_golden_repository_catalog(&path).expect("load golden repository catalog");
         let runner = CustomerJourneyRunner::new(catalog);
         let results = runner.run_default_suite();
-        assert_eq!(results.len(), 10);
+        assert_eq!(results.len(), 12);
         assert!(results.iter().all(|result| result.analysis_success));
         assert!(results.iter().all(|result| result.plan_success));
         assert!(results.iter().all(|result| result.runtime_success));
@@ -18951,6 +18965,25 @@ services:
             .expect("suite should include runtime migration journey");
         assert!(migration.runtime_migration_preserved_url);
 
+        let frontend = results
+            .iter()
+            .find(|result| result.journey_kind == CustomerJourneyKind::PortalFrontendJourney)
+            .expect("suite should include portal frontend journey");
+        assert!(frontend
+            .route_checks
+            .iter()
+            .any(|check| check.route == "/" && check.status_code == 200));
+
+        let extension = results
+            .iter()
+            .find(|result| {
+                result.journey_kind == CustomerJourneyKind::BrowserExtensionOverlayJourney
+            })
+            .expect("suite should include browser extension journey");
+        assert!(extension.route_checks.iter().any(|check| {
+            check.route == "/api/v1/surfaces/extension/ui" && check.status_code == 200
+        }));
+
         let metrics = compute_customer_journey_metrics(&results);
         assert_eq!(metrics.repo_run_success_rate, 100.0);
         assert_eq!(metrics.healing_success_rate, 100.0);
@@ -18960,6 +18993,10 @@ services:
         assert!(metrics.framework_success_rate.contains_key("fastapi"));
         assert!(metrics.framework_success_rate.contains_key("django"));
         assert!(metrics.framework_success_rate.contains_key("axum"));
+        assert!(metrics.framework_success_rate.contains_key("vue"));
+        assert!(metrics
+            .framework_success_rate
+            .contains_key("browser-extension"));
     }
 
     #[test]
