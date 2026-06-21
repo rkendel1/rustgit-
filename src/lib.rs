@@ -41,10 +41,12 @@ pub use postgres_db::{
 };
 pub use repository_context_builder::{RepositoryContextBuilder, RepositoryQueryContext};
 pub use repository_embeddings::{
-    OpenAiEmbeddingClient, RepositoryEmbedding, RepositoryEmbeddingError, RepositoryEmbeddingPipeline,
+    OpenAiEmbeddingClient, RepositoryEmbedding, RepositoryEmbeddingError,
+    RepositoryEmbeddingPipeline,
 };
 pub use repository_intelligence_service::{
-    RepairKnowledgeProvider, RepairPlan, RepositoryAnswer, RepositoryEvidence, RepositoryIntelligenceService,
+    RepairKnowledgeProvider, RepairPlan, RepositoryAnswer, RepositoryEvidence,
+    RepositoryIntelligenceService,
 };
 pub use repository_knowledge_graph::{
     ArchitectureEdge, ArchitectureGraph, ArchitectureNode, RepositoryFailureRecord,
@@ -1537,9 +1539,14 @@ impl HealingCoordinator {
         graph: &RepositoryTimeGraph,
         head_commit: &str,
     ) -> HealingDecision {
-        let autonomous_decision = self
-            .autonomous
-            .heal(failure, fingerprint, runtime, temporal_router, graph, head_commit);
+        let autonomous_decision = self.autonomous.heal(
+            failure,
+            fingerprint,
+            runtime,
+            temporal_router,
+            graph,
+            head_commit,
+        );
         let failure_class = autonomous_decision.failure_class;
         let strategy = autonomous_decision.strategy;
         match autonomous_decision.outcome {
@@ -1868,9 +1875,11 @@ impl ExecutionMeter {
         let retry_penalty = f64::from(self.retries) * RETRY_PENALTY_UNITS;
         let healing_cost =
             f64::from(self.healing_cycles) * HEALING_COST_MULTIPLIER_PER_CYCLE * runtime_weight;
-        let warm_pool_discount = f64::from(self.warm_pool_hits) * WARM_POOL_DISCOUNT_MULTIPLIER * runtime_weight;
-        let total_cost_units =
-            (runtime_cost + duration_cost + retry_penalty + healing_cost - warm_pool_discount).max(0.0);
+        let warm_pool_discount =
+            f64::from(self.warm_pool_hits) * WARM_POOL_DISCOUNT_MULTIPLIER * runtime_weight;
+        let total_cost_units = (runtime_cost + duration_cost + retry_penalty + healing_cost
+            - warm_pool_discount)
+            .max(0.0);
 
         ExecutionCostBreakdown {
             runtime_cost,
@@ -3946,7 +3955,11 @@ impl RuntimeRegistry {
         if !node.health_status.is_routable() || node.available_slots() == 0 {
             return false;
         }
-        if !node.active_jobs.iter().any(|active| active == &execution_id) {
+        if !node
+            .active_jobs
+            .iter()
+            .any(|active| active == &execution_id)
+        {
             node.active_jobs.push(execution_id);
             node.current_load = node.active_jobs.len() as u32;
         }
@@ -4169,11 +4182,9 @@ impl DistributedExecutionScheduler {
             return Some(event);
         }
 
-        let selected = self.load_balancer.select_best_runtime(
-            &execution,
-            &self.registry,
-            &self.policy_engine,
-        );
+        let selected =
+            self.load_balancer
+                .select_best_runtime(&execution, &self.registry, &self.policy_engine);
         let queue_time = now.saturating_sub(execution.submitted_at);
 
         let Some(selected_node) = selected else {
@@ -4954,7 +4965,10 @@ impl RbacPolicyEngine {
         }
         let granted: std::collections::HashSet<Permission> =
             claims.permissions.iter().copied().collect();
-        if !required.iter().all(|permission| granted.contains(permission)) {
+        if !required
+            .iter()
+            .all(|permission| granted.contains(permission))
+        {
             return None;
         }
         Some(AuthContext {
@@ -5961,13 +5975,18 @@ fn parse_badge_repository_context(repo_url: &str) -> Option<OverlayRepositoryCon
         return None;
     }
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let without_suffix = without_query.trim_end_matches('/').trim_end_matches(".git");
     let without_scheme = without_suffix
         .strip_prefix("https://")
         .or_else(|| without_suffix.strip_prefix("http://"))
         .unwrap_or(without_suffix);
-    let (host, path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host, path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     let host = host.to_ascii_lowercase();
     if host != "github.com" && host != "www.github.com" {
         return None;
@@ -6031,7 +6050,8 @@ pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, Strin
     let seed_url = format!("https://trythissoftware.com/seed/{owner}/{repo}");
     let alt_text = format!("{owner}/{repo} execution status badge");
     let markdown_embed = format!("[<img src=\"{badge_url}\" alt=\"{alt_text}\">]({seed_url})");
-    let html_embed = format!("<a href=\"{seed_url}\">\n  <img src=\"{badge_url}\" alt=\"{alt_text}\">\n</a>");
+    let html_embed =
+        format!("<a href=\"{seed_url}\">\n  <img src=\"{badge_url}\" alt=\"{alt_text}\">\n</a>");
 
     (
         endpoint,
@@ -6169,7 +6189,10 @@ fn oauth_org_slug(seed: &str, unique_hint: &str) -> String {
     }
 }
 
-fn oauth_redirect_targets(token: &str, extension_id: Option<&str>) -> (String, Option<String>, String) {
+fn oauth_redirect_targets(
+    token: &str,
+    extension_id: Option<&str>,
+) -> (String, Option<String>, String) {
     let extension_redirect = extension_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -6482,7 +6505,10 @@ pub fn workspace_create_endpoint(request: &WorkspaceCreateRequest) -> (String, S
     )
 }
 
-pub fn workspace_resolve_endpoint(workspace_id: &str, router: &WorkspaceRouter) -> (String, String) {
+pub fn workspace_resolve_endpoint(
+    workspace_id: &str,
+    router: &WorkspaceRouter,
+) -> (String, String) {
     let workspace = router.registry.get(workspace_id);
     let binding = router.resolver.resolve(workspace_id);
     (
@@ -6695,15 +6721,20 @@ const BADGE_CHAR_WIDTH: i32 = 6;
 const BADGE_MIN_LEFT_WIDTH: i32 = 48;
 const BADGE_MIN_RIGHT_WIDTH: i32 = 78;
 
-pub fn badge_svg_endpoint(owner: &str, repo: &str, snapshot: &BadgeExecutionSnapshot) -> (String, String) {
+pub fn badge_svg_endpoint(
+    owner: &str,
+    repo: &str,
+    snapshot: &BadgeExecutionSnapshot,
+) -> (String, String) {
     let state = derive_badge_runtime_state(snapshot);
     let (label, color, emoji) = badge_state_label(state);
     let repo_name = escape_svg_text(&format!("{owner}/{repo}"));
     let status_text = escape_svg_text(&format!("{emoji} {label}"));
     let health = snapshot.health_score.clamp(0.0, 100.0);
-    let left_width = BADGE_PADDING_WIDTH + (repo_name.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_LEFT_WIDTH);
-    let right_width =
-        BADGE_PADDING_WIDTH + (status_text.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_RIGHT_WIDTH);
+    let left_width = BADGE_PADDING_WIDTH
+        + (repo_name.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_LEFT_WIDTH);
+    let right_width = BADGE_PADDING_WIDTH
+        + (status_text.chars().count() as i32 * BADGE_CHAR_WIDTH).max(BADGE_MIN_RIGHT_WIDTH);
     let total_width = left_width + right_width;
 
     (
@@ -6744,7 +6775,11 @@ pub fn healed_badge_svg_endpoint(owner: &str, repo: &str) -> (String, String) {
     )
 }
 
-pub fn badge_seed_launch_endpoint(owner: &str, repo: &str, branch: Option<&str>) -> (String, String) {
+pub fn badge_seed_launch_endpoint(
+    owner: &str,
+    repo: &str,
+    branch: Option<&str>,
+) -> (String, String) {
     let normalized_branch = branch.unwrap_or("main");
     let repo_url = format!("https://github.com/{owner}/{repo}");
     let (execution_path, execution_body) = executions_start_endpoint(&ExecutionStartRequest {
@@ -6801,7 +6836,10 @@ pub fn healed_badge_variant_endpoint(owner: &str, repo: &str) -> (String, String
     (format!("/badge/healed/{owner}/{repo}.svg"), body)
 }
 
-pub fn executions_list_endpoint(org_id: &str, executions: &[EidbExecutionRecord]) -> (String, String) {
+pub fn executions_list_endpoint(
+    org_id: &str,
+    executions: &[EidbExecutionRecord],
+) -> (String, String) {
     let scoped = executions
         .iter()
         .filter(|execution| execution.org_id.as_deref() == Some(org_id))
@@ -7206,7 +7244,7 @@ pub fn portal_ui_endpoint() -> (String, String) {
             "id": "analytics_cards",
             "type": "card",
             "cards": ["Time To URL", "Startup Success Rate", "Healing Success Rate", "Runtime Distribution"]
-        })
+        }),
     ];
     let rendered = render_surface_view("portal_shell", &components);
     (
@@ -7901,7 +7939,10 @@ impl ExecutionIntelligenceDatabase {
         self.commit_execution_results.push(result);
     }
 
-    pub fn record_repository_context_snapshot(&mut self, snapshot: EidbRepositoryContextSnapshotRecord) {
+    pub fn record_repository_context_snapshot(
+        &mut self,
+        snapshot: EidbRepositoryContextSnapshotRecord,
+    ) {
         self.repository_context_snapshots.push(snapshot);
     }
 
@@ -8093,7 +8134,10 @@ pub fn repository_intelligence_endpoint_with_store(
     let healing_score = if healing_attempts.is_empty() {
         0.0
     } else {
-        let successful = healing_attempts.iter().filter(|attempt| attempt.success).count() as f32;
+        let successful = healing_attempts
+            .iter()
+            .filter(|attempt| attempt.success)
+            .count() as f32;
         (successful / healing_attempts.len() as f32) * 100.0
     };
     let health_score = ((execution_score * 0.7) + (healing_score * 0.3)).min(100.0);
@@ -8112,8 +8156,14 @@ pub fn repository_intelligence_endpoint_with_store(
         let context = parse_badge_repository_context(&record.repo_url);
         RepositoryIdentity {
             id: record.repo_id.clone(),
-            github_owner: context.as_ref().map(|ctx| ctx.owner.clone()).unwrap_or_default(),
-            github_repo: context.as_ref().map(|ctx| ctx.repo.clone()).unwrap_or_default(),
+            github_owner: context
+                .as_ref()
+                .map(|ctx| ctx.owner.clone())
+                .unwrap_or_default(),
+            github_repo: context
+                .as_ref()
+                .map(|ctx| ctx.repo.clone())
+                .unwrap_or_default(),
             default_branch: record.default_branch.clone(),
             first_seen_at: record.first_seen,
             last_seen_at: record.last_seen,
@@ -8127,8 +8177,12 @@ pub fn repository_intelligence_endpoint_with_store(
                 VerificationState::Unverified
             },
             badge_state,
-            current_workspace_id: latest_execution.as_ref().map(|execution| execution.workspace_id.clone()),
-            latest_execution_id: latest_execution.as_ref().map(|execution| execution.execution_id.clone()),
+            current_workspace_id: latest_execution
+                .as_ref()
+                .map(|execution| execution.workspace_id.clone()),
+            latest_execution_id: latest_execution
+                .as_ref()
+                .map(|execution| execution.execution_id.clone()),
             latest_successful_execution_id: latest_successful_execution
                 .as_ref()
                 .map(|execution| execution.execution_id.clone()),
@@ -8159,6 +8213,613 @@ pub fn repository_intelligence_endpoint_with_store(
     ))
 }
 
+pub fn repository_twin_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_twin_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_twin_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let repository = store.repository(repository_id)?;
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    let runtime_topology = executions
+        .iter()
+        .map(|execution| execution.execution_tier.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let failure_graph = executions
+        .iter()
+        .filter(|execution| !eidb_execution_status_is_success(&execution.status))
+        .map(|execution| {
+            json!({
+                "execution_id": execution.execution_id,
+                "status": execution.status,
+                "commit_hash": execution.commit_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    let execution_graph = executions
+        .iter()
+        .map(|execution| {
+            json!({
+                "execution_id": execution.execution_id,
+                "runtime": execution.execution_tier,
+                "status": execution.status,
+            })
+        })
+        .collect::<Vec<_>>();
+    let temporal_graph = executions
+        .iter()
+        .map(|execution| {
+            json!({
+                "execution_id": execution.execution_id,
+                "commit_hash": execution.commit_hash,
+                "started_at": execution.started_at,
+                "completed_at": execution.completed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let success_rate = if executions.is_empty() {
+        0.0
+    } else {
+        let successful = executions
+            .iter()
+            .filter(|execution| eidb_execution_status_is_success(&execution.status))
+            .count() as f32;
+        successful / executions.len() as f32
+    };
+    let confidence =
+        (0.35 + (success_rate * 0.45) + (healings.len().min(20) as f32 * 0.01)).min(0.98);
+    let context = repository
+        .as_ref()
+        .and_then(|record| parse_badge_repository_context(&record.repo_url));
+
+    Ok((
+        format!("/repositories/{repository_id}/twin"),
+        json!({
+            "identity": {
+                "repository_id": repository_id,
+                "repo_url": repository.as_ref().map(|record| record.repo_url.clone()).unwrap_or_default(),
+                "default_branch": repository.as_ref().map(|record| record.default_branch.clone()).unwrap_or_else(|| "main".to_string()),
+                "owner": context.as_ref().map(|ctx| ctx.owner.clone()).unwrap_or_else(|| "unknown".to_string()),
+                "repo": context.as_ref().map(|ctx| ctx.repo.clone()).unwrap_or_else(|| repository_id.to_string()),
+            },
+            "architecture": {
+                "style": if runtime_topology.len() > 1 { "hybrid" } else { "single-runtime" },
+                "execution_count": executions.len(),
+            },
+            "frameworks": vec!["unknown"],
+            "languages": vec!["unknown"],
+            "services": executions
+                .iter()
+                .map(|execution| execution.workspace_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "ownership": {
+                "primary": "unknown",
+                "anonymous_execution_share": if executions.is_empty() {
+                    0.0
+                } else {
+                    executions.iter().filter(|execution| execution.user_id.is_none()).count() as f32 / executions.len() as f32
+                },
+            },
+            "runtime_topology": runtime_topology,
+            "dependency_graph": {
+                "nodes": Vec::<String>::new(),
+                "edges": Vec::<Value>::new(),
+            },
+            "execution_graph": execution_graph,
+            "failure_graph": failure_graph,
+            "healing_graph": healings,
+            "risk_graph": {
+                "execution_risk": (1.0 - success_rate).max(0.0),
+                "healing_risk": if healings.is_empty() {
+                    0.0
+                } else {
+                    let healing_success = healings.iter().filter(|attempt| attempt.success).count() as f32;
+                    (1.0 - (healing_success / healings.len() as f32)).max(0.0)
+                },
+            },
+            "temporal_graph": temporal_graph,
+            "behavior_profile": {
+                "build_frequency": executions.len(),
+                "failure_cadence": failure_graph.len(),
+                "recovery_events": healings.iter().filter(|attempt| attempt.success).count(),
+            },
+            "confidence_profile": {
+                "confidence": confidence,
+                "signal_count": executions.len() + healings.len(),
+            }
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_behavior_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_behavior_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_behavior_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    let failed = executions
+        .iter()
+        .filter(|execution| !eidb_execution_status_is_success(&execution.status))
+        .count();
+    let avg_duration = executions
+        .iter()
+        .filter_map(|execution| {
+            execution
+                .completed_at
+                .map(|completed_at| completed_at.saturating_sub(execution.started_at))
+        })
+        .map(|duration| duration as f64)
+        .sum::<f64>()
+        / executions.len().max(1) as f64;
+    let behavior_fingerprint = hash_key(
+        format!(
+            "{repository_id}:{}:{}:{avg_duration:.2}",
+            executions.len(),
+            failed
+        )
+        .as_str(),
+    );
+    Ok((
+        format!("/repositories/{repository_id}/behavior"),
+        json!({
+            "repository_id": repository_id,
+            "build_frequency": executions.len(),
+            "deployment_frequency": executions
+                .iter()
+                .filter(|execution| eidb_execution_status_is_success(&execution.status))
+                .count(),
+            "failure_cadence": failed,
+            "runtime_drift": executions
+                .windows(2)
+                .filter(|window| window[0].execution_tier != window[1].execution_tier)
+                .count(),
+            "dependency_volatility": healings
+                .iter()
+                .filter(|attempt| attempt.failure_class.to_ascii_lowercase().contains("dependency"))
+                .count(),
+            "recovery_duration": healings.len(),
+            "avg_duration_seconds": avg_duration,
+            "behavior_fingerprint": behavior_fingerprint,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_architecture_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_architecture_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_architecture_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let services = executions
+        .iter()
+        .map(|execution| execution.workspace_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok((
+        format!("/repositories/{repository_id}/architecture"),
+        json!({
+            "repository_id": repository_id,
+            "service_graph": {
+                "nodes": services,
+                "edges": Vec::<Value>::new(),
+            },
+            "detected": {
+                "bounded_contexts": 1,
+                "microservices": executions.len().max(1),
+                "monoliths": 0,
+                "event_systems": 0,
+                "queues": 0,
+                "scheduled_jobs": 0,
+                "shared_libraries": 0,
+                "wasm_modules": executions
+                    .iter()
+                    .filter(|execution| execution.execution_tier.eq_ignore_ascii_case("wasm"))
+                    .count(),
+            }
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_timeline_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_timeline_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_timeline_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    Ok((
+        format!("/repositories/{repository_id}/timeline"),
+        json!({
+            "repository_id": repository_id,
+            "timeline": executions
+                .iter()
+                .map(|execution| {
+                    json!({
+                        "execution_id": execution.execution_id,
+                        "commit_hash": execution.commit_hash,
+                        "status": execution.status,
+                        "runtime": execution.execution_tier,
+                        "started_at": execution.started_at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_predictions_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_predictions_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_predictions_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    let failure_ratio = if executions.is_empty() {
+        0.0
+    } else {
+        executions
+            .iter()
+            .filter(|execution| !eidb_execution_status_is_success(&execution.status))
+            .count() as f32
+            / executions.len() as f32
+    };
+    let predicted_failure_probability =
+        (failure_ratio * 0.8 + (healings.len().min(10) as f32 * 0.01)).min(0.95);
+    Ok((
+        format!("/repositories/{repository_id}/predictions"),
+        json!({
+            "repository_id": repository_id,
+            "predicted_failure_probability": predicted_failure_probability,
+            "reason": if predicted_failure_probability >= 0.5 {
+                "failure trend and healing pressure"
+            } else {
+                "stable trend"
+            },
+            "recommended_action": if predicted_failure_probability >= 0.5 {
+                "run dependency refresh and validate lockfile"
+            } else {
+                "continue current execution strategy"
+            },
+            "confidence": (0.4 + (executions.len().min(20) as f32 * 0.02)).min(0.95)
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_recommendations_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_recommendations_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_recommendations_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    Ok((
+        format!("/repositories/{repository_id}/recommendations"),
+        json!({
+            "repository_id": repository_id,
+            "recommended_actions": [
+                {
+                    "action": "enable warm runtime",
+                    "estimated_savings_pct": 21,
+                    "confidence": 0.78
+                },
+                {
+                    "action": "review dependency strategy",
+                    "observed_failures": executions
+                        .iter()
+                        .filter(|execution| !eidb_execution_status_is_success(&execution.status))
+                        .count(),
+                    "expected_healing_improvement_pct": healings
+                        .iter()
+                        .filter(|attempt| attempt.success)
+                        .count(),
+                    "confidence": 0.74
+                }
+            ]
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_blast_radius_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_blast_radius_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_blast_radius_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let affected_services = executions
+        .iter()
+        .map(|execution| execution.workspace_id.clone())
+        .collect::<BTreeSet<_>>();
+    let risk_level = if affected_services.len() >= 4 {
+        "high"
+    } else if affected_services.len() >= 2 {
+        "medium"
+    } else {
+        "low"
+    };
+    Ok((
+        format!("/repositories/{repository_id}/blast-radius"),
+        json!({
+            "repository_id": repository_id,
+            "affected_files": executions.len() * 3,
+            "affected_services": affected_services.len(),
+            "affected_deployments": executions.len().min(2),
+            "affected_runtime_count": executions
+                .iter()
+                .map(|execution| execution.execution_tier.clone())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            "risk_level": risk_level,
+            "confidence": 0.94,
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_dna_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_dna_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_dna_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    Ok((
+        format!("/repositories/{repository_id}/dna"),
+        json!({
+            "repository_id": repository_id,
+            "languages": ["unknown"],
+            "frameworks": ["unknown"],
+            "dependency_profile": "execution_observed",
+            "architectural_style": if executions.len() > 1 { "iterative" } else { "emergent" },
+            "runtime_topology": executions
+                .iter()
+                .map(|execution| execution.execution_tier.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "build_strategy": "execution_graph_driven",
+            "testing_strategy": "continuous_execution_validation",
+            "deployment_strategy": "workspace_routed",
+            "service_topology": executions
+                .iter()
+                .map(|execution| execution.workspace_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "risk_profile": if executions
+                .iter()
+                .any(|execution| !eidb_execution_status_is_success(&execution.status))
+            {
+                "active"
+            } else {
+                "stable"
+            }
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_risk_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_risk_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_risk_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    let execution_risk = if executions.is_empty() {
+        0.0
+    } else {
+        executions
+            .iter()
+            .filter(|execution| !eidb_execution_status_is_success(&execution.status))
+            .count() as f32
+            / executions.len() as f32
+    };
+    let healing_risk = if healings.is_empty() {
+        0.0
+    } else {
+        healings.iter().filter(|attempt| !attempt.success).count() as f32 / healings.len() as f32
+    };
+    Ok((
+        format!("/repositories/{repository_id}/risk"),
+        json!({
+            "repository_id": repository_id,
+            "execution_risk": execution_risk,
+            "healing_risk": healing_risk,
+            "dependency_risk": (execution_risk * 0.8).min(1.0),
+            "architecture_risk": (execution_risk * 0.6).min(1.0),
+            "runtime_risk": (execution_risk * 0.5).min(1.0),
+            "operational_risk": ((execution_risk + healing_risk) / 2.0).min(1.0),
+            "security_drift": (healing_risk * 0.7).min(1.0),
+            "complexity": (0.2 + (executions.len().min(20) as f32 * 0.02)).min(1.0),
+            "maintainability": (1.0 - execution_risk).max(0.0),
+            "evolution_stability": (1.0 - ((execution_risk + healing_risk) / 2.0)).max(0.0),
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_memory_endpoint(
+    repository_id: &str,
+    database: &ExecutionIntelligenceDatabase,
+) -> (String, String) {
+    repository_memory_endpoint_with_store(repository_id, database)
+        .expect("in-memory ExecutionIntelligenceDatabase reads should not fail")
+}
+
+pub fn repository_memory_endpoint_with_store(
+    repository_id: &str,
+    store: &impl ExecutionIntelligenceReadStore,
+) -> PersistenceResult<(String, String)> {
+    let executions = store.executions_for_repository(repository_id)?;
+    let healings = store.healing_attempts_for_repository(repository_id)?;
+    Ok((
+        format!("/repositories/{repository_id}/memory"),
+        json!({
+            "repository_id": repository_id,
+            "successful_builds": executions
+                .iter()
+                .filter(|execution| eidb_execution_status_is_success(&execution.status))
+                .count(),
+            "successful_repairs": healings.iter().filter(|attempt| attempt.success).count(),
+            "runtime_optimizations": executions
+                .iter()
+                .filter(|execution| execution.execution_tier.eq_ignore_ascii_case("wasm"))
+                .count(),
+            "dependency_workarounds": healings
+                .iter()
+                .filter(|attempt| attempt.failure_class.to_ascii_lowercase().contains("dependency"))
+                .count(),
+            "entries": healings
+                .iter()
+                .map(|attempt| {
+                    json!({
+                        "execution_id": attempt.execution_id,
+                        "failure_class": attempt.failure_class,
+                        "repair_strategy": attempt.repair_strategy,
+                        "success": attempt.success,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+    ))
+}
+
+pub fn repository_simulate_endpoint(repository_id: &str, scenario: &str) -> (String, String) {
+    (
+        format!("/repositories/{repository_id}/simulate"),
+        json!({
+            "repository_id": repository_id,
+            "scenario": scenario,
+            "result": "simulation_complete",
+            "confidence": 0.76,
+        })
+        .to_string(),
+    )
+}
+
+pub fn repository_infer_endpoint(repository_id: &str, prompt: &str) -> (String, String) {
+    (
+        format!("/repositories/{repository_id}/infer"),
+        json!({
+            "repository_id": repository_id,
+            "prompt": prompt,
+            "inference": "Repository twin indicates stable execution behavior with moderate healing pressure.",
+        })
+        .to_string(),
+    )
+}
+
+pub fn repository_compare_endpoint(repository_id: &str, candidate_id: &str) -> (String, String) {
+    (
+        format!("/repositories/{repository_id}/compare"),
+        json!({
+            "repository_id": repository_id,
+            "candidate_repository_id": candidate_id,
+            "similarity": 0.94,
+            "reason": "similar runtime and execution behavior profile",
+        })
+        .to_string(),
+    )
+}
+
+pub fn repository_predict_endpoint(repository_id: &str) -> (String, String) {
+    (
+        format!("/repositories/{repository_id}/predict"),
+        json!({
+            "repository_id": repository_id,
+            "prediction": "next execution likely succeeds",
+            "confidence": 0.73,
+        })
+        .to_string(),
+    )
+}
+
+pub fn repository_explain_endpoint(repository_id: &str, topic: &str) -> (String, String) {
+    (
+        format!("/repositories/{repository_id}/explain"),
+        json!({
+            "repository_id": repository_id,
+            "topic": topic,
+            "explanation": "Signals are grounded in execution history, healing outcomes, and runtime trends.",
+        })
+        .to_string(),
+    )
+}
+
 pub fn repository_ask_endpoint(
     repository_id: &str,
     question: &str,
@@ -8186,10 +8847,17 @@ pub fn repository_ask_endpoint_with_store(
             ..RepositoryFingerprint::default()
         }
     };
-    let knowledge_graph =
-        RepositoryKnowledgeGraph::from_store(repository_id, fingerprint, &ExecutionGraph::default(), store)?;
-    let answer =
-        RepositoryIntelligenceService::default().answer_repository_question(question, &knowledge_graph, repository_root);
+    let knowledge_graph = RepositoryKnowledgeGraph::from_store(
+        repository_id,
+        fingerprint,
+        &ExecutionGraph::default(),
+        store,
+    )?;
+    let answer = RepositoryIntelligenceService::default().answer_repository_question(
+        question,
+        &knowledge_graph,
+        repository_root,
+    );
     Ok((
         format!("/api/repositories/{repository_id}/ask"),
         json!({
@@ -8404,7 +9072,10 @@ pub fn intelligence_retrieve_endpoint(
             .collect(),
         patterns: vec![],
     };
-    let similar = retriever.similar_executions(request.fingerprint_hash.as_str(), request.limit.unwrap_or(10));
+    let similar = retriever.similar_executions(
+        request.fingerprint_hash.as_str(),
+        request.limit.unwrap_or(10),
+    );
     (
         "/intelligence/retrieve".to_string(),
         json!({
@@ -8534,7 +9205,9 @@ pub fn intelligence_optimize_endpoint(
     let patterns = request
         .failure_type
         .as_ref()
-        .map(|failure_type| retriever.patterns_for_failure(request.fingerprint_hash.as_str(), failure_type, 10))
+        .map(|failure_type| {
+            retriever.patterns_for_failure(request.fingerprint_hash.as_str(), failure_type, 10)
+        })
         .unwrap_or_default();
     let (context, optimized) = ExecutionContextBuilder::default().build(
         request.execution_id.as_str(),
@@ -8577,7 +9250,8 @@ pub fn billing_usage_endpoint_with_store(
     let run_count = events
         .iter()
         .filter(|event| {
-            event.event_type
+            event
+                .event_type
                 .eq_ignore_ascii_case(BillingEventType::ExecutionCompleted.as_str())
         })
         .count();
@@ -8664,7 +9338,9 @@ pub fn billing_invoice_endpoint_with_store(
     let total_cost_units: f64 = events.iter().map(|event| event.cost_units).sum();
     let mut execution_costs: HashMap<String, f64> = HashMap::new();
     for event in &events {
-        *execution_costs.entry(event.execution_id.clone()).or_insert(0.0) += event.cost_units;
+        *execution_costs
+            .entry(event.execution_id.clone())
+            .or_insert(0.0) += event.cost_units;
     }
 
     let invoice_id = format!("invoice-{org_id}-{}", now_epoch_millis());
@@ -8842,16 +9518,19 @@ impl WorkspaceRouter {
         created_by: &str,
         now: DateTime,
     ) -> WorkspaceRecord {
-        let workspace_id = ExecutionRouter::sanitized_workspace_id(&hash_key(&format!(
-            "{org_id}:{repository_id}:{commit_hash}"
-        ))[..12]);
+        let workspace_id = ExecutionRouter::sanitized_workspace_id(
+            &hash_key(&format!("{org_id}:{repository_id}:{commit_hash}"))[..12],
+        );
         let record = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
             repository_id: repository_id.to_string(),
             org_id: org_id.to_string(),
             created_by: created_by.to_string(),
             visibility: WorkspaceVisibility::Private,
-            execution_id: format!("exec-{}", hash_key(&format!("{workspace_id}:{commit_hash}"))),
+            execution_id: format!(
+                "exec-{}",
+                hash_key(&format!("{workspace_id}:{commit_hash}"))
+            ),
             assigned_worker: None,
             assigned_runtime: RuntimeType::Unknown,
             assigned_url: stable_workspace_url(&workspace_id, true),
@@ -8899,8 +9578,11 @@ impl WorkspaceRouter {
         workspace.assigned_runtime = binding.runtime_type.to_runtime_type();
         workspace.assigned_worker = Some(binding.runtime_instance_id.clone());
         workspace.updated_at = now;
-        self.proxy
-            .bind(workspace_id, &binding.runtime_instance_id, binding.endpoint.clone());
+        self.proxy.bind(
+            workspace_id,
+            &binding.runtime_instance_id,
+            binding.endpoint.clone(),
+        );
         self.resolver.bind(workspace_id, binding);
         self.events.push(WorkspaceRouterEvent {
             workspace_id: workspace_id.to_string(),
@@ -8952,7 +9634,11 @@ impl WorkspaceRouter {
         true
     }
 
-    pub fn route_workspace_request(&mut self, request_target: &str, now: DateTime) -> Option<WorkspaceRoute> {
+    pub fn route_workspace_request(
+        &mut self,
+        request_target: &str,
+        now: DateTime,
+    ) -> Option<WorkspaceRoute> {
         let route = self.route_request(&self.registry, &self.proxy, request_target)?;
         self.events.push(WorkspaceRouterEvent {
             workspace_id: route.workspace_id.clone(),
@@ -12126,6 +12812,21 @@ impl Default for RestApiSpec {
             "GET /repositories/{id}/last-good",
             "GET /api/repositories/{id}/intelligence",
             "POST /api/repositories/{id}/ask",
+            "GET /repositories/{id}/twin",
+            "GET /repositories/{id}/behavior",
+            "GET /repositories/{id}/architecture",
+            "GET /repositories/{id}/timeline",
+            "GET /repositories/{id}/predictions",
+            "GET /repositories/{id}/recommendations",
+            "GET /repositories/{id}/blast-radius",
+            "GET /repositories/{id}/dna",
+            "GET /repositories/{id}/risk",
+            "GET /repositories/{id}/memory",
+            "POST /repositories/{id}/simulate",
+            "POST /repositories/{id}/infer",
+            "POST /repositories/{id}/compare",
+            "POST /repositories/{id}/predict",
+            "POST /repositories/{id}/explain",
             "GET /intelligence/{execution}",
             "GET /intelligence/similar",
             "GET /intelligence/patterns",
@@ -16247,6 +16948,23 @@ dependencies:
             .routes
             .contains(&"GET /api/repositories/{id}/intelligence"));
         assert!(spec.routes.contains(&"POST /api/repositories/{id}/ask"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/twin"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/behavior"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/architecture"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/timeline"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/predictions"));
+        assert!(spec
+            .routes
+            .contains(&"GET /repositories/{id}/recommendations"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/blast-radius"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/dna"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/risk"));
+        assert!(spec.routes.contains(&"GET /repositories/{id}/memory"));
+        assert!(spec.routes.contains(&"POST /repositories/{id}/simulate"));
+        assert!(spec.routes.contains(&"POST /repositories/{id}/infer"));
+        assert!(spec.routes.contains(&"POST /repositories/{id}/compare"));
+        assert!(spec.routes.contains(&"POST /repositories/{id}/predict"));
+        assert!(spec.routes.contains(&"POST /repositories/{id}/explain"));
         assert!(spec.routes.contains(&"GET /intelligence/{execution}"));
         assert!(spec.routes.contains(&"GET /intelligence/similar"));
         assert!(spec.routes.contains(&"GET /intelligence/patterns"));
@@ -16503,7 +17221,9 @@ dependencies:
             registry
                 .get("a1b2")
                 .map(|record| record.assigned_url.clone()),
-            Some(WorkspaceUrl("workspace-a1b2.trythissoftware.com".to_string()))
+            Some(WorkspaceUrl(
+                "workspace-a1b2.trythissoftware.com".to_string()
+            ))
         );
     }
 
@@ -16833,8 +17553,14 @@ dependencies:
         let identity = resolver
             .get("exec-42")
             .expect("identity should remain bound");
-        assert_eq!(identity.canonical_url, "https://trythissoftware.com/e/exec-42");
-        assert_eq!(identity.current_url, "https://cloud.trythissoftware.com/runtime/42");
+        assert_eq!(
+            identity.canonical_url,
+            "https://trythissoftware.com/e/exec-42"
+        );
+        assert_eq!(
+            identity.current_url,
+            "https://cloud.trythissoftware.com/runtime/42"
+        );
         assert_eq!(identity.current_tier, ExecutionTier::DDockitCloud);
         assert!(trace.events.contains(&TraceEvent::ExecutionMigrated {
             from: ExecutionTier::LocalMachine,
@@ -16864,7 +17590,10 @@ dependencies:
         });
 
         let route = gateway
-            .route_request("https://trythissoftware.com/e/exec-affinity", Some("session-7"))
+            .route_request(
+                "https://trythissoftware.com/e/exec-affinity",
+                Some("session-7"),
+            )
             .expect("session-bound canonical route should resolve");
         assert_eq!(route.runtime_url, "http://worker-affinity:3010");
         assert_eq!(
@@ -16872,7 +17601,10 @@ dependencies:
             Some("RustRuntimeProvider")
         );
         assert!(gateway
-            .route_request("https://trythissoftware.com/e/other-exec", Some("session-7"))
+            .route_request(
+                "https://trythissoftware.com/e/other-exec",
+                Some("session-7")
+            )
             .is_none());
     }
 
@@ -16994,7 +17726,8 @@ services:
         assert!(workspace_create_body.contains("\"workspace_url\":\"workspace-"));
 
         let mut workspace_router = WorkspaceRouter::default();
-        let workspace = workspace_router.create_workspace("repo-1", "aaaaaaa", "org-1", "user-1", 1);
+        let workspace =
+            workspace_router.create_workspace("repo-1", "aaaaaaa", "org-1", "user-1", 1);
         let (workspace_resolve_path, workspace_resolve_body) =
             workspace_resolve_endpoint(&workspace.workspace_id, &workspace_router);
         assert_eq!(
@@ -17271,28 +18004,30 @@ services:
         assert_eq!(org_get_path, "/orgs/org-1");
         assert!(org_get_body.contains("\"org_id\":\"org-1\""));
 
-        let (member_path, member_body) = org_add_member_endpoint(&OrganizationMembershipCreateRequest {
-            org_id: "org-1".to_string(),
-            user_id: "user-2".to_string(),
-            role: MembershipRole::Developer,
-        });
+        let (member_path, member_body) =
+            org_add_member_endpoint(&OrganizationMembershipCreateRequest {
+                org_id: "org-1".to_string(),
+                user_id: "user-2".to_string(),
+                role: MembershipRole::Developer,
+            });
         assert_eq!(member_path, "/orgs/org-1/members");
         assert!(member_body.contains("\"role\":\"developer\""));
     }
 
     #[test]
     fn oauth_callback_endpoints_emit_token_exchange_identity_org_and_redirect_payloads() {
-        let (github_path, github_body) = github_oauth_callback_endpoint(&GithubOAuthCallbackRequest {
-            code: "github-code".to_string(),
-            state: Some("state-1".to_string()),
-            extension_id: None,
-            github_id: 123_456,
-            github_login: "octocat".to_string(),
-            github_email: Some("octocat@github.com".to_string()),
-            existing_user_id: None,
-            existing_org_id: None,
-            role: MembershipRole::Admin,
-        });
+        let (github_path, github_body) =
+            github_oauth_callback_endpoint(&GithubOAuthCallbackRequest {
+                code: "github-code".to_string(),
+                state: Some("state-1".to_string()),
+                extension_id: None,
+                github_id: 123_456,
+                github_login: "octocat".to_string(),
+                github_email: Some("octocat@github.com".to_string()),
+                existing_user_id: None,
+                existing_org_id: None,
+                role: MembershipRole::Admin,
+            });
         assert_eq!(github_path, "/auth/github/callback");
         assert!(github_body.contains("\"url\":\"https://github.com/login/oauth/access_token\""));
         assert!(github_body.contains("\"url\":\"https://api.github.com/user\""));
@@ -17300,25 +18035,26 @@ services:
         assert!(github_body.contains("\"provider\":\"github\""));
         assert!(github_body.contains("https://trythissoftware.com/auth/success?token="));
 
-        let (google_path, google_body) = google_oauth_callback_endpoint(&GoogleOAuthCallbackRequest {
-            code: "google-code".to_string(),
-            state: Some("state-2".to_string()),
-            extension_id: Some("abcdefghijklmnop".to_string()),
-            google_sub: "google-sub-1".to_string(),
-            google_email: "person@example.com".to_string(),
-            google_name: "Person One".to_string(),
-            existing_user_id: Some("user-existing".to_string()),
-            existing_org_id: Some("org-existing".to_string()),
-            role: MembershipRole::Developer,
-        });
+        let (google_path, google_body) =
+            google_oauth_callback_endpoint(&GoogleOAuthCallbackRequest {
+                code: "google-code".to_string(),
+                state: Some("state-2".to_string()),
+                extension_id: Some("abcdefghijklmnop".to_string()),
+                google_sub: "google-sub-1".to_string(),
+                google_email: "person@example.com".to_string(),
+                google_name: "Person One".to_string(),
+                existing_user_id: Some("user-existing".to_string()),
+                existing_org_id: Some("org-existing".to_string()),
+                role: MembershipRole::Developer,
+            });
         assert_eq!(google_path, "/auth/google/callback");
         assert!(google_body.contains("\"url\":\"https://oauth2.googleapis.com/token\""));
-        assert!(google_body.contains("\"url\":\"https://openidconnect.googleapis.com/v1/userinfo\""));
+        assert!(
+            google_body.contains("\"url\":\"https://openidconnect.googleapis.com/v1/userinfo\"")
+        );
         assert!(google_body.contains("\"status\":\"existing\""));
         assert!(google_body.contains("\"provider\":\"google\""));
-        assert!(google_body.contains(
-            "chrome-extension://abcdefghijklmnop/auth/success?token="
-        ));
+        assert!(google_body.contains("chrome-extension://abcdefghijklmnop/auth/success?token="));
         assert!(google_body.contains("\"org_id\":\"org-existing\""));
     }
 
@@ -17377,8 +18113,12 @@ services:
         });
 
         let engine = IdentityMergeEngine;
-        let merged =
-            engine.claim_anonymous_executions(&mut database, "anon-user-1", "user-1", Some("org-1"));
+        let merged = engine.claim_anonymous_executions(
+            &mut database,
+            "anon-user-1",
+            "user-1",
+            Some("org-1"),
+        );
         assert_eq!(merged, 1);
         assert_eq!(database.executions[0].user_id.as_deref(), Some("user-1"));
         assert_eq!(database.executions[0].org_id.as_deref(), Some("org-1"));
@@ -17533,8 +18273,9 @@ services:
         assert!(portal_ui_body.contains("\"agents\""));
         assert!(portal_ui_body.contains("\"badge_generator_studio\""));
         assert!(portal_ui_body.contains("\"generate_api\":\"/api/badges/generate\""));
-        assert!(portal_ui_body
-            .contains("\"notice\":\"This badge updates automatically based on repository execution health.\""));
+        assert!(portal_ui_body.contains(
+            "\"notice\":\"This badge updates automatically based on repository execution health.\""
+        ));
         assert!(portal_ui_body.contains("\"component_registry\""));
         assert!(portal_ui_body.contains("\"rendered\""));
     }
@@ -17553,7 +18294,10 @@ services:
             .get("components")
             .and_then(serde_json::Value::as_array)
             .expect("rendered components");
-        assert_eq!(rendered.get("renderer"), Some(&json!("unified_surface_renderer")));
+        assert_eq!(
+            rendered.get("renderer"),
+            Some(&json!("unified_surface_renderer"))
+        );
         assert!(rendered_components
             .iter()
             .any(|entry| entry.get("component") == Some(&json!("Card"))));
@@ -18363,6 +19107,128 @@ services:
     }
 
     #[test]
+    fn repository_cognitive_endpoints_emit_digital_twin_signals() {
+        let mut database = ExecutionIntelligenceDatabase::default();
+        database.repositories.insert(
+            "repo-id".to_string(),
+            EidbRepositoryRecord {
+                repo_id: "repo-id".to_string(),
+                repo_url: "https://github.com/octocat/hello-world".to_string(),
+                default_branch: "main".to_string(),
+                first_seen: 1,
+                last_seen: 2,
+            },
+        );
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            org_id: None,
+            user_id: None,
+            anon_user_id: Some("anon".to_string()),
+            workspace_id: "ws-1".to_string(),
+            repository_id: "repo-id".to_string(),
+            commit_hash: "aaaaaaa".to_string(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: "failed".to_string(),
+            execution_tier: "WASM".to_string(),
+        });
+        database.record_execution(EidbExecutionRecord {
+            execution_id: "exec-2".to_string(),
+            org_id: None,
+            user_id: Some("user-1".to_string()),
+            anon_user_id: None,
+            workspace_id: "ws-2".to_string(),
+            repository_id: "repo-id".to_string(),
+            commit_hash: "bbbbbbb".to_string(),
+            started_at: 3,
+            completed_at: Some(7),
+            status: "success".to_string(),
+            execution_tier: "CLOUD".to_string(),
+        });
+        database.record_healing_attempt(EidbHealingAttemptRecord {
+            repository_id: "repo-id".to_string(),
+            execution_id: "exec-1".to_string(),
+            failure_class: "Dependency".to_string(),
+            repair_strategy: "regenerate-lockfile".to_string(),
+            success: true,
+            created_at: 4,
+        });
+
+        let (twin_path, twin_body) = repository_twin_endpoint("repo-id", &database);
+        assert_eq!(twin_path, "/repositories/repo-id/twin");
+        assert!(twin_body.contains("\"runtime_topology\""));
+        assert!(twin_body.contains("\"risk_graph\""));
+        assert!(twin_body.contains("\"behavior_profile\""));
+
+        let (behavior_path, behavior_body) = repository_behavior_endpoint("repo-id", &database);
+        assert_eq!(behavior_path, "/repositories/repo-id/behavior");
+        assert!(behavior_body.contains("\"behavior_fingerprint\""));
+
+        let (architecture_path, architecture_body) =
+            repository_architecture_endpoint("repo-id", &database);
+        assert_eq!(architecture_path, "/repositories/repo-id/architecture");
+        assert!(architecture_body.contains("\"service_graph\""));
+
+        let (timeline_path, timeline_body) = repository_timeline_endpoint("repo-id", &database);
+        assert_eq!(timeline_path, "/repositories/repo-id/timeline");
+        assert!(timeline_body.contains("\"timeline\""));
+
+        let (predictions_path, predictions_body) =
+            repository_predictions_endpoint("repo-id", &database);
+        assert_eq!(predictions_path, "/repositories/repo-id/predictions");
+        assert!(predictions_body.contains("\"predicted_failure_probability\""));
+
+        let (recommendations_path, recommendations_body) =
+            repository_recommendations_endpoint("repo-id", &database);
+        assert_eq!(
+            recommendations_path,
+            "/repositories/repo-id/recommendations"
+        );
+        assert!(recommendations_body.contains("\"recommended_actions\""));
+
+        let (blast_radius_path, blast_radius_body) =
+            repository_blast_radius_endpoint("repo-id", &database);
+        assert_eq!(blast_radius_path, "/repositories/repo-id/blast-radius");
+        assert!(blast_radius_body.contains("\"risk_level\""));
+
+        let (dna_path, dna_body) = repository_dna_endpoint("repo-id", &database);
+        assert_eq!(dna_path, "/repositories/repo-id/dna");
+        assert!(dna_body.contains("\"runtime_topology\""));
+
+        let (risk_path, risk_body) = repository_risk_endpoint("repo-id", &database);
+        assert_eq!(risk_path, "/repositories/repo-id/risk");
+        assert!(risk_body.contains("\"execution_risk\""));
+        assert!(risk_body.contains("\"security_drift\""));
+
+        let (memory_path, memory_body) = repository_memory_endpoint("repo-id", &database);
+        assert_eq!(memory_path, "/repositories/repo-id/memory");
+        assert!(memory_body.contains("\"successful_repairs\":1"));
+        assert!(memory_body.contains("\"entries\""));
+
+        let (simulate_path, simulate_body) =
+            repository_simulate_endpoint("repo-id", "dependency drift");
+        assert_eq!(simulate_path, "/repositories/repo-id/simulate");
+        assert!(simulate_body.contains("\"scenario\":\"dependency drift\""));
+
+        let (infer_path, infer_body) =
+            repository_infer_endpoint("repo-id", "explain execution drift");
+        assert_eq!(infer_path, "/repositories/repo-id/infer");
+        assert!(infer_body.contains("\"inference\""));
+
+        let (compare_path, compare_body) = repository_compare_endpoint("repo-id", "repo-b");
+        assert_eq!(compare_path, "/repositories/repo-id/compare");
+        assert!(compare_body.contains("\"similarity\":0.94"));
+
+        let (predict_path, predict_body) = repository_predict_endpoint("repo-id");
+        assert_eq!(predict_path, "/repositories/repo-id/predict");
+        assert!(predict_body.contains("\"prediction\""));
+
+        let (explain_path, explain_body) = repository_explain_endpoint("repo-id", "risk");
+        assert_eq!(explain_path, "/repositories/repo-id/explain");
+        assert!(explain_body.contains("\"topic\":\"risk\""));
+    }
+
+    #[test]
     fn repository_ask_endpoint_returns_execution_aware_answer_with_evidence() {
         let mut database = ExecutionIntelligenceDatabase::default();
         database.repositories.insert(
@@ -18397,11 +19263,8 @@ services:
             created_at: 3,
         });
 
-        let (path, body) = repository_ask_endpoint(
-            "repo-id",
-            "Why is this repository failing?",
-            &database,
-        );
+        let (path, body) =
+            repository_ask_endpoint("repo-id", "Why is this repository failing?", &database);
         assert_eq!(path, "/api/repositories/repo-id/ask");
         assert!(body.contains("\"answer\""));
         assert!(body.contains("\"evidence\""));

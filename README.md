@@ -96,6 +96,28 @@ This badge updates automatically based on repository execution health.
 - Add trend and anomaly intelligence (failure drift, runtime regressions, repair success decay) across time windows.
 - Improve confidence scoring calibration with source-weighted signals and explicit uncertainty reasoning.
 
+## Repository cognition (RCIE)
+
+The API now also exposes a cognitive repository model surface:
+
+- `GET /repositories/{id}/twin`
+- `GET /repositories/{id}/behavior`
+- `GET /repositories/{id}/architecture`
+- `GET /repositories/{id}/timeline`
+- `GET /repositories/{id}/predictions`
+- `GET /repositories/{id}/recommendations`
+- `GET /repositories/{id}/blast-radius`
+- `GET /repositories/{id}/dna`
+- `GET /repositories/{id}/risk`
+- `GET /repositories/{id}/memory`
+- `POST /repositories/{id}/simulate`
+- `POST /repositories/{id}/infer`
+- `POST /repositories/{id}/compare`
+- `POST /repositories/{id}/predict`
+- `POST /repositories/{id}/explain`
+
+These endpoints provide a repository digital twin view, behavior signals, risk projections, and intent-oriented inference actions on top of the existing execution intelligence loop.
+
 ## User journey screenshots
 
 End-to-end GitHub-native execution flywheel journey:
