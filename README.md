@@ -48,14 +48,14 @@ Example badge embed:
 
 ```html
 <a href="https://trythissoftware.com/seed/{owner}/{repo}">
-  <img src="https://cdn.trythissoftware.com/badge/{owner}/{repo}.svg" />
+  <img src="https://api.trythissoftware.com/badge/{owner}/{repo}.svg" />
 </a>
 ```
 
 Badge screenshots:
 
-![Execution status badge screenshot](https://cdn.trythissoftware.com/badge/vercel/next.js.svg)
-![Healed badge screenshot](https://cdn.trythissoftware.com/badge/healed/vercel/next.js.svg)
+![Execution status badge screenshot](https://api.trythissoftware.com/badge/vercel/next.js.svg)
+![Healed badge screenshot](https://api.trythissoftware.com/badge/healed/vercel/next.js.svg)
 
 This badge updates automatically based on repository execution health.
 

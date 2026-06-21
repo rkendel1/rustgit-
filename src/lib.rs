@@ -7443,7 +7443,7 @@ pub fn badge_generate_endpoint(request: &BadgeGenerateRequest) -> (String, Strin
     let repo = context.repo;
     let canonical_repo_url = format!("https://github.com/{owner}/{repo}");
     let execution_profile_id = hash_key(&canonical_repo_url);
-    let badge_url = format!("https://cdn.trythissoftware.com/badge/{owner}/{repo}.svg");
+    let badge_url = format!("https://api.trythissoftware.com/badge/{owner}/{repo}.svg");
     let seed_url = format!("https://trythissoftware.com/seed/{owner}/{repo}");
     let alt_text = format!("{owner}/{repo} execution status badge");
     let markdown_embed = format!("[<img src=\"{badge_url}\" alt=\"{alt_text}\">]({seed_url})");
@@ -8580,9 +8580,9 @@ pub fn portal_ui_endpoint() -> (String, String) {
                 }
             },
             "output": {
-                "markdown": "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)",
-                "html": "<a href=\"https://trythissoftware.com/seed/vercel/next.js\"><img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\"></a>",
-                "badge_url": "https://cdn.trythissoftware.com/badge/vercel/next.js.svg",
+                "markdown": "[<img src=\"https://api.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)",
+                "html": "<a href=\"https://trythissoftware.com/seed/vercel/next.js\"><img src=\"https://api.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\"></a>",
+                "badge_url": "https://api.trythissoftware.com/badge/vercel/next.js.svg",
                 "seed_link": "https://trythissoftware.com/seed/vercel/next.js"
             },
             "copy_to_clipboard": true,
@@ -20614,7 +20614,7 @@ services:
         );
         assert_eq!(
             payload.get("badge_url").and_then(Value::as_str),
-            Some("https://cdn.trythissoftware.com/badge/vercel/next.js.svg")
+            Some("https://api.trythissoftware.com/badge/vercel/next.js.svg")
         );
         assert_eq!(
             payload.get("seed_url").and_then(Value::as_str),
@@ -20627,7 +20627,7 @@ services:
                 .and_then(|snippets| snippets.get("markdown"))
                 .and_then(Value::as_str),
             Some(
-                "[<img src=\"https://cdn.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)"
+                "[<img src=\"https://api.trythissoftware.com/badge/vercel/next.js.svg\" alt=\"vercel/next.js execution status badge\">](https://trythissoftware.com/seed/vercel/next.js)"
             )
         );
         assert_eq!(
