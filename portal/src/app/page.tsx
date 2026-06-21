@@ -26,7 +26,6 @@ type RepoContext = {
 };
 
 type AnalyzeResponse = {
-  repo?: string;
   repo_url?: string;
   fingerprint_id?: string;
   frameworks?: string[];

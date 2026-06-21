@@ -91,5 +91,5 @@ fn detect_script(root: &Path, script_name: &str) -> Option<String> {
         .get("scripts")?
         .get(script_name)?
         .as_str()
-        .map(|_| format!("npm run {script_name}"))
+        .map(|command| command.to_string())
 }

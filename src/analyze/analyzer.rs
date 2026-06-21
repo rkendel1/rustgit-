@@ -12,6 +12,7 @@ use super::manifest_builder::{write_manifest, AnalyzeManifest};
 use super::runtime_detector::detect_runtime;
 
 const STAGE_TIMEOUT_MS: u128 = 250;
+const MAX_CONFIDENCE: u8 = 99;
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeEngineRequest {
@@ -119,5 +120,5 @@ fn compute_confidence(framework: &str, runtime: &str) -> u8 {
     if runtime != "unknown" {
         score = score.saturating_add(20);
     }
-    score.min(99)
+    score.min(MAX_CONFIDENCE)
 }
