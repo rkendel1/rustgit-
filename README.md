@@ -96,6 +96,61 @@ This badge updates automatically based on repository execution health.
 - Add trend and anomaly intelligence (failure drift, runtime regressions, repair success decay) across time windows.
 - Improve confidence scoring calibration with source-weighted signals and explicit uncertainty reasoning.
 
+## Universal Software Intelligence Layer (USIL)
+
+Tagline: **Every repository becomes a queryable, executable, continuously learning software object.**
+
+### Platform primitive shift
+
+`Repository` is the current primitive. USIL evolves that into a first-class `SoftwareObject` that unifies:
+
+- Source code + architecture
+- Runtime + execution/healing history
+- Dependency/service/API graphs
+- Temporal history + ownership
+- Memory + intelligence + recommendations + predictions
+- Live state
+
+### Unified object model
+
+Rather than split intelligence across isolated stores, USIL standardizes on a single software object interface:
+
+- `.getExecution()`
+- `.getArchitecture()`
+- `.getRuntime()`
+- `.getDependencies()`
+- `.getHistory()`
+- `.predict()`
+- `.heal()`
+- `.optimize()`
+- `.execute()`
+- `.ask()`
+- `.compare()`
+
+### Current capability trajectory
+
+- Repository Analysis ✅
+- Execution ✅
+- Runtime Routing ✅
+- Healing ◐
+- Repository Intelligence ◐
+- Portal ◐
+- Extension ◐
+
+USIL is the umbrella direction that links these capabilities into one shared live model for the portal, extension, API, CLI, and agents.
+
+### Planned USIL engines
+
+- **Live Runtime Mirror**: running executions continuously update the same software object state used by all product surfaces.
+- **Universal Query Engine**: one query language across repository, runtime, graph, and healing signals.
+- **Execution Replay**: replay, diff, and compare prior executions ("git bisect" for runtime behavior).
+- **Continuous Runtime Observatory**: learn best runtime/cache/healing/dependency outcomes from every execution.
+- **Software Similarity Engine**: compare systems by architecture + behavior + dependencies + performance + topology.
+- **Autonomous Optimization Engine**: continuously propose and validate faster/cheaper/more reliable execution plans.
+- **Multi-Repository Reasoning**: infer recommendations from cross-repository patterns.
+- **Live Architecture + Universal Timeline**: one graph and one causal timeline for commits, executions, healing, deploys, and regressions.
+- **Cognitive Agent API**: expose software object actions (`predict`, `execute`, `heal`, `optimize`, `compare`, `explain`, `simulate`, `recover`, `search`, `timeline`) to any agent client.
+
 ## Repository cognition (RCIE)
 
 The API now also exposes a cognitive repository model surface:
