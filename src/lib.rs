@@ -7432,15 +7432,13 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
     );
     let ci_files = discover_ci_files(root);
     let discovered_env_keys = discover_env_keys(root, &existing_environment_files);
-    let package_json_content = fs::read_to_string(root.join("package.json"))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let package_dependencies = parse_package_dependency_names(root);
 
     let has_prisma =
-        package_json_content.contains("\"prisma\"") || root.join("prisma/schema.prisma").exists();
+        package_dependencies.contains("prisma") || root.join("prisma/schema.prisma").exists();
     let has_redis =
-        package_json_content.contains("\"redis\"") || package_json_content.contains("\"ioredis\"");
-    let has_openai = package_json_content.contains("\"openai\"");
+        package_dependencies.contains("redis") || package_dependencies.contains("ioredis");
+    let has_openai = package_dependencies.contains("openai");
 
     let mut environment_graph = Vec::new();
     environment_graph.push(environment_variable_blueprint(
@@ -7645,6 +7643,18 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
     keys
 }
 
+fn parse_package_dependency_names(root: &Path) -> HashSet<String> {
+    let package_json = fs::read_to_string(root.join("package.json")).unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&package_json).unwrap_or(Value::Null);
+    let mut dependencies = HashSet::new();
+    for section in ["dependencies", "devDependencies", "peerDependencies"] {
+        if let Some(entries) = parsed.get(section).and_then(Value::as_object) {
+            dependencies.extend(entries.keys().cloned());
+        }
+    }
+    dependencies
+}
+
 fn environment_variable_blueprint(
     name: &str,
     synthesized_value: impl Into<String>,
@@ -7811,8 +7821,8 @@ fn environment_confidence_scores(
         + environment as u16
         + expected_runtime as u16)
         / 5) as u8;
-    let penalty =
-        (expected_failures.len() as u8).saturating_mul(PREFLIGHT_FAILURE_PENALTY_PER_ISSUE);
+    let failure_count = expected_failures.len().min(u8::MAX as usize) as u8;
+    let penalty = failure_count.saturating_mul(PREFLIGHT_FAILURE_PENALTY_PER_ISSUE);
     json!({
         "repository_health": repository_health,
         "environment": environment,
