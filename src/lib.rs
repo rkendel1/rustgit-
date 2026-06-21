@@ -2515,7 +2515,8 @@ impl WasiKernel {
             .component_graph
             .capabilities
             .needs
-            .contains("process.spawn")
+            .iter()
+            .any(|need| need == "process.spawn")
         {
             self.process.spawn()?;
             self.observability.syscall("process.spawn");
@@ -2538,12 +2539,10 @@ impl WasiKernel {
             .inspect_err(|err| self.observability.failure(&err.to_string()))?;
 
         self.observability.stage("observe");
-        self.observability.metric(
-            "execution_ms",
-            started.elapsed().as_secs_f64().max(MIN_BILLABLE_DURATION_SECONDS),
-        );
         self.observability
-            .metric("exported_functions", result.exported_functions.len() as f64);
+            .metric("execution_ms", started.elapsed().as_secs_f64() * 1_000.0);
+        self.observability
+            .metric("exported_function_count", result.exported_functions.len() as f64);
         self.observability.memory_profile.push(
             u64::from(request.runtime_spec.memory_limit_mb).saturating_mul(BYTES_PER_MB),
         );
@@ -18344,9 +18343,10 @@ dependencies:
         let response = kernel.execute(&request).expect("execute through kernel");
 
         assert_eq!(response.result, "ok");
-        assert!(!response.logs.is_empty());
+        assert!(response.logs.contains(&"run".to_string()));
         assert!(response.trace_id.starts_with("trace-"));
         assert!(response.metrics.contains_key("execution_ms"));
+        assert!(response.metrics.contains_key("exported_function_count"));
         assert!(response.execution_graph_diff.is_empty());
     }
 
@@ -18405,6 +18405,74 @@ dependencies:
             .execute(&request)
             .expect_err("network capability validation should fail");
         assert!(matches!(err, RuntimeError::WasmRuntime(message) if message.contains("allowlist")));
+    }
+
+    #[test]
+    fn wasi_kernel_reports_execution_graph_diff_when_links_are_missing() {
+        let module_bytes = parse_str("(module (func (export \"run\")))").expect("compile wat");
+        let component_graph = WasiComponentGraph {
+            components: vec![
+                WasiComponent {
+                    id: "producer".to_string(),
+                    module: "producer.wasm".to_string(),
+                    imports: vec![],
+                    exports: vec!["filesystem.read".to_string()],
+                    capabilities: vec!["filesystem.read".to_string()],
+                },
+                WasiComponent {
+                    id: "consumer".to_string(),
+                    module: "consumer.wasm".to_string(),
+                    imports: vec!["filesystem.read".to_string()],
+                    exports: vec![],
+                    capabilities: vec![],
+                },
+            ],
+            links: vec![],
+            capabilities: CapabilitySet::default(),
+            imports: vec!["import:consumer:filesystem.read".to_string()],
+            exports: vec!["export:producer:filesystem.read".to_string()],
+            runtime_constraints: RuntimeConstraints {
+                read_only_paths: vec!["/workspace".to_string()],
+                network_allowlist: vec![],
+                max_memory_mb: 64,
+                max_cpu_units: 2_000,
+                process_spawn_bounded: true,
+            },
+            execution_plan: ExecutionPlan::default(),
+        };
+        let request = WasiKernelExecutionRequest {
+            component_graph,
+            runtime_spec: WasmRuntimeSpec {
+                enabled: true,
+                wasi: true,
+                memory_limit_mb: 64,
+                cpu_limit_units: 2_000,
+                allowed_syscalls: vec![],
+            },
+            capabilities: WasiKernelCapability {
+                filesystem: WasiKernelFilesystemCapability {
+                    read: vec!["/workspace".to_string()],
+                    write: vec![],
+                },
+                network: WasiKernelNetworkCapability::default(),
+                process: WasiKernelProcessCapability::default(),
+                env: WasiKernelEnvCapability::default(),
+                runtime: WasiKernelRuntimeCapability {
+                    memory_limit_mb: 64,
+                    cpu_limit: 2_000.0,
+                },
+            },
+            filesystem_snapshot: WorkspaceSnapshot::default(),
+            environment: BTreeMap::new(),
+            module_bytes,
+        };
+
+        let mut kernel = WasiKernel::new().expect("create kernel");
+        let response = kernel.execute(&request).expect("execute through kernel");
+        assert_eq!(
+            response.execution_graph_diff,
+            vec!["producer->consumer:filesystem.read".to_string()]
+        );
     }
 
     #[test]
