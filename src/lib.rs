@@ -11950,7 +11950,14 @@ impl WorkspaceManager {
             copy_directory(Path::new(repo_url), destination)?;
         } else {
             let mut clone_command = Command::new("git");
-            clone_command.arg("clone").arg("--depth").arg("1");
+            clone_command
+                .arg("-c")
+                .arg("credential.helper=")
+                .arg("-c")
+                .arg("credential.username=")
+                .arg("clone")
+                .arg("--depth")
+                .arg("1");
             clone_command.env("GIT_TERMINAL_PROMPT", "0");
             if let Some(extra_header) = github_clone_extra_header(repo_url) {
                 clone_command
