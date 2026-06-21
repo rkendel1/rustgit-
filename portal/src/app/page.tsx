@@ -23,7 +23,7 @@ const ANALYZE_EXECUTIONS_FALLBACK_PATH = "/api/proxy/api/v1/executions";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_V1 = "/api/proxy/api/v1/workspaces";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_API = "/api/proxy/api/workspaces";
 const ANALYZE_WORKSPACES_FALLBACK_PATH_ROOT = "/api/proxy/workspaces";
-const ANALYZE_RETRYABLE_STATUS_CODES = new Set([404, 405]);
+const ANALYZE_RETRYABLE_STATUS_CODES = new Set([404, 405, 502, 503, 504]);
 
 type AnalyzeEndpointResponseKind = "analyze" | "workspace";
 type AnalyzeEndpointConfig = {
