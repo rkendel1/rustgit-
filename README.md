@@ -100,6 +100,45 @@ This badge updates automatically based on repository execution health.
 
 Tagline: **Every repository becomes a queryable, executable, continuously learning software object.**
 
+### Global Software Intelligence Network (GSIN)
+
+USIL now extends to a network model where repository-level learning contributes to global software intelligence.
+
+Current evolution:
+
+`Git Repository → Repository Intelligence → Repository Cognitive Twin → Software Object`
+
+Next evolution:
+
+`Software Objects (many) → Global Knowledge Graph → Collective Intelligence → Universal Reasoning`
+
+Core first-class graph nodes include:
+
+- Repository
+- Service
+- Dependency
+- Runtime
+- Framework
+- API
+- Database
+- Package
+- Execution
+- Failure
+- Repair
+- Optimization
+- Developer Action
+- Deployment
+- Architecture Pattern
+
+GSIN capabilities:
+
+- **Universal pattern mining** across framework/runtime/dependency combinations and outcomes.
+- **Autonomous architecture intelligence** that infers architecture from behavior (microservice, clean, event-driven, CQRS, monolith, serverless, hybrid, edge-native).
+- **Global healing network**: failure similarity search → prior successful repairs → confidence ranking → automated verification loop.
+- **Software evolution modeling** over lifecycle stages (creation, growth, refactor, migration, split, optimization, stabilization).
+- **Predictive architecture guidance** for dependency drift, runtime impact, and execution risk before failures occur.
+- **Cross-repository reasoning** for reliability, migration, scaling, and optimization decisions.
+
 ### Platform primitive shift
 
 `Repository` is the current primitive. USIL evolves that into a first-class `SoftwareObject` that unifies:
@@ -157,6 +196,20 @@ USIL is the umbrella direction that links these capabilities into one shared liv
 - **Multi-Repository Reasoning**: infer recommendations from cross-repository patterns.
 - **Live Architecture + Universal Timeline**: one graph and one causal timeline for commits, executions, healing, deploys, and regressions.
 - **Cognitive Agent API**: expose software object actions (`predict`, `execute`, `heal`, `optimize`, `compare`, `explain`, `simulate`, `recover`, `search`, `timeline`) to any agent client.
+
+### Universal Software Graph API
+
+All software objects share one queryable interface:
+
+- `software.find()`
+- `software.compare()`
+- `software.predict()`
+- `software.simulate()`
+- `software.optimize()`
+- `software.heal()`
+- `software.evolve()`
+- `software.explain()`
+- `software.recommend()`
 
 ## Repository cognition (RCIE)
 
