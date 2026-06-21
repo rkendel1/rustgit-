@@ -1,6 +1,7 @@
 use super::SoftwareExecutionSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeterministicExecutionArtifacts {
@@ -121,15 +122,15 @@ pub fn deterministic_execution_artifacts(
             "name": name,
             "source": source,
             "generated_by": "Environment Synthesizer",
-            "confidence": 99.2,
-            "validated": "2026-06-20",
-            "execution_successes": 18422
+            "confidence": f64::from(spec.confidence),
+            "validated": "derived_at_analysis_time",
+            "execution_successes": 0
         })).collect::<Vec<_>>(),
         "healing": [{
             "repair": "Updated runtime execution configuration",
-            "reason": "Known compatibility improvements from verified runs",
-            "evidence_successes": 9482,
-            "confidence": 98.7,
+            "reason": "Auto-generated from runtime recovery plan",
+            "evidence_successes": 0,
+            "confidence": f64::from(spec.confidence),
             "rollback_available": true
         }],
     });
@@ -189,14 +190,11 @@ execution_fingerprint = "{execution_fingerprint}""#
 }
 
 fn digest_label(input: &str) -> String {
-    format!("sha256:{}", deterministic_hash(input))
-}
-
-fn deterministic_hash(input: &str) -> String {
-    let mut state: u64 = 14695981039346656037;
-    for byte in input.bytes() {
-        state ^= byte as u64;
-        state = state.wrapping_mul(1099511628211);
+    let digest = Sha256::digest(input.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(char::from_digit((byte >> 4) as u32, 16).expect("hex nibble"));
+        hex.push(char::from_digit((byte & 0x0f) as u32, 16).expect("hex nibble"));
     }
-    format!("{state:x}")
+    format!("sha256:{hex}")
 }
