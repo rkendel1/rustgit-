@@ -18,6 +18,7 @@ mod execution_learning;
 mod execution_memory;
 mod execution_optimizer;
 mod execution_retriever;
+pub mod healing;
 mod postgres_db;
 mod repository_context_builder;
 mod repository_embeddings;
@@ -1521,10 +1522,7 @@ pub enum HealingDecision {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HealingCoordinator {
-    classifier: FailureClassifier,
-    catalog: HealingCatalog,
-    engine: HealingEngine,
-    validator: HealingValidationEngine,
+    autonomous: healing::coordinator::AutonomousHealingCoordinator,
     pub journal: HealingJournal,
 }
 
@@ -1539,52 +1537,50 @@ impl HealingCoordinator {
         graph: &RepositoryTimeGraph,
         head_commit: &str,
     ) -> HealingDecision {
-        let failure_class = self.classifier.classify(failure, fingerprint);
-        let strategy = self
-            .catalog
-            .strategy_for(failure_class, failure, fingerprint);
-        if let Some(result) = self
-            .engine
-            .execute_plan(&strategy, runtime, &self.validator)
-        {
-            self.journal.record(
-                repo_id,
-                failure_class,
-                &strategy.strategy_id,
-                HealingOutcome::Success,
-            );
-            return HealingDecision::Recovered {
-                failure_class,
-                strategy,
-                result,
-            };
-        }
-
-        if let Some(commit) =
-            temporal_router.route(graph, head_commit, RecoveryStrategy::LastKnownGood)
-        {
-            self.journal.record(
-                repo_id,
-                failure_class,
-                &strategy.strategy_id,
-                HealingOutcome::EscalatedToTre,
-            );
-            return HealingDecision::EscalatedToTre {
-                failure_class,
-                strategy,
-                selected_commit: commit,
-            };
-        }
-
-        self.journal.record(
-            repo_id,
-            failure_class,
-            &strategy.strategy_id,
-            HealingOutcome::HumanIntervention,
-        );
-        HealingDecision::HumanInterventionRequired {
-            failure_class,
-            strategy,
+        let autonomous_decision = self
+            .autonomous
+            .heal(failure, fingerprint, runtime, temporal_router, graph, head_commit);
+        let failure_class = autonomous_decision.failure_class;
+        let strategy = autonomous_decision.strategy;
+        match autonomous_decision.outcome {
+            healing::coordinator::AutonomousOutcome::Recovered { result } => {
+                self.journal.record(
+                    repo_id,
+                    failure_class,
+                    &strategy.strategy_id,
+                    HealingOutcome::Success,
+                );
+                HealingDecision::Recovered {
+                    failure_class,
+                    strategy,
+                    result,
+                }
+            }
+            healing::coordinator::AutonomousOutcome::EscalatedToTre { selected_commit } => {
+                self.journal.record(
+                    repo_id,
+                    failure_class,
+                    &strategy.strategy_id,
+                    HealingOutcome::EscalatedToTre,
+                );
+                HealingDecision::EscalatedToTre {
+                    failure_class,
+                    strategy,
+                    selected_commit,
+                }
+            }
+            healing::coordinator::AutonomousOutcome::HumanInterventionRequired => {
+                self.journal.record(
+                    repo_id,
+                    failure_class,
+                    &strategy.strategy_id,
+                    HealingOutcome::HumanIntervention,
+                );
+                HealingDecision::HumanInterventionRequired {
+                    failure_class,
+                    strategy,
+                }
+            }
         }
     }
 }
