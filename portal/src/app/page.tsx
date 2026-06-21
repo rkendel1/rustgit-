@@ -330,154 +330,212 @@ export default function Home() {
     intelligence?.repository_identity?.healing_score,
     intelligence?.healing_score,
   );
+  const repositoryName = parsedRepo ? `${parsedRepo.owner}/${parsedRepo.repo}` : "No repository selected";
 
   return (
     <main className={styles.page}>
-      <section className={styles.hero}>
-        <h1>Paste a GitHub repo. Get intelligence. Run it.</h1>
-        <p>
-          Start with a GitHub link, get an instant readout of frameworks/services and a run summary,
-          then launch execution.
-        </p>
-      </section>
+      <aside className={styles.sidebar}>
+        <div className={styles.profileCard}>
+          <div className={styles.avatar}>{parsedRepo?.owner?.slice(0, 1).toUpperCase() ?? "R"}</div>
+          <div>
+            <strong>RustGit Portal</strong>
+            <p>{repositoryName}</p>
+          </div>
+        </div>
 
-      <section className={styles.panel}>
-        <h2>1) Repository input</h2>
-        <label htmlFor="github-repo-url" className={styles.label}>
-          GitHub repository URL or owner/repo
-        </label>
-        <input
-          id="github-repo-url"
-          value={repository}
-          onChange={(event) => resetResults(event.target.value)}
-          placeholder="https://github.com/owner/repo"
-          className={styles.input}
-        />
-        <p className={styles.hint}>
-          You can also use <code>owner/repo</code>.
-        </p>
+        <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.newMailButton}>
+          {analyzing ? "Analyzing..." : "Analyze Repository"}
+        </button>
 
-        <div className={styles.branchRow}>
-          <label htmlFor="branch" className={styles.label}>
-            Branch
+        <nav className={styles.navSection} aria-label="Portal sections">
+          <p className={styles.navHeading}>Workspace</p>
+          <ul className={styles.navList}>
+            <li className={styles.navItem}>
+              <span>Intelligence</span>
+              <strong>{analyzeResult ? "1" : "0"}</strong>
+            </li>
+            <li className={styles.navItem}>
+              <span>Executions</span>
+              <strong>{runResult ? "1" : "0"}</strong>
+            </li>
+            <li className={styles.navItem}>
+              <span>Errors</span>
+              <strong>{error ? "1" : "0"}</strong>
+            </li>
+          </ul>
+        </nav>
+
+        <div className={styles.sidebarMeta}>
+          <p>
+            Branch <strong>{branch.trim() || "main"}</strong>
+          </p>
+          <p>
+            API <code>{API_BASE_URL}</code>
+          </p>
+        </div>
+      </aside>
+
+      <section className={styles.listPane}>
+        <header className={styles.paneHeader}>
+          <h1>Repository workspace</h1>
+          <p>Paste a GitHub URL, analyze metadata, and prepare execution.</p>
+        </header>
+
+        <section className={styles.panel}>
+          <h2>Repository input</h2>
+          <label htmlFor="github-repo-url" className={styles.label}>
+            GitHub repository URL or owner/repo
           </label>
           <input
-            id="branch"
-            value={branch}
-            onChange={(event) => setBranch(event.target.value)}
-            placeholder="main"
+            id="github-repo-url"
+            value={repository}
+            onChange={(event) => resetResults(event.target.value)}
+            placeholder="https://github.com/owner/repo"
             className={styles.input}
           />
-        </div>
+          <p className={styles.hint}>
+            You can also use <code>owner/repo</code>.
+          </p>
 
-        <div className={styles.actions}>
-          <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.primaryButton}>
-            {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
-          </button>
-          <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
-            {running ? "Starting run..." : "Run repository"}
-          </button>
-        </div>
+          <div className={styles.branchRow}>
+            <label htmlFor="branch" className={styles.label}>
+              Branch
+            </label>
+            <input
+              id="branch"
+              value={branch}
+              onChange={(event) => setBranch(event.target.value)}
+              placeholder="main"
+              className={styles.input}
+            />
+          </div>
+
+          <div className={styles.actions}>
+            <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.primaryButton}>
+              {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
+            </button>
+            <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
+              {running ? "Starting run..." : "Run repository"}
+            </button>
+          </div>
+        </section>
+
+        {error ? (
+          <section className={styles.errorPanel} role="alert">
+            {error}
+          </section>
+        ) : null}
+
+        {analyzeResult ? (
+          <section className={styles.panel}>
+            <h2>Intelligence</h2>
+            <div className={styles.grid}>
+              <div className={styles.tile}>
+                <strong>Repository</strong>
+                <code>{analyzeResult.repo_url ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Fingerprint</strong>
+                <code>{analyzeResult.fingerprint_id ?? "pending"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Frameworks</strong>
+                <span>{(analyzeResult.frameworks ?? []).join(", ") || "n/a"}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Services</strong>
+                <span>{(analyzeResult.services ?? []).join(", ") || "n/a"}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Health score</strong>
+                <span>{formatScore(healthScore)}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Execution score</strong>
+                <span>{formatScore(executionScore)}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Healing score</strong>
+                <span>{formatScore(healingScore)}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Runtime</strong>
+                <span>{intelligence?.runtime ?? "n/a"}</span>
+              </div>
+            </div>
+
+            {repoAnswer?.answer ? (
+              <div className={styles.answerBox}>
+                <h3>Repo summary</h3>
+                <p>{repoAnswer.answer}</p>
+                <p className={styles.hint}>
+                  Confidence: {formatConfidence(repoAnswer.confidence)}
+                </p>
+              </div>
+            ) : null}
+          </section>
+        ) : (
+          <section className={styles.emptyPanel}>
+            <h2>It&apos;s empty here</h2>
+            <p>Analyze a repository to view framework, services, and score details.</p>
+          </section>
+        )}
       </section>
 
-      {error ? (
-        <section className={styles.errorPanel} role="alert">
-          {error}
+      <section className={styles.detailPane}>
+        <header className={styles.paneHeader}>
+          <h2>Execution details</h2>
+          <p>Launch and monitor execution from the same workspace.</p>
+        </header>
+
+        {runResult ? (
+          <section className={styles.panel}>
+            <h2>Run status</h2>
+            <div className={styles.grid}>
+              <div className={styles.tile}>
+                <strong>Execution ID</strong>
+                <code>{runResult.execution_id ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Workspace ID</strong>
+                <code>{runResult.workspace_id ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Status</strong>
+                <span>{runResult.status ?? "starting"}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Workspace URL</strong>
+                {runResult.workspace_url ? (
+                  <a
+                    href={runResult.workspace_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label="Open workspace in a new tab"
+                  >
+                    Open workspace
+                  </a>
+                ) : (
+                  <span>pending</span>
+                )}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <section className={styles.emptyPanel}>
+            <h2>It&apos;s empty here</h2>
+            <p>Run a repository to populate execution status and workspace links.</p>
+          </section>
+        )}
+
+        <section className={styles.footerInfo}>
+          <p>
+            API base: <code>{API_BASE_URL}</code>
+          </p>
+          <p>
+            Health check: <a href="/api/health">/api/health</a>
+          </p>
         </section>
-      ) : null}
-
-      {analyzeResult ? (
-        <section className={styles.panel}>
-          <h2>2) Intelligence</h2>
-          <div className={styles.grid}>
-            <div className={styles.tile}>
-              <strong>Repository</strong>
-              <code>{analyzeResult.repo_url ?? "n/a"}</code>
-            </div>
-            <div className={styles.tile}>
-              <strong>Fingerprint</strong>
-              <code>{analyzeResult.fingerprint_id ?? "pending"}</code>
-            </div>
-            <div className={styles.tile}>
-              <strong>Frameworks</strong>
-              <span>{(analyzeResult.frameworks ?? []).join(", ") || "n/a"}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Services</strong>
-              <span>{(analyzeResult.services ?? []).join(", ") || "n/a"}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Health score</strong>
-              <span>{formatScore(healthScore)}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Execution score</strong>
-              <span>{formatScore(executionScore)}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Healing score</strong>
-              <span>{formatScore(healingScore)}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Runtime</strong>
-              <span>{intelligence?.runtime ?? "n/a"}</span>
-            </div>
-          </div>
-
-          {repoAnswer?.answer ? (
-            <div className={styles.answerBox}>
-              <h3>Repo summary</h3>
-              <p>{repoAnswer.answer}</p>
-              <p className={styles.hint}>
-                Confidence: {formatConfidence(repoAnswer.confidence)}
-              </p>
-            </div>
-          ) : null}
-        </section>
-      ) : null}
-
-      {runResult ? (
-        <section className={styles.panel}>
-          <h2>3) Run status</h2>
-          <div className={styles.grid}>
-            <div className={styles.tile}>
-              <strong>Execution ID</strong>
-              <code>{runResult.execution_id ?? "n/a"}</code>
-            </div>
-            <div className={styles.tile}>
-              <strong>Workspace ID</strong>
-              <code>{runResult.workspace_id ?? "n/a"}</code>
-            </div>
-            <div className={styles.tile}>
-              <strong>Status</strong>
-              <span>{runResult.status ?? "starting"}</span>
-            </div>
-            <div className={styles.tile}>
-              <strong>Workspace URL</strong>
-              {runResult.workspace_url ? (
-                <a
-                  href={runResult.workspace_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  aria-label="Open workspace in a new tab"
-                >
-                  Open workspace
-                </a>
-              ) : (
-                <span>pending</span>
-              )}
-            </div>
-          </div>
-        </section>
-      ) : null}
-
-      <section className={styles.footerInfo}>
-        <p>
-          API base: <code>{API_BASE_URL}</code>
-        </p>
-        <p>
-          Health check: <a href="/api/health">/api/health</a>
-        </p>
       </section>
     </main>
   );

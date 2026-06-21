@@ -1,34 +1,147 @@
 .page {
   min-height: 100vh;
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 2rem 1rem 3rem;
+  padding: 1rem;
   display: grid;
+  grid-template-columns: 270px minmax(0, 420px) minmax(0, 1fr);
   gap: 1rem;
   color: #0f172a;
+  background: #f8fafc;
 }
 
-.hero,
+.sidebar,
+.listPane,
+.detailPane,
 .panel,
 .footerInfo,
-.errorPanel {
+.errorPanel,
+.emptyPanel {
   border: 1px solid #dbeafe;
-  border-radius: 0.85rem;
+  border-radius: 1rem;
   background: #ffffff;
+}
+
+.sidebar,
+.listPane,
+.detailPane {
   padding: 1rem;
 }
 
-.hero h1 {
-  font-size: 1.4rem;
-  margin-bottom: 0.4rem;
+.sidebar {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
 }
 
-.hero p {
+.profileCard {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.profileCard p {
+  margin-top: 0.2rem;
+  color: #64748b;
+}
+
+.avatar {
+  width: 2.8rem;
+  height: 2.8rem;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+.newMailButton {
+  border: 0;
+  border-radius: 0.75rem;
+  padding: 0.8rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  background: #0f172a;
+  color: #ffffff;
+}
+
+.newMailButton:disabled,
+.primaryButton:disabled,
+.secondaryButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.navSection {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.navHeading {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+}
+
+.navList {
+  list-style: none;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.navItem {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f8fafc;
+}
+
+.navItem strong {
   color: #334155;
 }
 
+.sidebarMeta {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 0.8rem;
+  color: #475569;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.sidebarMeta code {
+  word-break: break-all;
+}
+
+.listPane,
+.detailPane {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+}
+
+.paneHeader h1,
+.paneHeader h2 {
+  font-size: 1.15rem;
+}
+
+.paneHeader p {
+  margin-top: 0.25rem;
+  color: #64748b;
+}
+
+.panel,
+.footerInfo,
+.errorPanel,
+.emptyPanel {
+  padding: 1rem;
+}
+
 .panel h2 {
-  font-size: 1.1rem;
+  font-size: 1.05rem;
   margin-bottom: 0.75rem;
 }
 
@@ -81,15 +194,9 @@
   background: #0f766e;
 }
 
-.primaryButton:disabled,
-.secondaryButton:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 0.65rem;
 }
 
@@ -123,6 +230,24 @@
   margin-bottom: 0.4rem;
 }
 
+.emptyPanel {
+  min-height: 12rem;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  text-align: center;
+  gap: 0.5rem;
+}
+
+.emptyPanel h2 {
+  font-size: 1.6rem;
+}
+
+.emptyPanel p {
+  color: #64748b;
+  max-width: 28ch;
+}
+
 .errorPanel {
   border-color: #fecaca;
   background: #fff1f2;
@@ -131,26 +256,89 @@
 
 .footerInfo {
   color: #334155;
+  display: grid;
+  gap: 0.35rem;
+}
+
+@media (max-width: 1200px) {
+  .page {
+    grid-template-columns: 250px minmax(0, 1fr);
+  }
+
+  .detailPane {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 860px) {
+  .page {
+    grid-template-columns: 1fr;
+    padding: 0.75rem;
+  }
+
+  .sidebar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+    gap: 0.75rem;
+  }
+
+  .profileCard,
+  .newMailButton,
+  .navSection,
+  .sidebarMeta {
+    grid-column: 1 / -1;
+  }
+
+  .emptyPanel {
+    min-height: 9rem;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
   .page {
     color: #e2e8f0;
+    background: #030712;
   }
 
-  .hero,
+  .sidebar,
+  .listPane,
+  .detailPane,
   .panel,
   .footerInfo,
-  .errorPanel {
+  .errorPanel,
+  .emptyPanel {
     border-color: #334155;
     background: #111827;
   }
 
-  .hero p,
+  .profileCard p,
+  .paneHeader p,
   .hint,
   .tile strong,
-  .footerInfo {
+  .footerInfo,
+  .sidebarMeta,
+  .emptyPanel p,
+  .navHeading {
     color: #cbd5e1;
+  }
+
+  .avatar {
+    background: #1e3a8a;
+    color: #dbeafe;
+  }
+
+  .navItem {
+    border-color: #334155;
+    background: #0f172a;
+  }
+
+  .navItem strong {
+    color: #cbd5e1;
+  }
+
+  .sidebarMeta,
+  .answerBox {
+    border-top-color: #334155;
   }
 
   .input {
@@ -164,8 +352,8 @@
     background: #0f172a;
   }
 
-  .answerBox {
-    border-top-color: #334155;
+  .newMailButton {
+    background: #1e293b;
   }
 
   .errorPanel {
