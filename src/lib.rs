@@ -7554,15 +7554,41 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         analysis,
         &expected_failures,
     );
-    let execution_specification = preparation::execution_spec_builder::build_execution_spec(
-        analysis,
-        &existing_configuration_files,
-        &ci_files,
-        &environment_graph,
-        &expected_failures,
-    );
-    let portable_execution_toml =
-        preparation::synthesis_engine::portable_execution_toml(&execution_specification);
+    let discovered_execution_spec =
+        discover_execution_specification(root, analysis, &existing_dependency_files, &environment_graph);
+    let should_fallback_to_derivation = discovered_execution_spec
+        .as_ref()
+        .is_none_or(|spec| spec.decision == "repair");
+    let derived_execution_specification = should_fallback_to_derivation.then(|| {
+        preparation::execution_spec_builder::build_execution_spec(
+            analysis,
+            &existing_configuration_files,
+            &ci_files,
+            &environment_graph,
+            &expected_failures,
+        )
+    });
+    let execution_specification = discovered_execution_spec
+        .as_ref()
+        .and_then(|spec| (!should_fallback_to_derivation).then(|| spec.execution_specification.clone()))
+        .unwrap_or_else(|| {
+            serde_json::to_value(
+                derived_execution_specification
+                    .as_ref()
+                    .expect("derived execution specification"),
+            )
+            .expect("serialize derived execution specification")
+        });
+    let portable_execution_toml = discovered_execution_spec
+        .as_ref()
+        .and_then(|spec| (!should_fallback_to_derivation).then(|| spec.portable_execution_toml.clone()))
+        .unwrap_or_else(|| {
+            preparation::synthesis_engine::portable_execution_toml(
+                derived_execution_specification
+                    .as_ref()
+                    .expect("derived execution specification"),
+            )
+        });
 
     json!({
         "pipeline": [
@@ -7582,6 +7608,15 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             "pre-healing",
             "simulation",
             "execution-plan"
+        ],
+        "analyzer_pipeline": [
+            "specification-discovery",
+            "schema-validation",
+            "capability-validation",
+            "dependency-validation",
+            "environment-validation",
+            "repair",
+            "execution"
         ],
         "discovery": {
             "environment_files": existing_environment_files,
@@ -7603,9 +7638,252 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         },
         "pre_healing": pre_healing_actions(&expected_failures),
         "environment_confidence": environment_confidence,
+        "execution_specification_discovery": discovered_execution_spec
+            .as_ref()
+            .map(|spec| spec.discovery_payload.clone())
+            .unwrap_or_else(|| {
+                json!({
+                    "search_order": EXECUTION_SPEC_SEARCH_ORDER,
+                    "source": "derived",
+                    "trust_level": "derived_from_repository",
+                    "trust_score": 60,
+                    "decision": "regenerate",
+                    "found": false,
+                    "used_fallback_derivation": true
+                })
+            }),
         "execution_specification": execution_specification,
         "portable_execution_toml": portable_execution_toml
     })
+}
+
+const EXECUTION_SPEC_SEARCH_ORDER: [&str; 6] = [
+    "execution.toml",
+    "execution.json",
+    ".execution/",
+    "ddockit.toml",
+    ".well-known/execution.toml",
+    "oci-wasi-metadata",
+];
+
+#[derive(Debug, Clone)]
+struct DiscoveredExecutionSpecification {
+    execution_specification: Value,
+    portable_execution_toml: String,
+    discovery_payload: Value,
+    decision: &'static str,
+}
+
+fn discover_execution_specification(
+    root: &Path,
+    analysis: &RepositoryAnalysis,
+    dependency_files: &[String],
+    environment_graph: &[Value],
+) -> Option<DiscoveredExecutionSpecification> {
+    let candidate = discover_execution_spec_candidate(root)?;
+    let validation = validate_discovered_spec(&candidate, analysis, dependency_files, environment_graph);
+    let (trust_score, trust_level) = trust_score_for_discovered_spec(&candidate);
+    let decision = if validation.overall_valid {
+        if trust_score >= 85 {
+            "use"
+        } else {
+            "validate"
+        }
+    } else {
+        "repair"
+    };
+
+    Some(DiscoveredExecutionSpecification {
+        execution_specification: candidate.specification,
+        portable_execution_toml: candidate.portable_execution_toml,
+        discovery_payload: json!({
+            "search_order": EXECUTION_SPEC_SEARCH_ORDER,
+            "source": candidate.source,
+            "path": candidate.path,
+            "found": true,
+            "trust_level": trust_level,
+            "trust_score": trust_score,
+            "decision": decision,
+            "used_fallback_derivation": decision == "repair",
+            "validation": {
+                "schema": validation.schema_valid,
+                "capability": validation.capability_valid,
+                "dependency": validation.dependency_valid,
+                "environment": validation.environment_valid,
+                "overall": validation.overall_valid
+            }
+        }),
+        decision,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionSpecDiscoveryCandidate {
+    source: &'static str,
+    path: String,
+    specification: Value,
+    portable_execution_toml: String,
+    validation_hint: String,
+}
+
+fn discover_execution_spec_candidate(root: &Path) -> Option<ExecutionSpecDiscoveryCandidate> {
+    read_execution_spec_candidate(root, "execution.toml", "execution_toml")
+        .or_else(|| read_execution_spec_candidate(root, "execution.json", "execution_json"))
+        .or_else(|| discover_dot_execution_spec_candidate(root))
+        .or_else(|| read_execution_spec_candidate(root, "ddockit.toml", "ddockit_toml"))
+        .or_else(|| {
+            read_execution_spec_candidate(
+                root,
+                ".well-known/execution.toml",
+                "well_known_execution_toml",
+            )
+        })
+        .or_else(|| discover_oci_wasi_metadata_candidate(root))
+}
+
+fn discover_dot_execution_spec_candidate(root: &Path) -> Option<ExecutionSpecDiscoveryCandidate> {
+    let dot_execution = root.join(".execution");
+    if !dot_execution.is_dir() {
+        return None;
+    }
+
+    read_execution_spec_candidate(root, ".execution/execution.toml", "dot_execution_directory")
+        .or_else(|| {
+            read_execution_spec_candidate(root, ".execution/execution.json", "dot_execution_directory")
+        })
+        .or_else(|| {
+            let mut candidates = fs::read_dir(dot_execution)
+                .ok()?
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+                    (extension == "toml" || extension == "json").then_some(path)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            let first = candidates.first()?;
+            let relative = first
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            read_execution_spec_candidate(root, &relative, "dot_execution_directory")
+        })
+}
+
+fn discover_oci_wasi_metadata_candidate(root: &Path) -> Option<ExecutionSpecDiscoveryCandidate> {
+    let metadata_candidates = [
+        "runtime.graph.json",
+        "execution.lock",
+        "wasi-runtime.json",
+        "oci-layout",
+    ];
+    let found = discover_existing_files(root, &metadata_candidates);
+    if found.is_empty() {
+        return None;
+    }
+    Some(ExecutionSpecDiscoveryCandidate {
+        source: "oci_wasi_metadata",
+        path: found.join(","),
+        specification: json!({
+            "format": "metadata",
+            "metadata_files": found
+        }),
+        portable_execution_toml: "# sourced from OCI/WASI metadata\n".to_string(),
+        validation_hint: "metadata".to_string(),
+    })
+}
+
+fn read_execution_spec_candidate(
+    root: &Path,
+    relative_path: &str,
+    source: &'static str,
+) -> Option<ExecutionSpecDiscoveryCandidate> {
+    let absolute_path = root.join(relative_path);
+    let content = fs::read_to_string(absolute_path).ok()?;
+    if relative_path.ends_with(".json") {
+        let parsed = serde_json::from_str::<Value>(&content).ok()?;
+        Some(ExecutionSpecDiscoveryCandidate {
+            source,
+            path: relative_path.to_string(),
+            specification: parsed,
+            portable_execution_toml: format!("# sourced from {relative_path}\n"),
+            validation_hint: content,
+        })
+    } else {
+        Some(ExecutionSpecDiscoveryCandidate {
+            source,
+            path: relative_path.to_string(),
+            specification: json!({
+                "format": "toml",
+                "path": relative_path,
+                "raw": content
+            }),
+            portable_execution_toml: content.clone(),
+            validation_hint: content,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiscoveredSpecValidation {
+    schema_valid: bool,
+    capability_valid: bool,
+    dependency_valid: bool,
+    environment_valid: bool,
+    overall_valid: bool,
+}
+
+fn validate_discovered_spec(
+    candidate: &ExecutionSpecDiscoveryCandidate,
+    analysis: &RepositoryAnalysis,
+    dependency_files: &[String],
+    environment_graph: &[Value],
+) -> DiscoveredSpecValidation {
+    let hint = candidate.validation_hint.to_ascii_lowercase();
+    let has_runtime_marker = hint.contains("[runtime]") || hint.contains("\"runtime\"");
+    let has_version_marker = hint.contains("version") || hint.contains("\"schema_version\"");
+    let schema_valid = candidate.source == "oci_wasi_metadata"
+        || (has_runtime_marker && has_version_marker);
+    let capability_valid = analysis
+        .compiled_runtime
+        .wasi_component_graph
+        .capabilities
+        .needs
+        .is_empty()
+        || hint.contains("capabilities");
+    let dependency_valid = !dependency_files.is_empty() || hint.contains("dependencies");
+    let environment_valid = environment_graph.is_empty()
+        || hint.contains("environment")
+        || hint.contains("[environment]");
+    let overall_valid = schema_valid && capability_valid && dependency_valid && environment_valid;
+    DiscoveredSpecValidation {
+        schema_valid,
+        capability_valid,
+        dependency_valid,
+        environment_valid,
+        overall_valid,
+    }
+}
+
+fn trust_score_for_discovered_spec(candidate: &ExecutionSpecDiscoveryCandidate) -> (u8, &'static str) {
+    let hint = candidate.validation_hint.to_ascii_lowercase();
+    if hint.contains("ddockit_signature = \"verified\"")
+        || hint.contains("\"ddockit_signature\":\"verified\"")
+    {
+        return (100, "verified_ddockit_signed");
+    }
+    if hint.contains("maintainer_signature") {
+        return (95, "repository_maintainer_signed");
+    }
+    if candidate.source == "well_known_execution_toml" || candidate.source == "oci_wasi_metadata" {
+        return (90, "published_release_artifact");
+    }
+    if candidate.path == "ddockit.toml" || hint.contains("generated_by = \"ddockit\"") {
+        return (85, "generated_by_ddockit");
+    }
+    (70, "user_modified")
 }
 
 fn discover_existing_files(root: &Path, candidates: &[&str]) -> Vec<String> {
@@ -21096,6 +21374,69 @@ services:
             .and_then(|confidence| confidence.get("expected_success"))
             .and_then(Value::as_u64)
             .is_some());
+    }
+
+    #[test]
+    fn preflight_intelligence_prefers_discovered_execution_specification_before_deriving() {
+        let repo = temp_dir("preflight-intelligence-discovery");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"14.2.0"},"scripts":{"dev":"next dev","build":"next build"}}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            repo.join("execution.toml"),
+            r#"version = "1"
+[runtime]
+language = "typescript"
+[environment]
+NODE_ENV = "development"
+[capabilities]
+all = ["network"]
+"#,
+        )
+        .expect("write execution.toml");
+        fs::write(
+            repo.join("execution.json"),
+            r#"{"version":"1","runtime":{"language":"javascript"}}"#,
+        )
+        .expect("write execution.json");
+
+        let analysis = analyze_repository(&repo).expect("analyze repo");
+        let (_, analyze_body) = repositories_analyze_endpoint(
+            &RepositoryAnalyzeRequest {
+                repo_url: "https://github.com/example/preflight-discovery".to_string(),
+            },
+            &analysis,
+        );
+        let payload: Value = serde_json::from_str(&analyze_body).expect("parse analyze payload");
+        let preflight = payload
+            .get("preflight")
+            .and_then(Value::as_object)
+            .expect("preflight payload");
+
+        let discovery = preflight
+            .get("execution_specification_discovery")
+            .and_then(Value::as_object)
+            .expect("discovery payload");
+        assert_eq!(
+            discovery.get("path").and_then(Value::as_str),
+            Some("execution.toml")
+        );
+        assert_eq!(
+            discovery.get("decision").and_then(Value::as_str),
+            Some("validate")
+        );
+        assert_eq!(
+            discovery
+                .get("used_fallback_derivation")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(preflight
+            .get("portable_execution_toml")
+            .and_then(Value::as_str)
+            .is_some_and(|toml| toml.contains("[runtime]")));
     }
 
     #[test]
