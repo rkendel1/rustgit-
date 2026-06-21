@@ -9,6 +9,7 @@ A Rust foundation for a Gitpod-compatible WebAssembly workspace runtime.
 - Execution router + provider model (`ExecutionRouter`, `ExecutionProvider`) for WASM/native/static substrates
 - Execution substrate foundation (`WasmRuntimeEngine`, `NativeRuntimeEngine`, `HybridExecutionBridge`) for concrete runtime dispatch
 - WASI Component Model execution fabric (`WasiComponentGraph`, `WasiLinker`) compiled from repository intelligence
+- Distributed WASI Execution Mesh (`ExecutionMesh`, `MeshScheduler`, `MeshExecutionRouter`) for cross-node component placement and healing
 - Virtual filesystem with snapshot + restore
 - Network policy and resource quota structures for sandbox controls
 - REST API route surface definition (`RestApiSpec`)

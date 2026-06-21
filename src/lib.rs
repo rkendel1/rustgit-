@@ -4628,6 +4628,398 @@ impl DistributedScheduler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshTopology {
+    #[default]
+    HubAndSpoke,
+    Regional,
+    PeerToPeer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshNodeType {
+    #[default]
+    Local,
+    Cloud,
+    Edge,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshNodeTrustLevel {
+    #[default]
+    FullAccess,
+    Sandboxed,
+    RestrictedIo,
+    SignedExecutionOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MeshNode {
+    pub id: String,
+    pub node_type: MeshNodeType,
+    pub trust_level: MeshNodeTrustLevel,
+    pub capabilities: WorkerCapabilities,
+    pub status: WorkerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComponentPlacementConstraints {
+    pub cpu: u32,
+    pub memory_mb: u64,
+    pub network: bool,
+    pub filesystem: bool,
+    pub latency_sensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ComponentPlacement {
+    pub component_id: String,
+    pub preferred_node_type: MeshNodeType,
+    pub constraints: ComponentPlacementConstraints,
+    pub affinity_rules: Vec<String>,
+    pub fallback_nodes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MeshExecutionPartition {
+    pub node_id: String,
+    pub components: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DistributedWasiExecutionGraph {
+    pub placements: Vec<ComponentPlacement>,
+    pub partitions: Vec<MeshExecutionPartition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeshScheduler;
+
+impl MeshScheduler {
+    pub fn plan(
+        &self,
+        wasi_graph: &WasiComponentGraph,
+        nodes: &[MeshNode],
+    ) -> DistributedWasiExecutionGraph {
+        let router = MeshExecutionRouter;
+        let mut placements = Vec::new();
+        let mut by_node: HashMap<String, Vec<String>> = HashMap::new();
+
+        for component in &wasi_graph.components {
+            let preferred_node_type = Self::preferred_node_type(component);
+            let constraints = Self::constraints_for(component);
+            let fallback_nodes =
+                router.candidate_nodes(preferred_node_type, &constraints, nodes);
+            let placement = ComponentPlacement {
+                component_id: component.id.clone(),
+                preferred_node_type,
+                constraints,
+                affinity_rules: vec![format!("component:{}:affinity", component.id)],
+                fallback_nodes,
+            };
+            if let Some(node_id) = router.route(&placement, nodes) {
+                by_node
+                    .entry(node_id)
+                    .or_default()
+                    .push(component.id.clone());
+            }
+            placements.push(placement);
+        }
+
+        let mut node_ids = by_node.keys().cloned().collect::<Vec<_>>();
+        node_ids.sort();
+        let partitions = node_ids
+            .into_iter()
+            .map(|node_id| MeshExecutionPartition {
+                components: by_node.remove(&node_id).unwrap_or_default(),
+                node_id,
+            })
+            .collect::<Vec<_>>();
+
+        DistributedWasiExecutionGraph {
+            placements,
+            partitions,
+        }
+    }
+
+    fn preferred_node_type(component: &WasiComponent) -> MeshNodeType {
+        let capabilities = component
+            .capabilities
+            .iter()
+            .map(|capability| capability.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+
+        if capabilities
+            .iter()
+            .any(|capability| capability.contains("serve") || capability.contains("preview"))
+        {
+            MeshNodeType::Edge
+        } else if capabilities.iter().any(|capability| {
+            capability.contains("build")
+                || capability.contains("install")
+                || capability.contains("compile")
+                || capability.contains("package_manager")
+        }) {
+            MeshNodeType::Cloud
+        } else if capabilities
+            .iter()
+            .any(|capability| capability.contains("peer"))
+        {
+            MeshNodeType::Peer
+        } else {
+            MeshNodeType::Local
+        }
+    }
+
+    fn constraints_for(component: &WasiComponent) -> ComponentPlacementConstraints {
+        let capabilities = component
+            .capabilities
+            .iter()
+            .map(|capability| capability.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        ComponentPlacementConstraints {
+            cpu: if capabilities.iter().any(|capability| {
+                capability.contains("build")
+                    || capability.contains("compile")
+                    || capability.contains("test")
+            }) {
+                2
+            } else {
+                1
+            },
+            memory_mb: if capabilities
+                .iter()
+                .any(|capability| capability.contains("build") || capability.contains("compile"))
+            {
+                1024
+            } else {
+                256
+            },
+            network: capabilities
+                .iter()
+                .any(|capability| capability.contains("network") || capability.contains("http")),
+            filesystem: capabilities
+                .iter()
+                .any(|capability| capability.contains("filesystem") || capability.contains("build")),
+            latency_sensitive: capabilities
+                .iter()
+                .any(|capability| capability.contains("latency") || capability.contains("serve")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeshExecutionRouter;
+
+impl MeshExecutionRouter {
+    pub fn route(&self, placement: &ComponentPlacement, nodes: &[MeshNode]) -> Option<String> {
+        self.candidate_nodes(placement.preferred_node_type, &placement.constraints, nodes)
+            .into_iter()
+            .next()
+    }
+
+    pub fn rebalance(&self, placements: &mut [ComponentPlacement], nodes: &[MeshNode]) {
+        for placement in placements {
+            placement.fallback_nodes =
+                self.candidate_nodes(placement.preferred_node_type, &placement.constraints, nodes);
+        }
+    }
+
+    pub fn migrate(
+        &self,
+        component_id: &str,
+        placements: &mut [ComponentPlacement],
+        target_node: &str,
+    ) -> bool {
+        let Some(placement) = placements
+            .iter_mut()
+            .find(|placement| placement.component_id == component_id)
+        else {
+            return false;
+        };
+        placement
+            .fallback_nodes
+            .retain(|node_id| node_id != target_node);
+        placement.fallback_nodes.insert(0, target_node.to_string());
+        true
+    }
+
+    pub fn replicate(
+        &self,
+        component_id: &str,
+        placements: &[ComponentPlacement],
+        replicas: usize,
+    ) -> Vec<String> {
+        placements
+            .iter()
+            .find(|placement| placement.component_id == component_id)
+            .map(|placement| {
+                placement
+                    .fallback_nodes
+                    .iter()
+                    .take(replicas)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn candidate_nodes(
+        &self,
+        preferred_node_type: MeshNodeType,
+        constraints: &ComponentPlacementConstraints,
+        nodes: &[MeshNode],
+    ) -> Vec<String> {
+        let mut candidates = nodes
+            .iter()
+            .filter(|node| matches!(node.status, WorkerStatus::Ready | WorkerStatus::Busy))
+            .filter(|node| node.capabilities.wasm)
+            .filter(|node| node.capabilities.cpu_cores >= constraints.cpu)
+            .filter(|node| node.capabilities.memory_mb >= constraints.memory_mb)
+            .filter(|node| {
+                !constraints.network
+                    || node
+                        .capabilities
+                        .labels
+                        .iter()
+                        .any(|label| label == "network")
+            })
+            .filter(|node| {
+                !constraints.filesystem
+                    || node
+                        .capabilities
+                        .labels
+                        .iter()
+                        .any(|label| label == "filesystem")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(|a, b| {
+            let a_preferred = a.node_type == preferred_node_type;
+            let b_preferred = b.node_type == preferred_node_type;
+            b_preferred
+                .cmp(&a_preferred)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        candidates.into_iter().map(|node| node.id).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StateSyncMode {
+    Eager,
+    Lazy,
+    #[default]
+    Eventual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StateSynchronizer {
+    pub sync_modes: HashMap<String, StateSyncMode>,
+    pub revisions: HashMap<String, u64>,
+}
+
+impl StateSynchronizer {
+    pub fn set_mode(&mut self, component_id: impl Into<String>, mode: StateSyncMode) {
+        self.sync_modes.insert(component_id.into(), mode);
+    }
+
+    pub fn mode_for(&self, component_id: &str) -> StateSyncMode {
+        self.sync_modes
+            .get(component_id)
+            .copied()
+            .unwrap_or(StateSyncMode::Eventual)
+    }
+
+    pub fn record_sync(&mut self, component_id: impl Into<String>, revision: u64) {
+        self.revisions.insert(component_id.into(), revision);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshFailureClass {
+    NodeUnavailable,
+    ComponentCrash,
+    StateDivergence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureEvent {
+    pub component_id: String,
+    pub node_id: String,
+    pub class: MeshFailureClass,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FailureDetector {
+    pub events: Vec<FailureEvent>,
+}
+
+impl FailureDetector {
+    pub fn record(&mut self, event: FailureEvent) {
+        self.events.push(event);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionMesh {
+    pub nodes: Vec<MeshNode>,
+    pub topology: MeshTopology,
+    pub scheduler: MeshScheduler,
+    pub router: MeshExecutionRouter,
+    pub state_sync: StateSynchronizer,
+    pub failure_detector: FailureDetector,
+}
+
+impl Default for ExecutionMesh {
+    fn default() -> Self {
+        Self {
+            nodes: vec![],
+            topology: MeshTopology::default(),
+            scheduler: MeshScheduler,
+            router: MeshExecutionRouter,
+            state_sync: StateSynchronizer::default(),
+            failure_detector: FailureDetector::default(),
+        }
+    }
+}
+
+impl ExecutionMesh {
+    pub fn plan(&self, graph: &WasiComponentGraph) -> DistributedWasiExecutionGraph {
+        self.scheduler.plan(graph, &self.nodes)
+    }
+
+    pub fn heal_component(
+        &mut self,
+        placements: &mut [ComponentPlacement],
+        component_id: &str,
+        failed_node_id: &str,
+        class: MeshFailureClass,
+        timestamp: u64,
+    ) -> Option<String> {
+        self.failure_detector.record(FailureEvent {
+            component_id: component_id.to_string(),
+            node_id: failed_node_id.to_string(),
+            class,
+            timestamp,
+        });
+        let placement = placements
+            .iter()
+            .find(|placement| placement.component_id == component_id)?;
+        let target = placement
+            .fallback_nodes
+            .iter()
+            .find(|node_id| node_id.as_str() != failed_node_id)
+            .cloned()?;
+        self.router
+            .migrate(component_id, placements, &target)
+            .then_some(target)
+    }
+}
+
 fn worker_is_usable(worker: &WorkerNode) -> bool {
     matches!(worker.status, WorkerStatus::Ready | WorkerStatus::Busy)
 }
@@ -18006,6 +18398,185 @@ dependencies:
             &policy,
         );
         assert_eq!(anonymous, ExecutionTier::ExternalProvider);
+    }
+
+    #[test]
+    fn mesh_scheduler_places_wasi_components_across_node_types() {
+        let graph = WasiComponentGraph {
+            components: vec![
+                WasiComponent {
+                    id: "build".to_string(),
+                    capabilities: vec!["build.compute".to_string(), "filesystem".to_string()],
+                    ..WasiComponent::default()
+                },
+                WasiComponent {
+                    id: "serve".to_string(),
+                    capabilities: vec!["http.serve".to_string(), "latency.sensitive".to_string()],
+                    ..WasiComponent::default()
+                },
+            ],
+            ..WasiComponentGraph::default()
+        };
+        let nodes = vec![
+            MeshNode {
+                id: "local-1".to_string(),
+                node_type: MeshNodeType::Local,
+                trust_level: MeshNodeTrustLevel::FullAccess,
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["filesystem".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            MeshNode {
+                id: "cloud-1".to_string(),
+                node_type: MeshNodeType::Cloud,
+                trust_level: MeshNodeTrustLevel::Sandboxed,
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 8,
+                    memory_mb: 8192,
+                    labels: vec!["filesystem".to_string(), "network".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            MeshNode {
+                id: "edge-1".to_string(),
+                node_type: MeshNodeType::Edge,
+                trust_level: MeshNodeTrustLevel::RestrictedIo,
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: false,
+                    cpu_cores: 4,
+                    memory_mb: 2048,
+                    labels: vec!["network".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+
+        let planned = MeshScheduler.plan(&graph, &nodes);
+        let build = planned
+            .placements
+            .iter()
+            .find(|placement| placement.component_id == "build")
+            .expect("build placement");
+        let serve = planned
+            .placements
+            .iter()
+            .find(|placement| placement.component_id == "serve")
+            .expect("serve placement");
+
+        assert_eq!(build.preferred_node_type, MeshNodeType::Cloud);
+        assert_eq!(serve.preferred_node_type, MeshNodeType::Edge);
+        assert_eq!(build.fallback_nodes.first().map(String::as_str), Some("cloud-1"));
+        assert_eq!(serve.fallback_nodes.first().map(String::as_str), Some("edge-1"));
+        assert!(planned
+            .partitions
+            .iter()
+            .any(|partition| partition.node_id == "cloud-1"));
+        assert!(planned
+            .partitions
+            .iter()
+            .any(|partition| partition.node_id == "edge-1"));
+    }
+
+    #[test]
+    fn mesh_router_supports_migration_and_replication() {
+        let router = MeshExecutionRouter;
+        let mut placements = vec![ComponentPlacement {
+            component_id: "install".to_string(),
+            preferred_node_type: MeshNodeType::Cloud,
+            constraints: ComponentPlacementConstraints {
+                cpu: 2,
+                memory_mb: 1024,
+                network: true,
+                filesystem: true,
+                latency_sensitive: false,
+            },
+            affinity_rules: vec![],
+            fallback_nodes: vec![
+                "cloud-1".to_string(),
+                "edge-1".to_string(),
+                "local-1".to_string(),
+            ],
+        }];
+
+        assert!(router.migrate("install", &mut placements, "edge-1"));
+        assert_eq!(
+            placements[0].fallback_nodes.first().map(String::as_str),
+            Some("edge-1")
+        );
+        assert_eq!(
+            router.replicate("install", &placements, 2),
+            vec!["edge-1".to_string(), "cloud-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn execution_mesh_heals_failed_components_with_fallback_node() {
+        let mut mesh = ExecutionMesh::default();
+        mesh.nodes = vec![
+            MeshNode {
+                id: "cloud-1".to_string(),
+                node_type: MeshNodeType::Cloud,
+                trust_level: MeshNodeTrustLevel::Sandboxed,
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 4,
+                    memory_mb: 4096,
+                    labels: vec!["filesystem".to_string(), "network".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+            MeshNode {
+                id: "edge-1".to_string(),
+                node_type: MeshNodeType::Edge,
+                trust_level: MeshNodeTrustLevel::RestrictedIo,
+                capabilities: WorkerCapabilities {
+                    wasm: true,
+                    native: true,
+                    cpu_cores: 2,
+                    memory_mb: 2048,
+                    labels: vec!["network".to_string()],
+                },
+                status: WorkerStatus::Ready,
+            },
+        ];
+
+        let mut placements = vec![ComponentPlacement {
+            component_id: "serve".to_string(),
+            preferred_node_type: MeshNodeType::Edge,
+            constraints: ComponentPlacementConstraints {
+                cpu: 1,
+                memory_mb: 256,
+                network: true,
+                filesystem: false,
+                latency_sensitive: true,
+            },
+            affinity_rules: vec![],
+            fallback_nodes: vec!["edge-1".to_string(), "cloud-1".to_string()],
+        }];
+
+        let moved_to = mesh.heal_component(
+            &mut placements,
+            "serve",
+            "edge-1",
+            MeshFailureClass::NodeUnavailable,
+            42,
+        );
+        assert_eq!(moved_to.as_deref(), Some("cloud-1"));
+        assert_eq!(
+            placements[0].fallback_nodes.first().map(String::as_str),
+            Some("cloud-1")
+        );
+        assert_eq!(mesh.failure_detector.events.len(), 1);
+        assert_eq!(mesh.failure_detector.events[0].component_id, "serve");
     }
 
     #[test]
