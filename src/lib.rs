@@ -7578,8 +7578,8 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             "capability-discovery",
             "configuration-discovery",
             "secrets-discovery",
-            "pre-healing",
             "validation",
+            "pre-healing",
             "simulation",
             "execution-plan"
         ],
