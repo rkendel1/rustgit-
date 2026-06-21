@@ -244,6 +244,20 @@ async fn analyze_repository(
         .trim()
         .to_string();
     let requested_commit = body.commit.unwrap_or_default().trim().to_string();
+    let request_cache_commit = if requested_commit.is_empty() {
+        "latest".to_string()
+    } else {
+        requested_commit.clone()
+    };
+    let request_cache_key = AnalyzeCache::key(&repo_url, &branch, &request_cache_commit);
+
+    if let Some(cached) = state.analyze_cache.get(&request_cache_key) {
+        let mut payload = cached.payload;
+        payload["cached"] = json!(true);
+        payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        return Ok((StatusCode::OK, Json(payload)));
+    }
+
     let repo_root = prepare_repository_for_analysis(&repo_url, &branch, &requested_commit)
         .map_err(err_response)?;
     let resolved_commit = resolve_repository_commit(&repo_root).unwrap_or_else(|| {
@@ -253,9 +267,9 @@ async fn analyze_repository(
             requested_commit.clone()
         }
     });
-    let cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit);
+    let resolved_cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit);
 
-    if let Some(cached) = state.analyze_cache.get(&cache_key) {
+    if let Some(cached) = state.analyze_cache.get(&resolved_cache_key) {
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
@@ -271,7 +285,12 @@ async fn analyze_repository(
     let mut payload = result.payload;
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-    state.analyze_cache.put(cache_key, payload.clone());
+    state
+        .analyze_cache
+        .put(resolved_cache_key.clone(), payload.clone());
+    if request_cache_key != resolved_cache_key {
+        state.analyze_cache.put(request_cache_key, payload.clone());
+    }
     Ok((StatusCode::OK, Json(payload)))
 }
 
@@ -681,5 +700,50 @@ mod tests {
         let second_payload: serde_json::Value =
             serde_json::from_slice(&second_body).expect("second json");
         assert_eq!(second_payload["cached"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn analyze_route_uses_latest_alias_cache_without_preparing_repository() {
+        let state = test_state();
+        let repo_url = "https://github.com/example/slow-repo.git";
+        let cache_key = super::AnalyzeCache::key(repo_url, "main", "latest");
+        state.analyze_cache.put(
+            cache_key,
+            serde_json::json!({
+                "repo": repo_url,
+                "runtime": { "language": "typescript", "packageManager": "pnpm", "framework": "nextjs" },
+                "execution": { "preferredProvider": "browser-wasm", "fallback": ["fly", "docker", "codespaces"] },
+                "manifest": { "version": 1, "path": ".ddockit/manifest.json" },
+                "confidence": 98,
+                "cached": false,
+                "durationMs": 0
+            }),
+        );
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/analyze")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repo_url": repo_url,
+                            "branch": "main"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["cached"].as_bool(), Some(true));
+        assert_eq!(payload["repo"].as_str(), Some(repo_url));
     }
 }
