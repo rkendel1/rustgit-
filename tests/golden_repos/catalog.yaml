@@ -225,6 +225,42 @@ repositories:
       startup_time: 28
       success_rate: 97.9
 
+  - id: new-vue-frontend
+    category: node
+    framework: vue
+    repo_url: https://github.com/rkendel1/new_vue.git
+    commit: 63965486e71ac45b2f603efd9a46733d207bccd5
+    execution_profile: vue
+    expected:
+      services: [frontend]
+      route_checks: [/]
+      startup_timeout_seconds: 240
+      health_expectation: healthy
+      browser_checks: ["Vue"]
+    certification:
+      last_verified: "2026-06-21"
+      framework: vue
+      startup_time: 1
+      success_rate: 100.0
+
+  - id: ddockit-browser-extension
+    category: special
+    framework: browser-extension
+    repo_url: https://github.com/rkendel1/rustgit
+    commit: 19e79db5d4034a1cd04aab96fe16e59bc75b72c9
+    execution_profile: github_overlay_extension
+    expected:
+      services: [frontend]
+      route_checks: [/api/v1/surfaces/extension/ui]
+      startup_timeout_seconds: 180
+      health_expectation: healthy
+      browser_checks: ["overlay_panel"]
+    certification:
+      last_verified: "2026-06-21"
+      framework: browser-extension
+      startup_time: 2
+      success_rate: 100.0
+
   - id: ddockit-golden-broken-head
     category: special
     framework: temporal-repository-execution
