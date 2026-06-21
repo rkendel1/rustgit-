@@ -201,11 +201,16 @@ export default function Home() {
         },
         body: JSON.stringify({ repo_url: parsedRepo.repoUrl }),
       };
-      const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
-      const analyzeResponse =
-        analyzeV1Response.status === 404
-          ? await fetch("/api/proxy/api/repositories/analyze", analyzeRequest)
-          : analyzeV1Response;
+      let analyzeResponse: Response;
+      try {
+        const analyzeV1Response = await fetch("/api/proxy/api/v1/repositories/analyze", analyzeRequest);
+        analyzeResponse =
+          analyzeV1Response.status === 404
+            ? await fetch("/api/proxy/api/repositories/analyze", analyzeRequest)
+            : analyzeV1Response;
+      } catch {
+        analyzeResponse = await fetch("/api/proxy/api/repositories/analyze", analyzeRequest);
+      }
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
