@@ -62,6 +62,9 @@ const RUNTIME_SPEC_DEFAULT_CPU_LIMIT_UNITS: u32 = 2_000;
 const UNINITIALIZED_RESOURCE_LIMIT: u32 = 0;
 const ENVIRONMENT_ID_PREFIX_LENGTH: usize = 12;
 const CPU_UNIT_TO_TIME_LIMIT_MS: u64 = 10;
+const DEFAULT_COMPONENT_VERSION: &str = "1.0.0";
+const RUNTIME_CONSTRAINT_MAX_MEMORY_MB: u32 = 16 * 1024;
+const RUNTIME_CONSTRAINT_MAX_CPU_UNITS: u32 = 100_000;
 const CACHE_KEY_NODE_MODE_SEPARATOR: &str = "@";
 const BYTES_PER_MB: u64 = 1024 * 1024;
 const SESSION_GRAPH_EVENT_BUFFER_LIMIT: usize = 1_024;
@@ -3602,7 +3605,7 @@ impl ComponentRegistry {
     pub fn register(&mut self, component: WasiComponent) {
         self.versioning
             .entry(component.id.clone())
-            .or_insert_with(|| "1.0.0".to_string());
+            .or_insert_with(|| DEFAULT_COMPONENT_VERSION.to_string());
         self.signatures
             .entry(component.id.clone())
             .or_insert_with(|| hash_key(&component.module));
@@ -3686,6 +3689,11 @@ impl CapabilityValidator {
         {
             return false;
         }
+        if graph.runtime_constraints.max_memory_mb > RUNTIME_CONSTRAINT_MAX_MEMORY_MB
+            || graph.runtime_constraints.max_cpu_units > RUNTIME_CONSTRAINT_MAX_CPU_UNITS
+        {
+            return false;
+        }
         let component_ids = graph
             .components
             .iter()
@@ -3737,6 +3745,20 @@ pub struct WasiComponentLoader {
 }
 
 impl WasiComponentLoader {
+    fn compute_cache_key(components: &[WasiComponent], imports: &[String], exports: &[String]) -> String {
+        hash_key(&format!(
+            "{}:{}",
+            hash_key(
+                &components
+                    .iter()
+                    .map(|component| format!("{}:{}", component.id, component.module))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
+            hash_key(&format!("{}:{}", imports.join("|"), exports.join("|")))
+        ))
+    }
+
     pub fn load_graph(
         &mut self,
         components: Vec<WasiComponent>,
@@ -3762,17 +3784,7 @@ impl WasiComponentLoader {
                     .map(move |export| format!("export:{}:{export}", component.id))
             })
             .collect::<Vec<_>>();
-        let cache_key = hash_key(&format!(
-            "{}:{}",
-            hash_key(
-                &components
-                    .iter()
-                    .map(|component| format!("{}:{}", component.id, component.module))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            ),
-            hash_key(&format!("{}:{}", imports.join("|"), exports.join("|")))
-        ));
+        let cache_key = Self::compute_cache_key(&components, &imports, &exports);
         if let Some(cached) = self.cache.get(cache_key.as_str()) {
             return cached;
         }
@@ -3789,6 +3801,8 @@ impl WasiComponentLoader {
         WasiLinker::optimize_graph(&mut graph);
         WasiLinker::enforce_security_model(&mut graph);
         if !self.validator.validate(&graph) {
+            // Keep loader output deterministic even when validation fails by
+            // returning a graph with explicit startup order and no bindings.
             graph.links.clear();
             graph.execution_plan = ExecutionPlan::default();
             graph.execution_plan.startup_order = graph
