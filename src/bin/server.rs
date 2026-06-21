@@ -252,7 +252,7 @@ async fn seed_launch(Path((owner, repo)): Path<(String, String)>) -> (StatusCode
     json_payload_response(payload)
 }
 
-fn with_workspace_routes(router: Router, prefix: &str) -> Router {
+fn with_workspace_routes(router: Router<SharedManager>, prefix: &str) -> Router<SharedManager> {
     router
         .route(&format!("{prefix}/workspaces"), post(launch_workspace))
         .route(&format!("{prefix}/workspaces/:id"), delete(stop_workspace))
@@ -280,7 +280,7 @@ fn cors_layer() -> CorsLayer {
 fn app(manager: SharedManager) -> Router {
     with_workspace_routes(
         with_workspace_routes(
-            with_workspace_routes(Router::new(), ""),
+            with_workspace_routes(Router::<SharedManager>::new(), ""),
             "/api/v1",
         ),
         "/api/proxy/api/v1",
