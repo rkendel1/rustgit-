@@ -18,6 +18,7 @@ mod execution_learning;
 mod execution_memory;
 mod execution_optimizer;
 mod execution_retriever;
+pub mod preparation;
 pub mod healing;
 mod postgres_db;
 mod repository_context_builder;
@@ -7553,19 +7554,34 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
         analysis,
         &expected_failures,
     );
+    let execution_specification = preparation::execution_spec_builder::build_execution_spec(
+        analysis,
+        &existing_configuration_files,
+        &ci_files,
+        &environment_graph,
+        &expected_failures,
+    );
+    let portable_execution_toml =
+        preparation::synthesis_engine::portable_execution_toml(&execution_specification);
 
     json!({
         "pipeline": [
             "repository-intelligence",
+            "execution-preparation",
+            "execution-specification",
+            "runtime-compiler",
+            "repository-discovery",
+            "runtime-discovery",
+            "service-discovery",
             "environment-discovery",
             "dependency-discovery",
+            "capability-discovery",
             "configuration-discovery",
             "secrets-discovery",
-            "capability-discovery",
-            "simulation",
+            "validation",
             "pre-healing",
-            "execution-plan",
-            "runtime-generation"
+            "simulation",
+            "execution-plan"
         ],
         "discovery": {
             "environment_files": existing_environment_files,
@@ -7586,7 +7602,9 @@ fn preflight_intelligence_payload(analysis: &RepositoryAnalysis) -> Value {
             "expected_failures": expected_failures
         },
         "pre_healing": pre_healing_actions(&expected_failures),
-        "environment_confidence": environment_confidence
+        "environment_confidence": environment_confidence,
+        "execution_specification": execution_specification,
+        "portable_execution_toml": portable_execution_toml
     })
 }
 
@@ -21031,8 +21049,28 @@ services:
                 .and_then(Value::as_array)
                 .expect("pipeline")
                 .len(),
-            10
+            16
         );
+        assert!(preflight
+            .get("pipeline")
+            .and_then(Value::as_array)
+            .expect("pipeline")
+            .iter()
+            .any(|entry| entry.as_str() == Some("execution-preparation")));
+        assert!(preflight
+            .get("pipeline")
+            .and_then(Value::as_array)
+            .expect("pipeline")
+            .iter()
+            .any(|entry| entry.as_str() == Some("execution-specification")));
+        assert!(preflight
+            .get("execution_specification")
+            .and_then(Value::as_object)
+            .is_some());
+        assert!(preflight
+            .get("portable_execution_toml")
+            .and_then(Value::as_str)
+            .is_some_and(|toml| toml.contains("[runtime]")));
         assert!(preflight
             .get("environment_graph")
             .and_then(Value::as_array)

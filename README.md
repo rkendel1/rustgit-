@@ -84,6 +84,7 @@ This badge updates automatically based on repository execution health.
 - Produces operator-facing summaries (execution score, healing score, runtime, last success, recommended actions).
 - Tracks evidence categories for answers (`file`, `execution`, `failure`, `repair`) so responses can be grounded in observed signals.
 - Discovers environment/dependency/configuration/CI files, synthesizes environment variable strategies, predicts likely failures, and emits pre-healing actions before execution.
+- Emits a canonical `execution_specification` object and portable `execution.toml` payload during preflight so runtime compilation can consume a deterministic execution contract.
 
 ### What we can currently determine
 
