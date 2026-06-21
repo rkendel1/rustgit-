@@ -16,6 +16,7 @@ const PORTAL_NAME = "RustGit Portal";
 const NO_REPOSITORY_SELECTED = "No repository selected";
 const DEFAULT_AVATAR_LETTER = "R";
 const EMPTY_STATE_HEADING = "It's empty here";
+const PORTAL_DEVICE_FINGERPRINT = "portal-home";
 const ANALYZE_V1_PATH = "/api/proxy/api/v1/repositories/analyze";
 const ANALYZE_LEGACY_PATH = "/api/proxy/api/repositories/analyze";
 const ANALYZE_EXECUTIONS_FALLBACK_PATH = "/api/proxy/api/v1/executions";
@@ -191,6 +192,13 @@ export default function Home() {
   const [intelligence, setIntelligence] = useState<RepositoryIntelligenceResponse | null>(null);
   const [repoAnswer, setRepoAnswer] = useState<RepositoryAskResponse | null>(null);
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
+  const anonymousIdentity = useMemo(
+    () => ({
+      anonUserId: createAnonymousId("anon-portal"),
+      anonSessionId: createAnonymousId("portal-session"),
+    }),
+    [],
+  );
 
   const parsedRepo = useMemo(() => parseRepositoryInput(repository), [repository]);
   const canAnalyze = Boolean(parsedRepo) && !analyzing;
@@ -254,9 +262,9 @@ export default function Home() {
         body: JSON.stringify({
           org_id: null,
           user_id: null,
-          anon_user_id: createAnonymousId("anon-portal"),
-          anon_session_id: createAnonymousId("portal-session"),
-          device_fingerprint: "portal-home",
+          anon_user_id: anonymousIdentity.anonUserId,
+          anon_session_id: anonymousIdentity.anonSessionId,
+          device_fingerprint: PORTAL_DEVICE_FINGERPRINT,
           repo_url: parsedRepo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
