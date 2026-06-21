@@ -56,20 +56,18 @@ async function proxyRequest(
   const requestBody =
     request.method === "GET" || request.method === "HEAD"
       ? undefined
-      : await request.text();
+      : await request.arrayBuffer();
 
   const sendUpstreamRequest = (url: URL) =>
     fetch(url, {
       method: request.method,
       headers: requestHeaders,
-      body: requestBody,
+      body: requestBody ? requestBody.slice(0) : undefined,
       cache: "no-store",
     });
 
   let upstreamResponse = await sendUpstreamRequest(upstreamUrl);
-  const canRetryWithProxyPrefix =
-    !joinedPath.startsWith("api/proxy/") &&
-    !request.nextUrl.pathname.startsWith("/api/proxy/api/proxy/");
+  const canRetryWithProxyPrefix = !joinedPath.startsWith("api/proxy/");
   if (upstreamResponse.status === 404 && canRetryWithProxyPrefix) {
     const proxiedUpstreamUrl = new URL(`${apiBaseUrl}/api/proxy/${joinedPath}`);
     request.nextUrl.searchParams.forEach((value, key) => {
