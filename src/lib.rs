@@ -3141,39 +3141,31 @@ impl WasiLinker {
         imports
             .iter()
             .filter_map(|import| {
-                let (import_component, import_capability) = import
-                    .trim_start_matches("import:")
-                    .split_once(':')
-                    .unwrap_or_default();
-                exports
-                    .iter()
-                    .find(|export| {
-                        export
-                            .trim_start_matches("export:")
-                            .split_once(':')
-                            .map(|(_, capability)| capability == import_capability)
-                            .unwrap_or(false)
-                    })
-                    .map(|export| WasiLink {
-                        from_component: export
-                            .trim_start_matches("export:")
-                            .split_once(':')
-                            .map(|(component, _)| component.to_string())
-                            .unwrap_or_default(),
-                        to_component: import_component.to_string(),
-                        capability: import_capability.to_string(),
-                    })
+                let (import_component, import_capability) =
+                    parse_link_entry("import:", import.as_str())?;
+                let (export_component, _) = exports.iter().find_map(|export| {
+                    let parsed = parse_link_entry("export:", export.as_str())?;
+                    (parsed.1 == import_capability).then_some(parsed)
+                })?;
+                Some(WasiLink {
+                    from_component: export_component.to_string(),
+                    to_component: import_component.to_string(),
+                    capability: import_capability.to_string(),
+                })
             })
             .collect()
     }
 
     pub fn validate(capabilities: &CapabilitySet, graph: &WasiComponentGraph) -> bool {
-        capabilities.needs.iter().all(|need| {
-            graph
-                .components
-                .iter()
-                .any(|component| component.capabilities.iter().any(|capability| capability == need))
-        })
+        let available = graph
+            .components
+            .iter()
+            .flat_map(|component| component.capabilities.iter().cloned())
+            .collect::<HashSet<_>>();
+        capabilities
+            .needs
+            .iter()
+            .all(|need| available.contains(need))
     }
 
     pub fn enforce_security_model(graph: &mut WasiComponentGraph) {
@@ -12790,9 +12782,18 @@ impl WasmRuntimeCompiler {
             components.push(WasiComponent {
                 id: package_manager.to_string(),
                 module: format!("{package_manager}.wasm"),
-                imports: vec!["network.http".to_string(), "filesystem.read".to_string()],
+                imports: package_manager_component_imports(package_manager),
                 exports: vec![format!("{package_manager}.package_manager")],
                 capabilities: vec![format!("{package_manager}.package_manager")],
+            });
+        }
+        if !spec.framework.is_empty() && spec.framework != UNKNOWN_SIGNATURE {
+            components.push(WasiComponent {
+                id: spec.framework.clone(),
+                module: format!("{}.wasm", spec.framework),
+                imports: vec![format!("{}.runtime", spec.language)],
+                exports: vec![format!("{}.framework", spec.framework)],
+                capabilities: vec![format!("{}.framework", spec.framework)],
             });
         }
 
@@ -12827,7 +12828,7 @@ impl WasmRuntimeCompiler {
         let links = WasiLinker::resolve(&imports, &exports);
 
         let mut execution_plan = ExecutionPlan::default();
-        execution_plan.startup_order = components.iter().map(|component| component.id.clone()).collect();
+        execution_plan.startup_order = component_startup_order(&components, &links);
         execution_plan.ordered_nodes = execution_plan.startup_order.clone();
 
         let mut wasi_component_graph = WasiComponentGraph {
@@ -12857,6 +12858,77 @@ impl WasmRuntimeCompiler {
             wasi_component_graph,
         }
     }
+}
+
+fn parse_link_entry<'a>(prefix: &str, value: &'a str) -> Option<(&'a str, &'a str)> {
+    value
+        .strip_prefix(prefix)
+        .and_then(|entry| entry.split_once(':'))
+        .filter(|(component, capability)| !component.is_empty() && !capability.is_empty())
+}
+
+fn package_manager_component_imports(package_manager: &str) -> Vec<String> {
+    match package_manager {
+        "pnpm" | "npm" | "yarn" | "bun" | "cargo" | "pip" | "pipenv" | "poetry" | "uv" => {
+            vec!["network.http".to_string(), "filesystem.read".to_string()]
+        }
+        _ => vec!["filesystem.read".to_string()],
+    }
+}
+
+fn component_startup_order(components: &[WasiComponent], links: &[WasiLink]) -> Vec<String> {
+    let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
+    for component in components {
+        in_degree.entry(component.id.clone()).or_insert(0);
+    }
+    for link in links {
+        if link.from_component == link.to_component {
+            continue;
+        }
+        if !in_degree.contains_key(&link.from_component) || !in_degree.contains_key(&link.to_component) {
+            continue;
+        }
+        if dependents
+            .entry(link.from_component.clone())
+            .or_default()
+            .insert(link.to_component.clone())
+        {
+            *in_degree.entry(link.to_component.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut ready = in_degree
+        .iter()
+        .filter_map(|(node, degree)| (*degree == 0).then_some(node.clone()))
+        .collect::<BTreeSet<_>>();
+
+    let mut ordered = Vec::new();
+    while let Some(node) = ready.first().cloned() {
+        ready.remove(&node);
+        ordered.push(node.clone());
+        if let Some(next_nodes) = dependents.get(&node) {
+            for next in next_nodes {
+                if let Some(degree) = in_degree.get_mut(next) {
+                    *degree = degree.saturating_sub(1);
+                    if *degree == 0 && !ordered.contains(next) {
+                        ready.insert(next.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if ordered.len() != in_degree.len() {
+        let mut fallback = components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<Vec<_>>();
+        fallback.sort();
+        fallback.dedup();
+        return fallback;
+    }
+    ordered
 }
 
 fn allowed_hosts_for_package_manager(package_manager: Option<&str>) -> Vec<String> {
@@ -15911,6 +15983,7 @@ dependencies:
             },
             network_policy: NetworkPolicy {
                 allow_outbound: true,
+                // Intentional duplicate to verify security-model deduplication.
                 allowed_hosts: vec!["crates.io".to_string(), "crates.io".to_string()],
             },
             memory_limit_mb: 512,
@@ -15927,7 +16000,12 @@ dependencies:
         };
 
         let compiled = WasmRuntimeCompiler::compile(&spec);
-        let graph = compiled.wasi_component_graph;
+        let mut graph = compiled.wasi_component_graph;
+        graph
+            .runtime_constraints
+            .read_only_paths
+            .push("/workspace".to_string());
+        WasiLinker::enforce_security_model(&mut graph);
         assert!(graph.components.iter().any(|component| component.id == "rust"));
         assert!(graph.components.iter().any(|component| component.id == "cargo"));
         assert!(graph
@@ -15940,6 +16018,15 @@ dependencies:
                 .network_allowlist
                 .iter()
                 .filter(|host| host.as_str() == "crates.io")
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .runtime_constraints
+                .read_only_paths
+                .iter()
+                .filter(|path| path.as_str() == "/workspace")
                 .count(),
             1
         );
