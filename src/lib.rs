@@ -3603,6 +3603,10 @@ impl WasiLinker {
 
         let mut live_component_ids = Self::collect_live_components(graph, &required_capabilities);
         if live_component_ids.is_empty() {
+            debug_assert!(
+                graph.components.is_empty(),
+                "WasiLinker::optimize_graph found no live components and is falling back to full graph retention"
+            );
             live_component_ids.extend(
                 graph
                     .components
@@ -3700,7 +3704,9 @@ impl WasiLinker {
                 .iter_mut()
                 .find(|existing: &&mut WasiComponent| existing.id == component.id)
             {
-                if existing.module.is_empty() && !component.module.is_empty() {
+                if !component.module.is_empty()
+                    && (existing.module.is_empty() || component.module < existing.module)
+                {
                     existing.module = component.module.clone();
                 }
                 existing.imports.extend(component.imports);
@@ -3754,11 +3760,19 @@ impl WasiLinker {
 
     fn requires_dependency_cache(component: &WasiComponent) -> bool {
         component.capabilities.iter().any(|capability| {
-            let normalized = capability.to_ascii_lowercase();
-            normalized.contains("build")
-                || normalized.contains("compile")
-                || normalized.contains("install")
-                || normalized.contains("package_manager")
+            let normalized = interface_identity(capability).to_ascii_lowercase();
+            normalized.ends_with(".package_manager")
+                || matches!(
+                    normalized.as_str(),
+                    "build.compile"
+                        | "build.install"
+                        | "build.package"
+                        | "runtime.build"
+                        | "runtime.compile"
+                        | "execution.build"
+                        | "execution.compile"
+                        | "execution.install"
+                )
         })
     }
 }
@@ -17362,7 +17376,20 @@ dependencies:
             .components
             .iter()
             .all(|component| component.id.as_str() != "terminal"));
+        let filesystem_component = graph
+            .components
+            .iter()
+            .find(|component| component.id == "filesystem")
+            .expect("filesystem component should remain");
+        assert_eq!(
+            filesystem_component.capabilities,
+            vec!["filesystem.read".to_string()]
+        );
         assert_eq!(graph.links.len(), 1);
+        assert!(graph
+            .exports
+            .iter()
+            .all(|entry| entry.as_str() != "export:terminal:process.spawn"));
         assert_eq!(
             graph.execution_plan.startup_order,
             vec!["filesystem".to_string(), "builder".to_string()]
