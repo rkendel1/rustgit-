@@ -139,6 +139,19 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
+async function readAnalyzeResponse(
+  response: Response,
+  path: string,
+  fallbackRepoUrl: string,
+): Promise<AnalyzeResponse> {
+  if (path === ANALYZE_WORKSPACES_FALLBACK_PATH) {
+    return {
+      repo_url: (await readJsonResponse<WorkspaceLaunchResponse>(response)).repo_url ?? fallbackRepoUrl,
+    };
+  }
+  return readJsonResponse<AnalyzeResponse>(response);
+}
+
 export default function Home() {
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
@@ -215,7 +228,7 @@ export default function Home() {
       const analyzePaths = [ANALYZE_V1_PATH, ANALYZE_LEGACY_PATH, ANALYZE_WORKSPACES_FALLBACK_PATH];
       let analyzeResponse: Response | null = null;
       let analyzePath: string | null = null;
-      let lastFailure = "No endpoints responded successfully";
+      let lastFailure = "All endpoints failed";
 
       for (const path of analyzePaths) {
         try {
@@ -225,7 +238,8 @@ export default function Home() {
             analyzePath = path;
             break;
           }
-          const text = await response.text();
+          // We consume the error response body here only for user-visible diagnostics.
+          const text = (await response.text()).slice(0, 500);
           lastFailure = `${path} -> ${response.status}: ${text || "no response body"}`;
         } catch (error) {
           lastFailure = error instanceof Error ? error.message : String(error);
@@ -236,14 +250,11 @@ export default function Home() {
         throw new Error(`Analyze request failed across all endpoints: ${lastFailure}`);
       }
 
-      const analyzed =
-        analyzePath === ANALYZE_WORKSPACES_FALLBACK_PATH
-          ? {
-              repo_url:
-                (await readJsonResponse<WorkspaceLaunchResponse>(analyzeResponse)).repo_url ??
-                parsedRepo.repoUrl,
-            }
-          : await readJsonResponse<AnalyzeResponse>(analyzeResponse);
+      const analyzed = await readAnalyzeResponse(
+        analyzeResponse,
+        analyzePath ?? ANALYZE_V1_PATH,
+        parsedRepo.repoUrl,
+      );
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(parsedRepo.repoUrl);
 
