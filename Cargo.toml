@@ -42,6 +42,8 @@ serde_yaml = "0.9.34"
 sha2 = "0.10.9"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 wasmtime = { version = "45.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 wat = "1.252.0"
+tower = "0.5"
