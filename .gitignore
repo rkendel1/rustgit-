@@ -1,2 +1,5 @@
 target/
 .wasm-runtime/
+
+stderr.log
+.workspace-data/workspaces/.DS_Store

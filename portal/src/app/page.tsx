@@ -610,16 +610,39 @@ export default function Home() {
           </div>
         </div>
 
-        <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.analyzeButton}>
-          {analyzing ? "Analyzing..." : "Analyze Repository"}
-        </button>
-
-        <button type="button" onClick={handleFreeSpace} disabled={freeingSpace} className={styles.freeSpaceButton}>
-          {freeingSpace ? "Cleaning..." : "Free Space"}
-        </button>
-        {freeSpaceResult ? (
-          <p className={styles.freeSpaceResult}>{freeSpaceResult}</p>
-        ) : null}
+        <div className={styles.sidebarInput}>
+          <label htmlFor="github-repo-url" className={styles.label}>
+            Repository
+          </label>
+          <input
+            ref={repoInputRef}
+            id="github-repo-url"
+            type="text"
+            autoComplete="off"
+            value={repository}
+            onChange={(event) => resetResults(event.target.value)}
+            onInput={(event) => {
+              const val = (event.target as HTMLInputElement).value;
+              if (val !== repository) resetResults(val);
+            }}
+            onPaste={(event) => {
+              const pasted = event.clipboardData.getData("text");
+              if (pasted) {
+                event.preventDefault();
+                resetResults(pasted.trim());
+              }
+            }}
+            placeholder="https://github.com/owner/repo"
+            className={styles.input}
+          />
+          <p className={styles.hint}>Paste a GitHub URL or <code>owner/repo</code>.</p>
+          <button type="button" onClick={handleAnalyze} disabled={analyzing} className={styles.analyzeButton}>
+            {analyzing ? "Analyzing..." : "Analyze"}
+          </button>
+          <button type="button" onClick={handleRun} disabled={running} className={styles.secondaryButton}>
+            {running ? "Starting..." : "Run"}
+          </button>
+        </div>
 
         <nav className={styles.navSection} aria-label="Portal sections">
           <p className={styles.navHeading}>Workspace</p>
@@ -639,61 +662,19 @@ export default function Home() {
           </ul>
         </nav>
 
-        <div className={styles.sidebarMeta}>
-          <p>
-            API <code>{API_BASE_URL}</code>
-          </p>
-        </div>
+        <button type="button" onClick={handleFreeSpace} disabled={freeingSpace} className={styles.freeSpaceButton}>
+          {freeingSpace ? "Cleaning..." : "Free Space"}
+        </button>
+        {freeSpaceResult ? (
+          <p className={styles.freeSpaceResult}>{freeSpaceResult}</p>
+        ) : null}
       </aside>
 
       <section className={styles.listPane}>
         <header className={styles.paneHeader}>
-          <h1>Repository workspace</h1>
-          <p>Paste a GitHub URL and run it. Override options appear after a failure.</p>
+          <h1>Intelligence</h1>
+          <p>Analysis results for the selected repository.</p>
         </header>
-
-        <section className={styles.panel}>
-          <h2>Repository input</h2>
-          <div>
-            <label htmlFor="github-repo-url" className={styles.label}>
-              GitHub repository URL or owner/repo
-            </label>
-            <input
-              ref={repoInputRef}
-              id="github-repo-url"
-              type="text"
-              autoComplete="off"
-              value={repository}
-              onChange={(event) => resetResults(event.target.value)}
-              onInput={(event) => {
-                // Catches browser autofill which may skip onChange
-                const val = (event.target as HTMLInputElement).value;
-                if (val !== repository) resetResults(val);
-              }}
-              onPaste={(event) => {
-                const pasted = event.clipboardData.getData("text");
-                if (pasted) {
-                  event.preventDefault();
-                  resetResults(pasted.trim());
-                }
-              }}
-              placeholder="https://github.com/owner/repo"
-              className={styles.input}
-            />
-            <p className={styles.hint}>
-              You can also use <code>owner/repo</code>.
-            </p>
-
-            <div className={styles.actions}>
-              <button type="button" onClick={handleAnalyze} disabled={analyzing} className={styles.primaryButton}>
-                {analyzing ? "Analyzing repository..." : "Analyze and get intelligence"}
-              </button>
-              <button type="button" onClick={handleRun} disabled={running} className={styles.secondaryButton}>
-                {running ? "Starting run..." : "Run repository"}
-              </button>
-            </div>
-          </div>
-        </section>
 
         {error ? (
           <section className={styles.errorPanel} role="alert">
@@ -703,7 +684,7 @@ export default function Home() {
 
         {analyzeResult ? (
           <section className={styles.panel}>
-            <h2>Intelligence</h2>
+            <h2>Analysis</h2>
             <div className={styles.grid}>
               <div className={styles.tile}>
                 <strong>Repository</strong>
@@ -956,10 +937,7 @@ export default function Home() {
 
         <section className={styles.footerInfo}>
           <p>
-            API base: <code>{API_BASE_URL}</code>
-          </p>
-          <p>
-            Health check: <a href="/api/health">/api/health</a>
+            <a href="/api/health">/api/health</a>
           </p>
         </section>
       </section>
