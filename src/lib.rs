@@ -12031,6 +12031,13 @@ pub struct Workspace {
     pub resource_quotas: ResourceQuotas,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaunchOverrides {
+    pub start_command: Option<String>,
+    pub environment: BTreeMap<String, String>,
+    pub versions: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionContext {
     pub workspace_id: String,
@@ -12107,6 +12114,7 @@ struct LocalWorkspaceRecord {
     execution_context: Option<ExecutionContext>,
     process_handle: Option<ProcessHandle>,
     child_process: Option<std::process::Child>,
+    launch_overrides: LaunchOverrides,
 }
 
 pub struct ExecutionEngine {
@@ -12346,6 +12354,10 @@ impl WorkspaceManager {
     /// Immediately allocates a workspace ID and inserts a pending record.
     /// Call `complete_launch` on a background thread to do the actual work.
     pub fn begin_launch(&self, repo_url: &str) -> String {
+        self.begin_launch_with_overrides(repo_url, LaunchOverrides::default())
+    }
+
+    pub fn begin_launch_with_overrides(&self, repo_url: &str, overrides: LaunchOverrides) -> String {
         let id = self.next_workspace_id();
         let workspace_root = self.root.join("workspaces").join(&id);
         let workspace = Workspace {
@@ -12373,6 +12385,7 @@ impl WorkspaceManager {
                 execution_context: None,
                 process_handle: None,
                 child_process: None,
+                launch_overrides: overrides,
             },
         );
         id
@@ -12380,6 +12393,16 @@ impl WorkspaceManager {
 
     /// Does the blocking work for a workspace previously allocated by `begin_launch`.
     pub fn complete_launch(&self, id: &str, repo_url: &str) {
+        let overrides = self
+            .workspaces
+            .lock()
+            .ok()
+            .and_then(|workspaces| workspaces.get(id).map(|record| record.launch_overrides.clone()))
+            .unwrap_or_default();
+        self.complete_launch_with_overrides(id, repo_url, overrides);
+    }
+
+    pub fn complete_launch_with_overrides(&self, id: &str, repo_url: &str, overrides: LaunchOverrides) {
         let workspace_root = self.root.join("workspaces").join(id);
         let repository_root = workspace_root.join("repo");
 
@@ -12448,10 +12471,15 @@ impl WorkspaceManager {
             },
             network: analysis.runtime_spec.network_policy.clone(),
         };
-        push_log(format!(
-            "planned execution command: {}",
-            ctx.execution_graph.primary_run_command().unwrap_or_else(|| "none".to_string())
-        ));
+        let planned_command = Self::resolved_run_command(&ctx, &overrides)
+            .unwrap_or_else(|| "none".to_string());
+        push_log(format!("planned execution command: {planned_command}"));
+        if !overrides.environment.is_empty() {
+            push_log(format!("applied env overrides: {}", overrides.environment.len()));
+        }
+        if !overrides.versions.is_empty() {
+            push_log(format!("applied version overrides: {}", overrides.versions.len()));
+        }
 
         workspace.framework = ctx.analysis.framework;
         workspace.ports = ports_for_framework(ctx.analysis.framework);
@@ -12460,7 +12488,7 @@ impl WorkspaceManager {
 
         set_state(WorkspaceState::Starting);
         let mut spawn_logs: Vec<String> = vec![];
-        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut spawn_logs);
+        let (child, assigned_port) = Self::spawn_run_command(&ctx, &overrides, &mut spawn_logs);
         for line in &spawn_logs {
             push_log(line.clone());
         }
@@ -12476,6 +12504,7 @@ impl WorkspaceManager {
                 r.workspace.state = WorkspaceState::Running;
                 r.execution_context = Some(ctx);
                 r.child_process = child;
+                r.launch_overrides = overrides.clone();
                 r.logs.push("workspace running".to_string());
             }
         }
@@ -12489,8 +12518,40 @@ impl WorkspaceManager {
     }
 
     // Returns (child, assigned_port)
-    fn spawn_run_command(ctx: &ExecutionContext, logs: &mut Vec<String>) -> (Option<std::process::Child>, Option<u16>) {
-        let run_cmd = match ctx.execution_graph.primary_run_command() {
+    fn apply_command_overrides(command: &str, overrides: &LaunchOverrides) -> String {
+        let mut rendered = command.to_string();
+        for (name, value) in &overrides.versions {
+            rendered = rendered.replace(&format!("{{{name}}}"), value);
+        }
+        rendered
+    }
+
+    fn resolved_run_command(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Option<String> {
+        overrides
+            .start_command
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| ctx.execution_graph.primary_run_command())
+    }
+
+    fn apply_process_overrides(command: &mut Command, overrides: &LaunchOverrides) {
+        for (name, value) in &overrides.environment {
+            command.env(name, value);
+        }
+        for (name, value) in &overrides.versions {
+            command.env(name, value);
+        }
+    }
+
+    // Returns (child, assigned_port)
+    fn spawn_run_command(
+        ctx: &ExecutionContext,
+        overrides: &LaunchOverrides,
+        logs: &mut Vec<String>,
+    ) -> (Option<std::process::Child>, Option<u16>) {
+        let run_cmd = match Self::resolved_run_command(ctx, overrides) {
             Some(cmd) => cmd,
             None => return (None, None),
         };
@@ -12528,6 +12589,8 @@ impl WorkspaceManager {
                 match Command::new(&pip_path)
                     .args(&pip_args)
                     .current_dir(repo_path)
+                    .envs(&overrides.environment)
+                    .envs(&overrides.versions)
                     .output()
                 {
                     Ok(out) => {
@@ -12556,6 +12619,8 @@ impl WorkspaceManager {
                     let _ = Command::new(program)
                         .args(&args)
                         .current_dir(repo_path)
+                        .envs(&overrides.environment)
+                        .envs(&overrides.versions)
                         .output();
                 }
             }
@@ -12573,6 +12638,8 @@ impl WorkspaceManager {
             let _ = Command::new(&python)
                 .args(["manage.py", "migrate", "--run-syncdb"])
                 .current_dir(repo_path)
+                .envs(&overrides.environment)
+                .envs(&overrides.versions)
                 .output();
         }
 
@@ -12581,7 +12648,7 @@ impl WorkspaceManager {
 
         // Substitute {PORT} placeholder used in Python command templates, then
         // rewrite the program path to the venv binary if this is a Python app
-        let run_cmd = run_cmd.replace("{PORT}", &port_str);
+        let run_cmd = Self::apply_command_overrides(&run_cmd, overrides).replace("{PORT}", &port_str);
         let run_cmd = if is_python {
             let venv_bin = repo_path.join(".venv").join("bin");
             let mut parts = run_cmd.splitn(2, ' ');
@@ -12625,6 +12692,7 @@ impl WorkspaceManager {
         if let Some(port) = assigned_port {
             cmd.env("PORT", port.to_string());
         }
+        Self::apply_process_overrides(&mut cmd, overrides);
 
         logs.push(format!("running: {program} {args_str}"));
         match cmd.spawn() {
@@ -12671,7 +12739,62 @@ impl WorkspaceManager {
                     }
                 }
             }
+
         }
+    }
+
+    pub fn restart_with_overrides(
+        &self,
+        id: &str,
+        overrides: Option<LaunchOverrides>,
+    ) -> Result<()> {
+        // Kill old process and snapshot what we need before releasing the lock
+        let (ctx, effective_overrides) = {
+            let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+            let record = workspaces
+                .get_mut(id)
+                .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
+            if let Some(new_overrides) = overrides {
+                record.launch_overrides = new_overrides;
+            }
+            Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
+            if let Some(child) = record.child_process.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            record.child_process = None;
+            record.process_handle = None;
+            record.logs.push("restarting…".to_string());
+            (
+                record
+                    .execution_context
+                    .clone()
+                    .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?,
+                record.launch_overrides.clone(),
+            )
+        }; // lock released here
+
+        // Spawn the new process without holding the lock (can take seconds)
+        let mut spawn_logs: Vec<String> = vec![];
+        let (child, assigned_port) =
+            Self::spawn_run_command(&ctx, &effective_overrides, &mut spawn_logs);
+
+        let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+        let record = workspaces
+            .get_mut(id)
+            .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
+        for line in spawn_logs {
+            record.logs.push(line);
+        }
+        if let Some(port) = assigned_port {
+            for p in &mut record.workspace.ports {
+                p.port = port;
+            }
+        }
+        record.child_process = child;
+        record.workspace.state = WorkspaceState::Running;
+        record.logs.push("workspace restarted".to_string());
+        Ok(())
     }
 }
 
@@ -12709,6 +12832,7 @@ impl WasmWorkspace for WorkspaceManager {
                     execution_context: None,
                     process_handle: None,
                     child_process: None,
+                    launch_overrides: LaunchOverrides::default(),
                 },
             );
         }
@@ -12764,7 +12888,8 @@ impl WasmWorkspace for WorkspaceManager {
 
         match launch_result {
             Ok((ctx, handle)) => {
-                let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut record.logs);
+                let overrides = record.launch_overrides.clone();
+                let (child, assigned_port) = Self::spawn_run_command(&ctx, &overrides, &mut record.logs);
                 // Patch the port list to use the actual assigned port
                 if let Some(port) = assigned_port {
                     for p in &mut workspace.ports {
@@ -12808,46 +12933,7 @@ impl WasmWorkspace for WorkspaceManager {
     }
 
     fn restart(&self, id: &str) -> Result<()> {
-        // Kill old process and snapshot what we need before releasing the lock
-        let ctx = {
-            let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
-            let record = workspaces
-                .get_mut(id)
-                .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
-            Self::transition_state(&mut record.workspace, WorkspaceState::Starting)?;
-            if let Some(child) = record.child_process.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            record.child_process = None;
-            record.process_handle = None;
-            record.logs.push("restarting…".to_string());
-            record
-                .execution_context
-                .clone()
-                .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?
-        }; // lock released here
-
-        // Spawn the new process without holding the lock (can take seconds)
-        let mut spawn_logs: Vec<String> = vec![];
-        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut spawn_logs);
-
-        let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
-        let record = workspaces
-            .get_mut(id)
-            .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
-        for line in spawn_logs {
-            record.logs.push(line);
-        }
-        if let Some(port) = assigned_port {
-            for p in &mut record.workspace.ports {
-                p.port = port;
-            }
-        }
-        record.child_process = child;
-        record.workspace.state = WorkspaceState::Running;
-        record.logs.push("workspace restarted".to_string());
-        Ok(())
+        self.restart_with_overrides(id, None)
     }
 
     fn logs(&self, id: &str) -> Result<Vec<String>> {
@@ -18900,6 +18986,50 @@ dependencies:
         let logs = manager.logs(&workspace.id).expect("workspace logs");
         assert!(logs.iter().any(|line| line.contains("workspace stopped")));
         assert!(logs.iter().any(|line| line.contains("workspace restarted")));
+    }
+
+    #[test]
+    fn launch_overrides_replace_command_version_placeholders() {
+        let overrides = LaunchOverrides {
+            start_command: None,
+            environment: BTreeMap::new(),
+            versions: BTreeMap::from([(String::from("NODE_VERSION"), String::from("20"))]),
+        };
+        let rendered = WorkspaceManager::apply_command_overrides(
+            "nvm use {NODE_VERSION} && npm run dev",
+            &overrides,
+        );
+        assert_eq!(rendered, "nvm use 20 && npm run dev");
+    }
+
+    #[test]
+    fn begin_launch_persists_preheal_overrides_for_retries() {
+        let runtime_root = temp_dir("runtime-root-overrides");
+        let manager = WorkspaceManager::new(&runtime_root);
+        let overrides = LaunchOverrides {
+            start_command: Some("npm run custom".to_string()),
+            environment: BTreeMap::from([(String::from("PORT"), String::from("4321"))]),
+            versions: BTreeMap::from([(String::from("NODE_VERSION"), String::from("20"))]),
+        };
+        let id = manager.begin_launch_with_overrides("https://github.com/example/repo.git", overrides);
+        let workspaces = manager.workspaces.lock().expect("workspace lock");
+        let record = workspaces.get(&id).expect("workspace record");
+        assert_eq!(
+            record.launch_overrides.start_command.as_deref(),
+            Some("npm run custom")
+        );
+        assert_eq!(
+            record.launch_overrides.environment.get("PORT").map(String::as_str),
+            Some("4321")
+        );
+        assert_eq!(
+            record
+                .launch_overrides
+                .versions
+                .get("NODE_VERSION")
+                .map(String::as_str),
+            Some("20")
+        );
     }
 
     #[test]
