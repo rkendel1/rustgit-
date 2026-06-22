@@ -25551,4 +25551,76 @@ all = ["network"]
             ExecutionRoutingMode::Local
         ));
     }
+
+    #[test]
+    fn runtime_status_never_carries_endpoint_outside_local_mode() {
+        let runtime_root = temp_dir("runtime-status-invariant");
+        let local_repo = temp_dir("runtime-status-invariant-repo");
+        fs::write(
+            local_repo.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"},"dependencies":{}}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            local_repo.join("server.js"),
+            "require('http').createServer((_, res) => res.end('ok')).listen(process.env.PORT || 3000);\n",
+        )
+        .expect("write server.js");
+
+        let manager = WorkspaceManager::new(&runtime_root);
+        let workspace = manager
+            .launch(local_repo.to_string_lossy().as_ref())
+            .expect("launch workspace");
+        {
+            let mut workspaces = manager.workspaces.lock().expect("workspace lock poisoned");
+            let record = workspaces
+                .get_mut(&workspace.id)
+                .expect("workspace record should exist");
+            let requested_port = record
+                .workspace
+                .ports
+                .first()
+                .map(|port| port.port)
+                .unwrap_or(3000);
+            let pid = record.child_process.as_ref().map(|child| child.id()).unwrap_or(1);
+            let mut runtime = ExecutionTruth::new(workspace.id.clone(), requested_port, pid);
+            runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
+            runtime.update_from_event(ExecutionTruthEvent::ObservedPort(Some(requested_port)));
+            runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Running));
+            record.runtime = Some(runtime);
+        }
+
+        let status = manager
+            .runtime_status(&workspace.id)
+            .expect("runtime status should resolve");
+        let handle = status
+            .execution_handle
+            .expect("launched workspace should have an execution handle");
+
+        match handle.routing_mode {
+            ExecutionRoutingMode::Local => {
+                if let Some(endpoint) = handle.endpoint.as_deref() {
+                    assert!(
+                        endpoint.starts_with("http://127.0.0.1:"),
+                        "Local endpoint must be loopback-derived, got: {endpoint}"
+                    );
+                }
+            }
+            ExecutionRoutingMode::Wasm
+            | ExecutionRoutingMode::Remote
+            | ExecutionRoutingMode::Hybrid => {
+                assert!(
+                    handle.endpoint.is_none(),
+                    "non-Local routing mode must never carry an HTTP endpoint; \
+                     got mode={:?} endpoint={:?}. If this fails, a Remote/Hybrid \
+                     provider has started populating endpoint — re-derive the \
+                     per-mode invariants and proxy validation before merging.",
+                    handle.routing_mode,
+                    handle.endpoint
+                );
+            }
+        }
+
+        manager.stop(&workspace.id).expect("stop workspace");
+    }
 }
