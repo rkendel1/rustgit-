@@ -40,6 +40,7 @@ type RunResponse = {
 };
 
 type LaunchOverridesPayload = {
+  branch?: string;
   start_command?: string;
   environment?: Record<string, string>;
   versions?: Record<string, string>;
@@ -261,9 +262,11 @@ export default function Home() {
 
   function buildLaunchOverrides(): LaunchOverridesPayload {
     const payload: LaunchOverridesPayload = {};
+    const b = branch.trim();
     const command = startCommand.trim();
     const environment = parseKeyValueLines(envOverrides);
     const versions = parseKeyValueLines(versionOverrides);
+    if (b) payload.branch = b;
     if (command) payload.start_command = command;
     if (Object.keys(environment).length > 0) payload.environment = environment;
     if (Object.keys(versions).length > 0) payload.versions = versions;

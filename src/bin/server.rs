@@ -79,7 +79,13 @@ impl ExecutionRequest {
             .map(|(key, value)| (key.trim().to_string(), value))
             .filter(|(key, _)| !key.is_empty())
             .collect();
+        let branch = self
+            .branch
+            .as_ref()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
         LaunchOverrides {
+            branch,
             start_command,
             environment,
             versions,
@@ -89,6 +95,7 @@ impl ExecutionRequest {
 
 #[derive(Default, Deserialize)]
 struct RestartRequest {
+    branch: Option<String>,
     start_command: Option<String>,
     environment: Option<HashMap<String, String>>,
     versions: Option<HashMap<String, String>>,
@@ -115,7 +122,12 @@ impl RestartRequest {
             .map(|(key, value)| (key.trim().to_string(), value))
             .filter(|(key, _)| !key.is_empty())
             .collect();
+        let branch = self
+            .branch
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
         LaunchOverrides {
+            branch,
             start_command,
             environment,
             versions,

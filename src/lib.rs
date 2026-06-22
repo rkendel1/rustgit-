@@ -12046,6 +12046,7 @@ pub struct Workspace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LaunchOverrides {
+    pub branch: Option<String>,
     pub start_command: Option<String>,
     pub environment: BTreeMap<String, String>,
     pub versions: BTreeMap<String, String>,
@@ -12324,7 +12325,7 @@ impl WorkspaceManager {
         evicted
     }
 
-    fn materialize_repository(&self, repo_url: &str, destination: &Path) -> Result<()> {
+    fn materialize_repository(&self, repo_url: &str, branch: Option<&str>, destination: &Path) -> Result<()> {
         const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024;      // 1 GB
         const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB
         const MAX_REPO_BYTES_TO_CACHE: u64 = 200 * 1024 * 1024;        // 200 MB
@@ -12376,6 +12377,13 @@ impl WorkspaceManager {
                     "http.https://github.com/.extraheader={extra_header}"
                 ));
             }
+            let effective_branch = branch
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
+            if let Some(ref b) = effective_branch {
+                clone_command.arg("--branch").arg(b);
+            }
             let output = clone_command
                 .arg(repo_url)
                 .arg(destination)
@@ -12384,11 +12392,43 @@ impl WorkspaceManager {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let reason = github_clone_error_reason(repo_url, &stderr);
-                return Err(RuntimeError::CommandFailed(format!(
-                    "git clone exited with status {}: {}",
-                    output.status, reason
-                )));
+                // If the branch wasn't found, retry without it to fall back to default.
+                if effective_branch.is_some()
+                    && (stderr.contains("Remote branch") && stderr.contains("not found")
+                        || stderr.contains("pathspec") && stderr.contains("did not match"))
+                {
+                    if destination.exists() {
+                        let _ = fs::remove_dir_all(destination);
+                    }
+                    fs::create_dir_all(destination)?;
+                    let output2 = clone_command
+                        .args(["--branch"])  // remove last --branch arg isn't possible; rebuild
+                        .output();
+                    // Rebuild without --branch and retry
+                    let mut retry = Command::new("git");
+                    retry
+                        .arg("-c").arg("credential.helper=")
+                        .arg("-c").arg("credential.username=")
+                        .arg("clone").arg("--depth").arg("1")
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .arg(repo_url).arg(destination);
+                    drop(output2);
+                    let retry_out = retry.output()
+                        .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+                    if !retry_out.status.success() {
+                        let err = String::from_utf8_lossy(&retry_out.stderr).trim().to_string();
+                        let reason = github_clone_error_reason(repo_url, &err);
+                        return Err(RuntimeError::CommandFailed(format!(
+                            "git clone exited with status {}: {}", retry_out.status, reason
+                        )));
+                    }
+                } else {
+                    let reason = github_clone_error_reason(repo_url, &stderr);
+                    return Err(RuntimeError::CommandFailed(format!(
+                        "git clone exited with status {}: {}",
+                        output.status, reason
+                    )));
+                }
             }
         }
 
@@ -12535,7 +12575,7 @@ impl WorkspaceManager {
         self.evict_terminal_workspaces();
 
         set_state(WorkspaceState::Materializing);
-        if let Err(e) = self.materialize_repository(repo_url, &repository_root) {
+        if let Err(e) = self.materialize_repository(repo_url, overrides.branch.as_deref(), &repository_root) {
             set_failed(format!("workspace failed: {e}"));
             return;
         }
@@ -12552,7 +12592,7 @@ impl WorkspaceManager {
         push_log(format!("detected framework: {:?}", analysis.framework));
 
         set_state(WorkspaceState::Planning);
-        let mut ctx = ExecutionContext {
+        let ctx = ExecutionContext {
             workspace_id: id.to_string(),
             repo_path: repository_root.to_string_lossy().to_string(),
             analysis: analysis.clone(),
@@ -12965,7 +13005,7 @@ impl WasmWorkspace for WorkspaceManager {
 
         let launch_result = (|| -> Result<(ExecutionContext, ProcessHandle)> {
             Self::transition_state(&mut workspace, WorkspaceState::Materializing)?;
-            self.materialize_repository(repo_url, &repository_root)?;
+            self.materialize_repository(repo_url, None, &repository_root)?;
             logs.push(format!("materialized repository: {repo_url}"));
 
             Self::transition_state(&mut workspace, WorkspaceState::Analyzing)?;
@@ -19213,6 +19253,7 @@ dependencies:
     #[test]
     fn launch_overrides_replace_command_version_placeholders() {
         let overrides = LaunchOverrides {
+            branch: None,
             start_command: None,
             environment: BTreeMap::new(),
             versions: BTreeMap::from([(String::from("NODE_VERSION"), String::from("20"))]),
@@ -19229,6 +19270,7 @@ dependencies:
         let runtime_root = temp_dir("runtime-root-overrides");
         let manager = WorkspaceManager::new(&runtime_root);
         let overrides = LaunchOverrides {
+            branch: None,
             start_command: Some("npm run custom".to_string()),
             environment: BTreeMap::from([(String::from("PORT"), String::from("4321"))]),
             versions: BTreeMap::from([(String::from("NODE_VERSION"), String::from("20"))]),
