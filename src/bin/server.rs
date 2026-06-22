@@ -15,8 +15,8 @@ use axum::{
 use rustgit_wasm_runtime::{
     analyze::{AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
-    healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, RuntimeError,
-    WasmWorkspace, Workspace, WorkspaceManager,
+    healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, LaunchOverrides,
+    RuntimeError, WasmWorkspace, Workspace, WorkspaceManager,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +51,76 @@ struct ExecutionRequest {
     repo: Option<String>,
     repo_url: Option<String>,
     branch: Option<String>,
+    start_command: Option<String>,
+    environment: Option<HashMap<String, String>>,
+    versions: Option<HashMap<String, String>>,
+}
+
+impl ExecutionRequest {
+    fn launch_overrides(&self) -> LaunchOverrides {
+        let start_command = self
+            .start_command
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let environment = self
+            .environment
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        let versions = self
+            .versions
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        LaunchOverrides {
+            start_command,
+            environment,
+            versions,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct RestartRequest {
+    start_command: Option<String>,
+    environment: Option<HashMap<String, String>>,
+    versions: Option<HashMap<String, String>>,
+}
+
+impl RestartRequest {
+    fn launch_overrides(self) -> LaunchOverrides {
+        let start_command = self
+            .start_command
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let environment = self
+            .environment
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        let versions = self
+            .versions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        LaunchOverrides {
+            start_command,
+            environment,
+            versions,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -245,17 +315,20 @@ async fn launch_execution(
     State(state): State<AppState>,
     Json(body): Json<ExecutionRequest>,
 ) -> Result<(StatusCode, Json<ExecutionResponse>), (StatusCode, Json<Value>)> {
-    let repo_url = resolve_repo_url(body.repo_url, None, body.owner, body.repo)?;
+    let overrides = body.launch_overrides();
+    let repo_url = resolve_repo_url(body.repo_url.clone(), None, body.owner.clone(), body.repo.clone())?;
     let manager = state.manager;
 
     // Allocate the workspace ID synchronously (fast — just inserts a pending record)
-    let id = manager.begin_launch(&repo_url);
+    let id = manager.begin_launch_with_overrides(&repo_url, overrides.clone());
     let workspace_url = format!("{}/workspaces/{}", base_url(), id);
 
     // Do the heavy work (git clone, npm install, process spawn) in a background thread.
     // The UI polls /workspaces/:id for status updates while this runs.
     let id_bg = id.clone();
-    tokio::task::spawn_blocking(move || manager.complete_launch(&id_bg, &repo_url));
+    tokio::task::spawn_blocking(move || {
+        manager.complete_launch_with_overrides(&id_bg, &repo_url, overrides)
+    });
 
     Ok((
         StatusCode::CREATED,
@@ -517,9 +590,11 @@ async fn stop_workspace(
 async fn restart_workspace(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<RestartRequest>>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let overrides = body.map(|Json(payload)| payload.launch_overrides());
     let manager = state.manager;
-    tokio::task::spawn_blocking(move || manager.restart(&id))
+    tokio::task::spawn_blocking(move || manager.restart_with_overrides(&id, overrides))
         .await
         .expect("task panicked")
         .map(|_| StatusCode::NO_CONTENT)
@@ -831,6 +906,71 @@ mod tests {
                 .expect("response");
             assert_ne!(response.status(), StatusCode::NOT_FOUND, "POST {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn launch_execution_accepts_preheal_overrides() {
+        let repo = std::env::temp_dir().join(format!(
+            "rustgit-launch-repo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"},"dependencies":{}}"#,
+        )
+        .expect("write package");
+        fs::write(repo.join("server.js"), "setInterval(() => {}, 1000);\n").expect("write server");
+
+        let app = app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/executions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repo_url": repo.to_string_lossy().to_string(),
+                            "start_command": "node server.js",
+                            "environment": { "PORT": "4100" },
+                            "versions": { "NODE_VERSION": "20" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn restart_workspace_accepts_overrides_payload() {
+        let app = app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workspaces/missing/restart")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "start_command": "npm run dev",
+                            "environment": { "PORT": "3001" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

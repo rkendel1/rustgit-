@@ -39,6 +39,12 @@ type RunResponse = {
   status?: string;
 };
 
+type LaunchOverridesPayload = {
+  start_command?: string;
+  environment?: Record<string, string>;
+  versions?: Record<string, string>;
+};
+
 type WorkspaceState =
   | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
   | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
@@ -146,6 +152,22 @@ function parseRepositoryInput(input: string): RepoContext | null {
   };
 }
 
+function parseKeyValueLines(input: string): Record<string, string> {
+  return input
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reduce<Record<string, string>>((acc, line) => {
+      const separatorIndex = line.indexOf("=");
+      if (separatorIndex <= 0) return acc;
+      const key = line.slice(0, separatorIndex).trim();
+      const value = line.slice(separatorIndex + 1).trim();
+      if (!key) return acc;
+      acc[key] = value;
+      return acc;
+    }, {});
+}
+
 async function readJsonResponse<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
@@ -162,6 +184,9 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
 export default function Home() {
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
+  const [startCommand, setStartCommand] = useState("");
+  const [envOverrides, setEnvOverrides] = useState("");
+  const [versionOverrides, setVersionOverrides] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -202,6 +227,17 @@ export default function Home() {
     setError(null);
   }
 
+  function buildLaunchOverrides(): LaunchOverridesPayload {
+    const payload: LaunchOverridesPayload = {};
+    const command = startCommand.trim();
+    const environment = parseKeyValueLines(envOverrides);
+    const versions = parseKeyValueLines(versionOverrides);
+    if (command) payload.start_command = command;
+    if (Object.keys(environment).length > 0) payload.environment = environment;
+    if (Object.keys(versions).length > 0) payload.versions = versions;
+    return payload;
+  }
+
   const fetchWorkspaceData = useCallback(async (wsId: string) => {
     const [wsRes, logsRes] = await Promise.all([
       fetch(`/api/proxy/workspaces/${wsId}`, { cache: "no-store" }),
@@ -231,7 +267,11 @@ export default function Home() {
     if (!wsId) return;
     setActionPending(true);
     try {
-      await fetch(`/api/proxy/workspaces/${wsId}/restart`, { method: "POST" });
+      await fetch(`/api/proxy/workspaces/${wsId}/restart`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildLaunchOverrides()),
+      });
       // Re-enable polling by touching state; the existing poll effect picks it up
       await fetchWorkspaceData(wsId);
     } finally {
@@ -406,6 +446,7 @@ export default function Home() {
           repo_url: parsedRepo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
+          ...buildLaunchOverrides(),
         }),
       });
 
@@ -529,6 +570,42 @@ export default function Home() {
                 className={styles.input}
               />
             </div>
+            <label htmlFor="start-command" className={styles.label}>
+              Start command override (pre-heal)
+            </label>
+            <input
+              id="start-command"
+              type="text"
+              value={startCommand}
+              onChange={(event) => setStartCommand(event.target.value)}
+              placeholder="npm run dev -- --host 0.0.0.0"
+              className={styles.input}
+            />
+            <label htmlFor="env-overrides" className={styles.label}>
+              Environment overrides (KEY=value per line)
+            </label>
+            <textarea
+              id="env-overrides"
+              value={envOverrides}
+              onChange={(event) => setEnvOverrides(event.target.value)}
+              placeholder={"PORT=3000\nNODE_ENV=development"}
+              className={styles.input}
+              rows={4}
+            />
+            <label htmlFor="version-overrides" className={styles.label}>
+              Version overrides (KEY=value per line)
+            </label>
+            <textarea
+              id="version-overrides"
+              value={versionOverrides}
+              onChange={(event) => setVersionOverrides(event.target.value)}
+              placeholder={"NODE_VERSION=20\nPYTHON_VERSION=3.12"}
+              className={styles.input}
+              rows={3}
+            />
+            <p className={styles.hint}>
+              These overrides are applied before launch and on every retry so you can iterate indefinitely.
+            </p>
 
             <div className={styles.actions}>
               <button type="submit" disabled={!canAnalyze} className={styles.primaryButton}>
@@ -625,10 +702,10 @@ export default function Home() {
                 </span>
                 <button
                   className={styles.btnRestart}
-                  disabled={actionPending || !["Running","Failed","Stopped","Degraded"].includes(workspace.state)}
+                  disabled={actionPending}
                   onClick={handleRestart}
                 >
-                  Restart
+                  Retry run
                 </button>
                 <button
                   className={styles.btnStop}
