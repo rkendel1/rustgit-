@@ -14816,7 +14816,7 @@ impl BuildPlanner {
             let vite_host_flag = |name: &str| -> &str {
                 let body = scripts.get(name).map(|s| s.as_str()).unwrap_or("");
                 if body.contains("vite") || name == "dev" || name == "preview" || name == "serve" {
-                    " -- --host 0.0.0.0"
+                    " -- --host 0.0.0.0 --port {PORT}"
                 } else {
                     ""
                 }
@@ -14836,7 +14836,7 @@ impl BuildPlanner {
                 format!("{pm_run} develop")
             } else {
                 // Nothing matched — log what scripts exist and fall back to dev
-                format!("{pm_run} dev -- --host 0.0.0.0")
+                format!("{pm_run} dev -- --host 0.0.0.0 --port {{PORT}}")
             }
         };
         let py_install = match package_manager {
@@ -18575,7 +18575,7 @@ mod tests {
             .any(|node| node.id == "install"));
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
-            Some("npm run dev -- --host 0.0.0.0")
+            Some("npm run dev -- --host 0.0.0.0 --port {PORT}")
         );
         assert_eq!(
             analysis.build_intelligence.package_manager.as_deref(),
@@ -18597,7 +18597,7 @@ mod tests {
         assert_eq!(analysis.language, Language::JavaScript);
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
-            Some("npm run dev -- --host 0.0.0.0")
+            Some("npm run dev -- --host 0.0.0.0 --port {PORT}")
         );
     }
 
@@ -18643,7 +18643,7 @@ mod tests {
         );
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
-            Some("uvicorn app:app --host 0.0.0.0 --port 8000")
+            Some("uvicorn app:app --host 0.0.0.0 --port {PORT}")
         );
     }
 
@@ -18657,7 +18657,7 @@ mod tests {
         assert_eq!(analysis.language, Language::JavaScript);
         assert_eq!(
             analysis.execution_graph.primary_run_command().as_deref(),
-            Some("npm run dev -- --host 0.0.0.0")
+            Some("npm run dev -- --host 0.0.0.0 --port {PORT}")
         );
         assert!(analysis.topology.is_none());
     }
@@ -19170,7 +19170,10 @@ dependencies:
             .edges
             .iter()
             .any(|edge| edge.from == "test" && edge.to == "dev"));
-        assert_eq!(graph.primary_run_command().as_deref(), Some("npm run dev"));
+        assert_eq!(
+            graph.primary_run_command().as_deref(),
+            Some("npm run dev -- --host 0.0.0.0 --port {PORT}")
+        );
         assert!(graph.nodes.iter().all(|node| node.cache_key.is_some()));
     }
 
@@ -19260,7 +19263,7 @@ dependencies:
                 .iter()
                 .find(|node| node.id == "dev")
                 .and_then(|node| node.command.as_deref()),
-            Some("bun run dev")
+            Some("bun run dev -- --host 0.0.0.0 --port {PORT}")
         );
     }
 
