@@ -145,15 +145,25 @@ function forbiddenOriginResponse(origin: string): NextResponse {
   );
 }
 
+function resolveOriginDecision(request: NextRequest): {
+  allowedOrigin: string | null;
+  requestOrigin: string | null;
+  isAllowed: boolean;
+} {
+  const requestOrigin = request.headers.get("origin");
+  const allowedOrigin = resolveAllowedOrigin(request);
+  const isAllowed = !requestOrigin || Boolean(allowedOrigin);
+  return { allowedOrigin, requestOrigin, isAllowed };
+}
+
 async function proxyRequest(
   request: NextRequest,
   params: Promise<{ path: string[] }>,
 ): Promise<NextResponse> {
   const resolvedParams = await params;
-  const allowedOrigin = resolveAllowedOrigin(request);
-  const requestOrigin = request.headers.get("origin");
-  if (requestOrigin && !allowedOrigin) {
-    return forbiddenOriginResponse(requestOrigin);
+  const originDecision = resolveOriginDecision(request);
+  if (!originDecision.isAllowed && originDecision.requestOrigin) {
+    return forbiddenOriginResponse(originDecision.requestOrigin);
   }
 
   const joinedPath = resolvedParams.path
@@ -201,7 +211,7 @@ async function proxyRequest(
   try {
     upstreamResponse = await sendUpstreamRequest(upstreamUrl);
   } catch (error) {
-    return upstreamFailureResponse(error, joinedPath, allowedOrigin);
+    return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
   }
   const joinedSegments = joinedPath.split("/");
   const hasProxyPrefix =
@@ -218,7 +228,7 @@ async function proxyRequest(
     try {
       upstreamResponse = await sendUpstreamRequest(proxiedUpstreamUrl);
     } catch (error) {
-      return upstreamFailureResponse(error, joinedPath, allowedOrigin);
+      return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
     }
   }
 
@@ -230,7 +240,7 @@ async function proxyRequest(
           upstreamResponse.headers.get("content-type") ?? "application/json",
       },
     }),
-    allowedOrigin,
+    originDecision.allowedOrigin,
   );
 }
 
@@ -256,13 +266,12 @@ export async function DELETE(
 }
 
 export async function OPTIONS(request: NextRequest) {
-  const allowedOrigin = resolveAllowedOrigin(request);
-  const requestOrigin = request.headers.get("origin");
-  if (!allowedOrigin) {
-    if (!requestOrigin) {
+  const originDecision = resolveOriginDecision(request);
+  if (!originDecision.allowedOrigin) {
+    if (!originDecision.requestOrigin) {
       return new NextResponse(null, { status: 403 });
     }
-    return forbiddenOriginResponse(requestOrigin);
+    return forbiddenOriginResponse(originDecision.requestOrigin);
   }
-  return withCorsHeaders(new NextResponse(null, { status: 204 }), allowedOrigin);
+  return withCorsHeaders(new NextResponse(null, { status: 204 }), originDecision.allowedOrigin);
 }
