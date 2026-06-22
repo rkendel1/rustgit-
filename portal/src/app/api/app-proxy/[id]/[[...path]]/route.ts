@@ -5,7 +5,7 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-const READY_LOG_PATTERN = /ready|listening|localhost|compiled|started|vite v/i;
+const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v)\b/i;
 
 type WorkspaceState = "Running" | "Failed" | string;
 
@@ -33,7 +33,25 @@ function retryDelayMs(attempt: number): number {
 
 function progressPercent(elapsedMs: number, maxWaitMs: number): number {
   if (maxWaitMs <= 0) return 0;
-  return Math.min(99, Math.floor((elapsedMs / maxWaitMs) * 100));
+  return Math.min(100, Math.floor((elapsedMs / maxWaitMs) * 100));
+}
+
+function shouldFetchLogs(attempt: number, hasLogs: boolean): boolean {
+  return !hasLogs || attempt % 2 === 0;
+}
+
+function probeError(error: unknown): string {
+  if (error instanceof Error && error.name === "TimeoutError") {
+    return "timeout";
+  }
+  return error instanceof Error ? error.message : "connection failed";
+}
+
+function processHint(logs: string[]): string {
+  const pidLine = logs.find((line) => line.includes("spawned pid:"));
+  if (!pidLine) return "unknown";
+  const match = pidLine.match(/spawned pid:\s*(\d+)/i);
+  return match ? `running (pid ${match[1]})` : "running";
 }
 
 async function getWorkspace(id: string): Promise<WorkspaceInfo | null> {
@@ -96,7 +114,13 @@ async function handle(
       ? new Uint8Array(await request.arrayBuffer())
       : undefined;
 
-  while (Date.now() - startedAt < maxWaitMs) {
+  const deadline = startedAt + maxWaitMs;
+  while (Date.now() < deadline) {
+    const now = Date.now();
+    const remaining = deadline - now;
+    if (remaining <= 0) {
+      break;
+    }
     const port = workspace.ports?.[0]?.port ?? null;
     if (!port) {
       lastProbe = "port unavailable";
@@ -107,6 +131,7 @@ async function handle(
           method: request.method,
           headers: forwardHeaders,
           body: bodyBytes,
+          signal: AbortSignal.timeout(Math.min(500, remaining)),
         });
 
         const contentType = upstreamRes.headers.get("content-type") ?? "";
@@ -150,7 +175,7 @@ async function handle(
           headers: responseHeaders,
         });
       } catch (error) {
-        lastProbe = error instanceof Error ? error.message : "connection failed";
+        lastProbe = probeError(error);
       }
     }
 
@@ -162,6 +187,7 @@ async function handle(
           error: "Workspace failed to become ready.",
           status: "failed",
           framework: workspace.framework ?? "unknown",
+          process: processHint(logs),
           workspaceState: workspace.state,
           port: workspace.ports?.[0]?.port ?? null,
           lastProbe,
@@ -173,7 +199,7 @@ async function handle(
       );
     }
 
-    if (attempt % 2 === 0 || lastLogs.length === 0) {
+    if (shouldFetchLogs(attempt, lastLogs.length > 0)) {
       const logs = await getWorkspaceLogs(id);
       if (logs.length > 0) {
         lastLogs = logs.slice(-5);
@@ -188,7 +214,13 @@ async function handle(
     if (elapsed >= maxWaitMs) {
       break;
     }
-    await new Promise((r) => setTimeout(r, Math.min(delay, maxWaitMs - elapsed)));
+    const remainingAfterWork = maxWaitMs - elapsed;
+    const boundedDelay = Math.min(delay, remainingAfterWork);
+    const waitMs = Math.max(100, boundedDelay);
+    if (remainingAfterWork < 100) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
     attempt += 1;
     const refreshed = await getWorkspace(id);
     if (!refreshed) {
@@ -202,6 +234,7 @@ async function handle(
     {
       status: "starting",
       framework: workspace.framework ?? "unknown",
+      process: processHint(lastLogs),
       workspaceState: workspace.state ?? "unknown",
       port: workspace.ports?.[0]?.port ?? null,
       progress: progressPercent(elapsed, maxWaitMs),
