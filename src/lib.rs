@@ -12343,6 +12343,150 @@ impl WorkspaceManager {
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))
     }
 
+    /// Immediately allocates a workspace ID and inserts a pending record.
+    /// Call `complete_launch` on a background thread to do the actual work.
+    pub fn begin_launch(&self, repo_url: &str) -> String {
+        let id = self.next_workspace_id();
+        let workspace_root = self.root.join("workspaces").join(&id);
+        let workspace = Workspace {
+            id: id.clone(),
+            repo_url: repo_url.to_string(),
+            root: workspace_root,
+            state: WorkspaceState::Created,
+            framework: Framework::Unknown,
+            ports: vec![],
+            network_policy: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+            resource_quotas: ResourceQuotas {
+                max_memory_mb: 1024,
+                max_cpu_millis: 1000,
+            },
+        };
+        let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+        workspaces.insert(
+            id.clone(),
+            LocalWorkspaceRecord {
+                workspace,
+                logs: vec!["workspace queued".to_string()],
+                execution_context: None,
+                process_handle: None,
+                child_process: None,
+            },
+        );
+        id
+    }
+
+    /// Does the blocking work for a workspace previously allocated by `begin_launch`.
+    pub fn complete_launch(&self, id: &str, repo_url: &str) {
+        let workspace_root = self.root.join("workspaces").join(id);
+        let repository_root = workspace_root.join("repo");
+
+        let mut workspace = {
+            let workspaces = self.workspaces.lock().expect("workspace lock poisoned");
+            match workspaces.get(id) {
+                Some(r) => r.workspace.clone(),
+                None => return,
+            }
+        };
+
+        let push_log = |msg: String| {
+            if let Ok(mut w) = self.workspaces.lock() {
+                if let Some(r) = w.get_mut(id) {
+                    r.logs.push(msg);
+                }
+            }
+        };
+        let set_failed = |msg: String| {
+            if let Ok(mut w) = self.workspaces.lock() {
+                if let Some(r) = w.get_mut(id) {
+                    r.workspace.state = WorkspaceState::Failed;
+                    r.logs.push(msg);
+                }
+            }
+        };
+        let set_state = |state: WorkspaceState| {
+            if let Ok(mut w) = self.workspaces.lock() {
+                if let Some(r) = w.get_mut(id) {
+                    r.workspace.state = state;
+                }
+            }
+        };
+
+        if let Err(e) = fs::create_dir_all(&workspace_root) {
+            set_failed(format!("workspace failed: {e}"));
+            return;
+        }
+
+        set_state(WorkspaceState::Materializing);
+        if let Err(e) = self.materialize_repository(repo_url, &repository_root) {
+            set_failed(format!("workspace failed: {e}"));
+            return;
+        }
+        push_log(format!("materialized repository: {repo_url}"));
+
+        set_state(WorkspaceState::Analyzing);
+        let analysis = match analyze_repository(&repository_root) {
+            Ok(a) => a,
+            Err(e) => { set_failed(format!("workspace failed: {e}")); return; }
+        };
+        push_log(format!("detected framework: {:?}", analysis.framework));
+
+        set_state(WorkspaceState::Planning);
+        let mut ctx = ExecutionContext {
+            workspace_id: id.to_string(),
+            repo_path: repository_root.to_string_lossy().to_string(),
+            analysis: analysis.clone(),
+            execution_graph: analysis.execution_graph.clone(),
+            runtime_spec: analysis.runtime_spec.clone(),
+            compiled_runtime: analysis.compiled_runtime.clone(),
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: analysis.runtime_spec.memory_limit_mb,
+                max_cpu_millis: analysis.runtime_spec.cpu_limit_units,
+            },
+            network: analysis.runtime_spec.network_policy.clone(),
+        };
+        push_log(format!(
+            "planned execution command: {}",
+            ctx.execution_graph.primary_run_command().unwrap_or_else(|| "none".to_string())
+        ));
+
+        set_state(WorkspaceState::Starting);
+        let handle = match self.execution_engine.start(&mut ctx) {
+            Ok(h) => h,
+            Err(e) => { set_failed(format!("workspace failed: {e}")); return; }
+        };
+        push_log(format!("started process: {}", handle.pid_hint));
+
+        workspace.framework = ctx.analysis.framework;
+        workspace.ports = ports_for_framework(ctx.analysis.framework);
+        workspace.network_policy = ctx.network.clone();
+        workspace.resource_quotas = ctx.resources.clone();
+
+        let (child, assigned_port) = Self::spawn_run_command(&ctx, &mut vec![]);
+        if let Some(port) = assigned_port {
+            for p in &mut workspace.ports {
+                p.port = port;
+            }
+        }
+
+        if let Ok(mut workspaces) = self.workspaces.lock() {
+            if let Some(r) = workspaces.get_mut(id) {
+                r.workspace = workspace;
+                r.workspace.state = WorkspaceState::Running;
+                if let Some(port) = assigned_port {
+                    push_log(format!("spawned pid: {} on port {port}", child.as_ref().map_or(0, |c| c.id())));
+                }
+                r.execution_context = Some(ctx);
+                r.process_handle = Some(handle);
+                r.child_process = child;
+                r.logs.push("workspace running".to_string());
+            }
+        }
+    }
+
     fn find_free_port() -> Option<u16> {
         std::net::TcpListener::bind("127.0.0.1:0")
             .ok()

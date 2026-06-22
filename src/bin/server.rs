@@ -246,22 +246,25 @@ async fn launch_execution(
     Json(body): Json<ExecutionRequest>,
 ) -> Result<(StatusCode, Json<ExecutionResponse>), (StatusCode, Json<Value>)> {
     let repo_url = resolve_repo_url(body.repo_url, None, body.owner, body.repo)?;
-    let _branch = body.branch;
     let manager = state.manager;
-    tokio::task::spawn_blocking(move || manager.launch(&repo_url))
-        .await
-        .expect("task panicked")
-        .map(|workspace| {
-            (
-                StatusCode::CREATED,
-                Json(ExecutionResponse {
-                    execution_id: workspace.id.clone(),
-                    workspace_url: format!("{}/workspaces/{}", base_url(), workspace.id),
-                    status: format!("{:?}", workspace.state).to_lowercase(),
-                }),
-            )
-        })
-        .map_err(err_response)
+
+    // Allocate the workspace ID synchronously (fast — just inserts a pending record)
+    let id = manager.begin_launch(&repo_url);
+    let workspace_url = format!("{}/workspaces/{}", base_url(), id);
+
+    // Do the heavy work (git clone, npm install, process spawn) in a background thread.
+    // The UI polls /workspaces/:id for status updates while this runs.
+    let id_bg = id.clone();
+    tokio::task::spawn_blocking(move || manager.complete_launch(&id_bg, &repo_url));
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ExecutionResponse {
+            execution_id: id,
+            workspace_url,
+            status: "created".to_string(),
+        }),
+    ))
 }
 
 async fn analyze_repository(
