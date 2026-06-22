@@ -7,19 +7,22 @@ const BACKEND_BASE =
 
 const MAX_PROBE_TIMEOUT_MS = 500;
 
-type WorkspaceInfo = {
-  state?: string;
-  framework?: string;
-};
-
 type WorkspaceRuntime = {
+  framework?: string;
+  workspace_id?: string;
+  provider_selected?: string;
   pid?: number;
   alive?: boolean;
+  process_state?: string;
   exit_code?: number | null;
   requested_port?: number;
   actual_port?: number | null;
   listening?: boolean;
+  detected_start_signal?: string | null;
   http_ready?: boolean;
+  readiness_state?: string;
+  lifecycle_state?: string;
+  last_http_probe?: string;
   last_probe?: string;
   stdout?: string[];
   stderr?: string[];
@@ -27,16 +30,6 @@ type WorkspaceRuntime = {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c] ?? c));
-}
-
-async function getWorkspace(id: string): Promise<WorkspaceInfo | null> {
-  try {
-    const res = await fetch(`${BACKEND_BASE}/workspaces/${id}`, { cache: "no-store" });
-    if (!res.ok) return null;
-    return (await res.json()) as WorkspaceInfo;
-  } catch {
-    return null;
-  }
 }
 
 async function getRuntime(id: string): Promise<WorkspaceRuntime | null> {
@@ -49,17 +42,17 @@ async function getRuntime(id: string): Promise<WorkspaceRuntime | null> {
   }
 }
 
-function startupHtml(id: string, workspace: WorkspaceInfo, runtime: WorkspaceRuntime): string {
+function startupHtml(id: string, runtime: WorkspaceRuntime): string {
   const logs = [...(runtime.stdout ?? []), ...(runtime.stderr ?? [])].slice(-20);
   const safeLogs = logs
     .map((line) => escapeHtml(line))
     .join("\n");
   const details = [
     `Workspace: ${escapeHtml(id)}`,
-    `Framework: ${escapeHtml(workspace.framework ?? "unknown")}`,
-    `Status: ${escapeHtml(workspace.state ?? "Initializing")}`,
+    `Framework: ${escapeHtml(runtime.framework ?? "unknown")}`,
+    `Status: ${escapeHtml(runtime.lifecycle_state ?? "Initializing")}`,
     `PID: ${escapeHtml(String(runtime.pid ?? "unknown"))}`,
-    `Probe: ${escapeHtml(runtime.last_probe ?? "connection refused")}`,
+    `Probe: ${escapeHtml(runtime.last_http_probe ?? runtime.last_probe ?? "connection refused")}`,
   ]
     .map((line) => `<div>${line}</div>`)
     .join("");
@@ -71,30 +64,32 @@ async function handle(
   params: Promise<{ id: string; path?: string[] }>,
 ): Promise<NextResponse> {
   const { id, path } = await params;
-  const workspace = await getWorkspace(id);
-  if (!workspace) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
-  }
   const runtime = await getRuntime(id);
-  const port = runtime?.actual_port ?? null;
-  const isReady = Boolean(runtime?.alive && runtime?.http_ready && port);
+  const truth = runtime ?? {};
+  const port = truth.actual_port ?? null;
+  const isReady = Boolean(truth.http_ready && port);
 
   if (!isReady || !port) {
     const payload = {
       workspaceId: id,
-      framework: workspace.framework ?? "unknown",
-      state: workspace.state ?? "Initializing",
-      pid: runtime?.pid ?? null,
-      requestedPort: runtime?.requested_port ?? null,
-      actualPort: runtime?.actual_port ?? null,
-      processAlive: runtime?.alive ?? false,
-      httpReady: runtime?.http_ready ?? false,
-      lastProbe: runtime?.last_probe ?? "connection refused",
-      logs: [...(runtime?.stdout ?? []), ...(runtime?.stderr ?? [])].slice(-20),
+      framework: truth.framework ?? "unknown",
+      state: truth.lifecycle_state ?? "Initializing",
+      provider: truth.provider_selected ?? null,
+      processState: truth.process_state ?? null,
+      readinessState: truth.readiness_state ?? null,
+      pid: truth.pid ?? null,
+      requestedPort: truth.requested_port ?? null,
+      actualPort: truth.actual_port ?? null,
+      processAlive: truth.alive ?? false,
+      httpReady: truth.http_ready ?? false,
+      lastProbe: truth.last_http_probe ?? truth.last_probe ?? "connection refused",
+      detectedStartSignal: truth.detected_start_signal ?? null,
+      logs: [...(truth.stdout ?? []), ...(truth.stderr ?? [])].slice(-20),
+      truth,
     };
 
     if (request.method === "GET") {
-      return new NextResponse(startupHtml(id, workspace, runtime ?? {}), {
+      return new NextResponse(startupHtml(id, truth), {
         status: 202,
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
       });

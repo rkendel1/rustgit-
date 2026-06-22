@@ -9,21 +9,23 @@ const BACKEND_BASE =
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 let browserPromise: Promise<Browser> | null = null;
 
-type WorkspaceInfo = {
-  state?: string;
-  ports?: Array<{ port?: number }>;
+type WorkspaceRuntime = {
+  actual_port?: number | null;
+  http_ready?: boolean;
+  lifecycle_state?: string;
+  last_http_probe?: string;
 };
 
-async function getWorkspace(id: string): Promise<WorkspaceInfo | null> {
+async function getRuntimeTruth(id: string): Promise<WorkspaceRuntime | null> {
   try {
-    const response = await fetch(`${BACKEND_BASE}/workspaces/${id}`, {
+    const response = await fetch(`${BACKEND_BASE}/workspaces/${id}/runtime`, {
       cache: "no-store",
     });
     if (!response.ok) {
       return null;
     }
 
-    return (await response.json()) as WorkspaceInfo;
+    return (await response.json()) as WorkspaceRuntime;
   } catch {
     return null;
   }
@@ -44,12 +46,16 @@ export async function GET(
   context: { params: Promise<{ id: string }> },
 ) {
   const { id } = await context.params;
-  const workspace = await getWorkspace(id);
-  const port = workspace?.ports?.[0]?.port;
+  const runtimeTruth = await getRuntimeTruth(id);
+  const port = runtimeTruth?.actual_port;
 
-  if (!workspace || workspace.state !== "Running" || !port) {
+  if (!runtimeTruth || !runtimeTruth.http_ready || !port) {
     return NextResponse.json(
-      { error: "Workspace is not running yet." },
+      {
+        error: "Workspace app is not ready yet.",
+        lifecycle_state: runtimeTruth?.lifecycle_state ?? "unknown",
+        last_probe: runtimeTruth?.last_http_probe ?? "not probed",
+      },
       { status: 409 },
     );
   }

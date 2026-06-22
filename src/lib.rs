@@ -95,6 +95,16 @@ const PREFLIGHT_RUNTIME_CONFIDENCE_WASM: u8 = 98;
 const PREFLIGHT_RUNTIME_CONFIDENCE_NATIVE: u8 = 99;
 const PREFLIGHT_FAILURE_PENALTY_PER_ISSUE: u8 = 2;
 const MAX_RUNTIME_LOG_LINES: usize = 500;
+const STARTUP_LOG_PATTERNS: [&str; 8] = [
+    "ready",
+    "listening",
+    "vite",
+    "local:",
+    "network:",
+    "started",
+    "compiled successfully",
+    "running on",
+];
 pub const DDOCKIT_ANON_ID_COOKIE: &str = "ddockit_anon_id";
 pub const DDOCKIT_SESSION_ID_COOKIE: &str = "ddockit_session_id";
 const DISTRIBUTED_ARTIFACT_STORE_POISONED: &str =
@@ -12073,32 +12083,208 @@ pub enum ProcessStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionReadinessState {
+    Starting,
+    SignalDetected,
+    Ready,
+    Exited,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutionTruthEvent {
+    StdoutLine(String),
+    StderrLine(String),
+    ProcessAlive(bool),
+    ProcessExited(Option<i32>),
+    ObservedPort(Option<u16>),
+    HttpProbeOk(u16),
+    HttpProbeErr(String),
+    ReadinessTimedOut,
+    Lifecycle(WorkspaceState),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WorkspaceProcess {
-    pub id: String,
+pub struct ExecutionTruth {
+    pub workspace_id: String,
+    pub provider_selected: String,
     pub pid: u32,
-    pub status: ProcessStatus,
+    pub process_state: ProcessStatus,
+    pub exit_code: Option<i32>,
     pub requested_port: u16,
     pub actual_port: Option<u16>,
-    pub started_at_unix_ms: u128,
-    pub exit_code: Option<i32>,
-    pub process_alive: bool,
+    pub stdout_tail: Vec<String>,
+    pub stderr_tail: Vec<String>,
+    pub detected_start_signal: Option<String>,
     pub http_ready: bool,
-    pub last_probe: String,
-    pub stdout: Vec<String>,
-    pub stderr: Vec<String>,
+    pub last_http_probe: String,
+    pub readiness_state: ExecutionReadinessState,
+    pub lifecycle_state: WorkspaceState,
+    #[serde(skip_serializing)]
+    pub started_at_unix_ms: u128,
+    #[serde(skip_serializing)]
+    pub process_alive: bool,
+}
+
+impl ExecutionTruth {
+    fn new(workspace_id: String, requested_port: u16, pid: u32) -> Self {
+        Self {
+            workspace_id,
+            provider_selected: "local-supervised-process".to_string(),
+            pid,
+            process_state: ProcessStatus::Launching,
+            exit_code: None,
+            requested_port,
+            actual_port: None,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+            detected_start_signal: None,
+            http_ready: false,
+            last_http_probe: "not probed".to_string(),
+            readiness_state: ExecutionReadinessState::Starting,
+            lifecycle_state: WorkspaceState::Launching,
+            started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            process_alive: true,
+        }
+    }
+
+    fn update_from_event(&mut self, event: ExecutionTruthEvent) {
+        match event {
+            ExecutionTruthEvent::StdoutLine(line) => {
+                WorkspaceManager::append_capped(&mut self.stdout_tail, line.clone());
+                if self.detected_start_signal.is_none()
+                    && STARTUP_LOG_PATTERNS
+                        .iter()
+                        .any(|pattern| line.to_ascii_lowercase().contains(pattern))
+                {
+                    self.detected_start_signal = Some(line);
+                    self.readiness_state = ExecutionReadinessState::SignalDetected;
+                }
+            }
+            ExecutionTruthEvent::StderrLine(line) => {
+                WorkspaceManager::append_capped(&mut self.stderr_tail, line.clone());
+                if self.detected_start_signal.is_none()
+                    && STARTUP_LOG_PATTERNS
+                        .iter()
+                        .any(|pattern| line.to_ascii_lowercase().contains(pattern))
+                {
+                    self.detected_start_signal = Some(line);
+                    self.readiness_state = ExecutionReadinessState::SignalDetected;
+                }
+            }
+            ExecutionTruthEvent::ProcessAlive(alive) => {
+                self.process_alive = alive;
+                if alive {
+                    self.process_state = ProcessStatus::Initializing;
+                } else {
+                    self.process_state = ProcessStatus::Stopped;
+                    self.lifecycle_state = WorkspaceState::Failed;
+                    self.readiness_state = ExecutionReadinessState::Exited;
+                }
+            }
+            ExecutionTruthEvent::ProcessExited(code) => {
+                self.exit_code = code;
+                self.process_alive = false;
+                self.process_state = ProcessStatus::Failed;
+                self.lifecycle_state = WorkspaceState::Failed;
+                self.readiness_state = ExecutionReadinessState::Exited;
+            }
+            ExecutionTruthEvent::ObservedPort(port) => {
+                self.actual_port = port;
+            }
+            ExecutionTruthEvent::HttpProbeOk(status) => {
+                self.http_ready = true;
+                self.last_http_probe = format!("{status} OK");
+            }
+            ExecutionTruthEvent::HttpProbeErr(err) => {
+                self.http_ready = false;
+                self.last_http_probe = err;
+            }
+            ExecutionTruthEvent::ReadinessTimedOut => {
+                self.process_state = ProcessStatus::Failed;
+                self.readiness_state = ExecutionReadinessState::TimedOut;
+                self.lifecycle_state = WorkspaceState::Failed;
+            }
+            ExecutionTruthEvent::Lifecycle(state) => {
+                self.lifecycle_state = state;
+                self.process_state = match state {
+                    WorkspaceState::Launching => ProcessStatus::Launching,
+                    WorkspaceState::Initializing => ProcessStatus::Initializing,
+                    WorkspaceState::Ready => ProcessStatus::Ready,
+                    WorkspaceState::Running => ProcessStatus::Running,
+                    WorkspaceState::Stopping => ProcessStatus::Stopping,
+                    WorkspaceState::Stopped => ProcessStatus::Stopped,
+                    WorkspaceState::Failed => ProcessStatus::Failed,
+                    _ => self.process_state,
+                };
+            }
+        }
+        self.evaluate_readiness();
+    }
+
+    fn evaluate_readiness(&mut self) {
+        if self.exit_code.is_some() || !self.process_alive {
+            self.readiness_state = ExecutionReadinessState::Exited;
+            if !matches!(
+                self.lifecycle_state,
+                WorkspaceState::Stopped | WorkspaceState::Stopping | WorkspaceState::Destroyed
+            ) {
+                self.lifecycle_state = WorkspaceState::Failed;
+            }
+            return;
+        }
+        let ready_signal = self.process_alive || self.http_ready || self.detected_start_signal.is_some();
+        if ready_signal {
+            if self.http_ready {
+                self.readiness_state = ExecutionReadinessState::Ready;
+                if matches!(
+                    self.lifecycle_state,
+                    WorkspaceState::Launching | WorkspaceState::Initializing | WorkspaceState::Ready
+                ) {
+                    self.lifecycle_state = WorkspaceState::Ready;
+                    self.process_state = ProcessStatus::Ready;
+                }
+            } else if self.detected_start_signal.is_some() {
+                self.readiness_state = ExecutionReadinessState::SignalDetected;
+                if matches!(
+                    self.lifecycle_state,
+                    WorkspaceState::Launching | WorkspaceState::Initializing
+                ) {
+                    self.lifecycle_state = WorkspaceState::Initializing;
+                    self.process_state = ProcessStatus::Initializing;
+                }
+            } else if matches!(
+                self.lifecycle_state,
+                WorkspaceState::Launching | WorkspaceState::Initializing
+            ) {
+                self.readiness_state = ExecutionReadinessState::Starting;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceRuntimeStatus {
+    pub workspace_id: String,
+    pub provider_selected: String,
     pub pid: u32,
     pub alive: bool,
+    pub process_state: ProcessStatus,
     pub exit_code: Option<i32>,
     pub framework: String,
     pub requested_port: u16,
     pub actual_port: Option<u16>,
     pub listening: bool,
+    pub detected_start_signal: Option<String>,
     pub http_ready: bool,
+    pub readiness_state: ExecutionReadinessState,
+    pub lifecycle_state: WorkspaceState,
+    pub last_http_probe: String,
     pub last_probe: String,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
@@ -12201,7 +12387,7 @@ struct LocalWorkspaceRecord {
     execution_context: Option<ExecutionContext>,
     process_handle: Option<ProcessHandle>,
     child_process: Option<Child>,
-    runtime: Option<WorkspaceProcess>,
+    runtime: Option<ExecutionTruth>,
     launch_overrides: LaunchOverrides,
 }
 
@@ -12386,8 +12572,8 @@ impl WorkspaceManager {
                 record.workspace.state = WorkspaceState::Failed;
                 Self::append_capped(&mut record.logs, message.clone());
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.status = ProcessStatus::Failed;
-                    runtime.process_alive = false;
+                    runtime.update_from_event(ExecutionTruthEvent::ProcessExited(runtime.exit_code));
+                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Failed));
                 }
             }
         }
@@ -12404,9 +12590,9 @@ impl WorkspaceManager {
                 Self::append_capped(&mut record.logs, line.clone());
                 if let Some(runtime) = record.runtime.as_mut() {
                     if is_stderr {
-                        Self::append_capped(&mut runtime.stderr, line);
+                        runtime.update_from_event(ExecutionTruthEvent::StderrLine(line));
                     } else {
-                        Self::append_capped(&mut runtime.stdout, line);
+                        runtime.update_from_event(ExecutionTruthEvent::StdoutLine(line));
                     }
                 }
             }
@@ -12541,7 +12727,6 @@ impl WorkspaceManager {
                 if let Some(child) = record.child_process.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            record.workspace.state = WorkspaceState::Failed;
                             Self::append_capped(
                                 &mut record.logs,
                                 format!(
@@ -12552,22 +12737,30 @@ impl WorkspaceManager {
                                 ),
                             );
                             if let Some(runtime) = record.runtime.as_mut() {
-                                runtime.exit_code = status.code();
-                                runtime.process_alive = false;
-                                runtime.status = ProcessStatus::Failed;
+                                runtime.update_from_event(ExecutionTruthEvent::ProcessExited(
+                                    status.code(),
+                                ));
+                                runtime.update_from_event(ExecutionTruthEvent::Lifecycle(
+                                    WorkspaceState::Failed,
+                                ));
+                                record.workspace.state = runtime.lifecycle_state;
                             }
                             record.child_process = None;
                             should_exit = true;
                         }
                         Ok(None) => {
-                            if record.workspace.state == WorkspaceState::Ready {
-                                record.workspace.state = WorkspaceState::Running;
-                            }
                             if let Some(runtime) = record.runtime.as_mut() {
-                                runtime.process_alive = true;
-                                if runtime.http_ready {
-                                    runtime.status = ProcessStatus::Running;
+                                runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
+                                if runtime.http_ready
+                                    && runtime.lifecycle_state == WorkspaceState::Ready
+                                {
+                                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(
+                                        WorkspaceState::Running,
+                                    ));
                                 }
+                                record.workspace.state = runtime.lifecycle_state;
+                            } else if record.workspace.state == WorkspaceState::Ready {
+                                record.workspace.state = WorkspaceState::Running;
                             }
                         }
                         Err(_) => {}
@@ -12959,23 +13152,8 @@ impl WorkspaceManager {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let runtime = WorkspaceProcess {
-            id: id.to_string(),
-            pid,
-            status: ProcessStatus::Launching,
-            requested_port,
-            actual_port: None,
-            started_at_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            exit_code: None,
-            process_alive: true,
-            http_ready: false,
-            last_probe: "not probed".to_string(),
-            stdout: vec![],
-            stderr: vec![],
-        };
+        let mut runtime = ExecutionTruth::new(id.to_string(), requested_port, pid);
+        runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Launching));
 
         if let Ok(mut workspaces) = self.workspaces.lock() {
             if let Some(record) = workspaces.get_mut(id) {
@@ -13012,9 +13190,9 @@ impl WorkspaceManager {
 
         if let Ok(mut workspaces) = self.workspaces.lock() {
             if let Some(record) = workspaces.get_mut(id) {
-                record.workspace.state = WorkspaceState::Ready;
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.status = ProcessStatus::Ready;
+                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
+                    record.workspace.state = runtime.lifecycle_state;
                 }
                 Self::append_capped(&mut record.logs, "workspace ready".to_string());
             }
@@ -13300,17 +13478,6 @@ impl WorkspaceManager {
     }
 
     fn wait_for_runtime_readiness(&self, id: &str) -> Result<()> {
-        // Framework-agnostic startup hints observed across Node/Python dev servers.
-        const STARTUP_LOG_PATTERNS: [&str; 8] = [
-            "ready",
-            "listening",
-            "vite",
-            "local:",
-            "network:",
-            "started",
-            "compiled successfully",
-            "running on",
-        ];
         const READINESS_POLL_INTERVAL_MS: u64 = 500;
         const READINESS_TIMEOUT_MS: u64 = 30_000;
         const MAX_ATTEMPTS: usize = (READINESS_TIMEOUT_MS / READINESS_POLL_INTERVAL_MS) as usize;
@@ -13327,44 +13494,40 @@ impl WorkspaceManager {
                     }
                 }
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.process_alive = exited_status.is_none();
-                    runtime.actual_port =
-                        Self::parse_listening_ports(runtime.pid).into_iter().next();
-
-                    let log_ready =
-                        runtime
-                            .stdout
-                            .iter()
-                            .chain(runtime.stderr.iter())
-                            .any(|line| {
-                                let lowercase_line = line.to_ascii_lowercase();
-                                STARTUP_LOG_PATTERNS
-                                    .iter()
-                                    .any(|pattern| lowercase_line.contains(pattern))
-                            });
-                    if log_ready {
-                        runtime.last_probe = "startup logs indicate ready".to_string();
-                    }
+                    runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(exited_status.is_none()));
+                    let observed_port = Self::parse_listening_ports(runtime.pid).into_iter().next();
+                    runtime.update_from_event(ExecutionTruthEvent::ObservedPort(observed_port));
                     if let Some(port) = runtime.actual_port {
                         match Self::http_probe(port) {
                             Ok(status) => {
-                                runtime.http_ready = true;
-                                runtime.last_probe = format!("{status} OK");
+                                runtime.update_from_event(ExecutionTruthEvent::HttpProbeOk(status));
                                 return Ok(());
                             }
                             Err(err) => {
-                                runtime.http_ready = false;
-                                runtime.last_probe = err;
+                                runtime.update_from_event(ExecutionTruthEvent::HttpProbeErr(err));
                             }
                         }
                     } else {
-                        runtime.last_probe = "connection refused".to_string();
+                        runtime.update_from_event(ExecutionTruthEvent::HttpProbeErr(
+                            "connection refused".to_string(),
+                        ));
                     }
-                    runtime.status = ProcessStatus::Initializing;
+                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(
+                        WorkspaceState::Initializing,
+                    ));
+                    record.workspace.state = runtime.lifecycle_state;
                 }
             }
 
             if let Some(code) = exited_status {
+                if let Ok(mut workspaces) = self.workspaces.lock() {
+                    if let Some(record) = workspaces.get_mut(id) {
+                        if let Some(runtime) = record.runtime.as_mut() {
+                            runtime.update_from_event(ExecutionTruthEvent::ProcessExited(code));
+                        }
+                        record.workspace.state = WorkspaceState::Failed;
+                    }
+                }
                 return Err(RuntimeError::CommandFailed(format!(
                     "process exited before readiness probe completed (code {:?})",
                     code
@@ -13373,9 +13536,15 @@ impl WorkspaceManager {
             std::thread::sleep(Duration::from_millis(READINESS_POLL_INTERVAL_MS));
         }
 
-        Err(RuntimeError::CommandFailed(
-            "readiness probe timed out".to_string(),
-        ))
+        if let Ok(mut workspaces) = self.workspaces.lock() {
+            if let Some(record) = workspaces.get_mut(id) {
+                if let Some(runtime) = record.runtime.as_mut() {
+                    runtime.update_from_event(ExecutionTruthEvent::ReadinessTimedOut);
+                }
+                record.workspace.state = WorkspaceState::Failed;
+            }
+        }
+        Err(RuntimeError::CommandFailed("readiness probe timed out".to_string()))
     }
 
     // Returns (child, assigned_port)
@@ -13604,7 +13773,6 @@ impl WorkspaceManager {
                 if let Some(child) = record.child_process.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            record.workspace.state = WorkspaceState::Failed;
                             Self::append_capped(
                                 &mut record.logs,
                                 format!(
@@ -13615,15 +13783,19 @@ impl WorkspaceManager {
                                 ),
                             );
                             if let Some(runtime) = record.runtime.as_mut() {
-                                runtime.exit_code = status.code();
-                                runtime.process_alive = false;
-                                runtime.status = ProcessStatus::Failed;
+                                runtime
+                                    .update_from_event(ExecutionTruthEvent::ProcessExited(status.code()));
+                                runtime.update_from_event(ExecutionTruthEvent::Lifecycle(
+                                    WorkspaceState::Failed,
+                                ));
+                                record.workspace.state = runtime.lifecycle_state;
                             }
                             record.child_process = None;
                         }
                         Ok(None) => {
                             if let Some(runtime) = record.runtime.as_mut() {
-                                runtime.process_alive = true;
+                                runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
+                                record.workspace.state = runtime.lifecycle_state;
                             }
                         }
                         Err(_) => {}
@@ -13747,17 +13919,24 @@ impl WorkspaceManager {
             }
         });
         Ok(WorkspaceRuntimeStatus {
+            workspace_id: runtime.workspace_id.clone(),
+            provider_selected: runtime.provider_selected.clone(),
             pid: runtime.pid,
             alive: runtime.process_alive,
+            process_state: runtime.process_state,
             exit_code: runtime.exit_code,
             framework: format!("{:?}", record.workspace.framework).to_lowercase(),
             requested_port: runtime.requested_port,
             actual_port: runtime.actual_port,
             listening: runtime.actual_port.is_some(),
+            detected_start_signal: runtime.detected_start_signal.clone(),
             http_ready: runtime.http_ready,
-            last_probe: runtime.last_probe.clone(),
-            stdout: runtime.stdout.clone(),
-            stderr: runtime.stderr.clone(),
+            readiness_state: runtime.readiness_state,
+            lifecycle_state: runtime.lifecycle_state,
+            last_http_probe: runtime.last_http_probe.clone(),
+            last_probe: runtime.last_http_probe.clone(),
+            stdout: runtime.stdout_tail.clone(),
+            stderr: runtime.stderr_tail.clone(),
             execution_trace,
         })
     }
@@ -13908,7 +14087,7 @@ impl WasmWorkspace for WorkspaceManager {
             .ok_or_else(|| RuntimeError::WorkspaceMissing(id.to_string()))?;
         Self::transition_state(&mut record.workspace, WorkspaceState::Stopping)?;
         if let Some(runtime) = record.runtime.as_mut() {
-            runtime.status = ProcessStatus::Stopping;
+            runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Stopping));
         }
         if let (Some(ctx), Some(handle)) = (&record.execution_context, &record.process_handle) {
             self.execution_engine.stop(ctx, handle)?;
@@ -13921,8 +14100,9 @@ impl WasmWorkspace for WorkspaceManager {
         record.process_handle = None;
         Self::transition_state(&mut record.workspace, WorkspaceState::Stopped)?;
         if let Some(runtime) = record.runtime.as_mut() {
-            runtime.status = ProcessStatus::Stopped;
-            runtime.process_alive = false;
+            runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(false));
+            runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Stopped));
+            record.workspace.state = runtime.lifecycle_state;
         }
         Self::append_capped(&mut record.logs, "workspace stopped".to_string());
         Ok(())
@@ -20160,6 +20340,33 @@ dependencies:
         let logs = manager.logs(&workspace.id).expect("workspace logs");
         assert!(logs.iter().any(|line| line.contains("workspace stopped")));
         assert!(logs.iter().any(|line| line.contains("workspace restarted")));
+    }
+
+    #[test]
+    fn execution_truth_tracks_exit_and_lifecycle() {
+        let mut truth = ExecutionTruth::new("ws-test".to_string(), 3000, 12345);
+        truth.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
+        truth.update_from_event(ExecutionTruthEvent::ObservedPort(Some(3000)));
+        truth.update_from_event(ExecutionTruthEvent::HttpProbeOk(200));
+        truth.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
+        assert_eq!(truth.readiness_state, ExecutionReadinessState::Ready);
+        assert_eq!(truth.lifecycle_state, WorkspaceState::Ready);
+
+        truth.update_from_event(ExecutionTruthEvent::ProcessExited(Some(137)));
+        assert_eq!(truth.readiness_state, ExecutionReadinessState::Exited);
+        assert_eq!(truth.lifecycle_state, WorkspaceState::Failed);
+        assert_eq!(truth.exit_code, Some(137));
+    }
+
+    #[test]
+    fn execution_truth_preserves_stopped_lifecycle_after_process_end() {
+        let mut truth = ExecutionTruth::new("ws-test".to_string(), 3000, 12345);
+        truth.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Stopping));
+        truth.update_from_event(ExecutionTruthEvent::ProcessAlive(false));
+        truth.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Stopped));
+        assert_eq!(truth.readiness_state, ExecutionReadinessState::Exited);
+        assert_eq!(truth.lifecycle_state, WorkspaceState::Stopped);
+        assert_eq!(truth.process_state, ProcessStatus::Stopped);
     }
 
     #[test]

@@ -800,7 +800,10 @@ async fn workspace_runtime(
     Path(id): Path<String>,
 ) -> Result<Json<WorkspaceRuntimeStatus>, (StatusCode, Json<Value>)> {
     let manager = state.manager;
-    tokio::task::spawn_blocking(move || manager.runtime_status(&id))
+    tokio::task::spawn_blocking(move || {
+        manager.sync_process_health(&id);
+        manager.runtime_status(&id)
+    })
         .await
         .expect("task panicked")
         .map(Json)
