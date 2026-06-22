@@ -12266,6 +12266,27 @@ impl ExecutionTruth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ExecutionRoutingMode {
+    Local,
+    Wasm,
+    Remote,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionHandle {
+    pub workspace_id: String,
+    pub provider_id: String,
+    pub execution_id: String,
+    pub routing_mode: ExecutionRoutingMode,
+    pub endpoint: Option<String>,
+    pub stream_channel: Option<String>,
+    pub readiness_state: ExecutionReadinessState,
+    pub authority_node: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceRuntimeStatus {
     pub workspace_id: String,
     pub provider_selected: String,
@@ -12285,6 +12306,8 @@ pub struct WorkspaceRuntimeStatus {
     pub last_probe: String,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
+    #[serde(rename = "executionHandle", skip_serializing_if = "Option::is_none")]
+    pub execution_handle: Option<ExecutionHandle>,
     #[serde(rename = "executionTrace", skip_serializing_if = "Option::is_none")]
     pub execution_trace: Option<WorkspaceExecutionTrace>,
 }
@@ -12570,7 +12593,8 @@ impl WorkspaceManager {
                 Self::append_capped(&mut record.logs, message.clone());
                 if let Some(runtime) = record.runtime.as_mut() {
                     runtime.update_from_event(ExecutionTruthEvent::ProcessExited(None));
-                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Failed));
+                    runtime
+                        .update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Failed));
                 }
             }
         }
@@ -13188,7 +13212,8 @@ impl WorkspaceManager {
         if let Ok(mut workspaces) = self.workspaces.lock() {
             if let Some(record) = workspaces.get_mut(id) {
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
+                    runtime
+                        .update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
                     record.workspace.state = runtime.lifecycle_state;
                 }
                 Self::append_capped(&mut record.logs, "workspace ready".to_string());
@@ -13491,7 +13516,9 @@ impl WorkspaceManager {
                     }
                 }
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(exited_status.is_none()));
+                    runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(
+                        exited_status.is_none(),
+                    ));
                     let observed_port = Self::parse_listening_ports(runtime.pid).into_iter().next();
                     runtime.update_from_event(ExecutionTruthEvent::ObservedPort(observed_port));
                     if let Some(port) = runtime.actual_port {
@@ -13541,7 +13568,9 @@ impl WorkspaceManager {
                 record.workspace.state = WorkspaceState::Failed;
             }
         }
-        Err(RuntimeError::CommandFailed("readiness probe timed out".to_string()))
+        Err(RuntimeError::CommandFailed(
+            "readiness probe timed out".to_string(),
+        ))
     }
 
     // Returns (child, assigned_port)
@@ -13780,8 +13809,9 @@ impl WorkspaceManager {
                                 ),
                             );
                             if let Some(runtime) = record.runtime.as_mut() {
-                                runtime
-                                    .update_from_event(ExecutionTruthEvent::ProcessExited(status.code()));
+                                runtime.update_from_event(ExecutionTruthEvent::ProcessExited(
+                                    status.code(),
+                                ));
                                 runtime.update_from_event(ExecutionTruthEvent::Lifecycle(
                                     WorkspaceState::Failed,
                                 ));
@@ -13915,6 +13945,37 @@ impl WorkspaceManager {
                 successful: runtime.process_alive || runtime.exit_code == Some(0),
             }
         });
+        let routing_mode = Self::routing_mode_for_provider(&runtime.provider_selected);
+        let endpoint = match routing_mode {
+            ExecutionRoutingMode::Local => runtime
+                .actual_port
+                .map(|port| format!("http://127.0.0.1:{port}")),
+            ExecutionRoutingMode::Wasm
+            | ExecutionRoutingMode::Remote
+            | ExecutionRoutingMode::Hybrid => None,
+        };
+        let stream_channel = if endpoint.is_none() {
+            Some(format!(
+                "/api/v1/workspaces/{}/runtime",
+                runtime.workspace_id
+            ))
+        } else {
+            None
+        };
+        let execution_handle = Some(ExecutionHandle {
+            workspace_id: runtime.workspace_id.clone(),
+            provider_id: runtime.provider_selected.clone(),
+            execution_id: record
+                .process_handle
+                .as_ref()
+                .map(|handle| handle.pid_hint.clone())
+                .unwrap_or_else(|| format!("workspace-{}", runtime.workspace_id)),
+            routing_mode,
+            endpoint,
+            stream_channel,
+            readiness_state: runtime.readiness_state,
+            authority_node: "workspace-manager".to_string(),
+        });
         Ok(WorkspaceRuntimeStatus {
             workspace_id: runtime.workspace_id.clone(),
             provider_selected: runtime.provider_selected.clone(),
@@ -13934,8 +13995,26 @@ impl WorkspaceManager {
             last_probe: runtime.last_http_probe.clone(),
             stdout: runtime.stdout_tail.clone(),
             stderr: runtime.stderr_tail.clone(),
+            execution_handle,
             execution_trace,
         })
+    }
+
+    fn routing_mode_for_provider(provider: &str) -> ExecutionRoutingMode {
+        let normalized = provider.to_ascii_lowercase();
+        let is_wasm = normalized.contains("wasm");
+        let is_remote = normalized.contains("cloud") || normalized.contains("remote");
+        let is_hybrid = normalized.contains("hybrid");
+
+        if is_hybrid || (is_wasm && is_remote) {
+            ExecutionRoutingMode::Hybrid
+        } else if is_remote {
+            ExecutionRoutingMode::Remote
+        } else if is_wasm {
+            ExecutionRoutingMode::Wasm
+        } else {
+            ExecutionRoutingMode::Local
+        }
     }
 }
 
@@ -25427,5 +25506,29 @@ all = ["network"]
         let stderr = "fatal: repository 'https://github.com/rkendel1/missing.git/' not found";
         let reason = github_clone_error_reason("https://github.com/rkendel1/missing.git", stderr);
         assert_eq!(reason, stderr);
+    }
+
+    #[test]
+    fn execution_routing_mode_maps_provider_ownership() {
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("WASM"),
+            ExecutionRoutingMode::Wasm
+        ));
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("CloudWorkspace"),
+            ExecutionRoutingMode::Remote
+        ));
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("HybridRuntime"),
+            ExecutionRoutingMode::Hybrid
+        ));
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("WasmCloudBridge"),
+            ExecutionRoutingMode::Hybrid
+        ));
+        assert!(matches!(
+            WorkspaceManager::routing_mode_for_provider("UserMachine"),
+            ExecutionRoutingMode::Local
+        ));
     }
 }

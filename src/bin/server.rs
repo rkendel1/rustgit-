@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
+    body::{to_bytes, Body},
     extract::{Path, State},
-    http::{header, Method, StatusCode},
-    response::{IntoResponse, Json},
-    routing::{get, post},
+    http::{header, Method, Request, StatusCode},
+    response::{IntoResponse, Json, Response},
+    routing::{any, get, post},
     Router,
 };
 use rustgit_wasm_runtime::{
@@ -804,10 +805,129 @@ async fn workspace_runtime(
         manager.sync_process_health(&id);
         manager.runtime_status(&id)
     })
-        .await
-        .expect("task panicked")
-        .map(Json)
-        .map_err(err_response)
+    .await
+    .expect("task panicked")
+    .map(Json)
+    .map_err(err_response)
+}
+
+async fn workspace_app_proxy(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let manager = state.manager;
+    let workspace_id = id.clone();
+    let runtime = tokio::task::spawn_blocking(move || {
+        manager.sync_process_health(&workspace_id);
+        manager.runtime_status(&workspace_id)
+    })
+    .await
+    .expect("task panicked")
+    .map_err(err_response)?;
+
+    let handle = runtime.execution_handle.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "execution handle unavailable", "workspace_id": id })),
+        )
+    })?;
+    let endpoint = handle.endpoint.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "execution owner is not HTTP-forwardable",
+                "workspace_id": handle.workspace_id,
+                "provider": handle.provider_id,
+                "routing_mode": handle.routing_mode,
+                "stream_channel": handle.stream_channel,
+            })),
+        )
+    })?;
+
+    let query = request
+        .uri()
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let target = if path.is_empty() {
+        format!("{}{}", endpoint.trim_end_matches('/'), query)
+    } else {
+        format!(
+            "{}/{}{}",
+            endpoint.trim_end_matches('/'),
+            path.trim_start_matches('/'),
+            query
+        )
+    };
+
+    let method = request.method().clone();
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in request.headers() {
+        let lower = key.as_str().to_ascii_lowercase();
+        if lower == "host"
+            || lower == "connection"
+            || lower == "transfer-encoding"
+            || lower == "content-length"
+        {
+            continue;
+        }
+        headers.insert(key, value.clone());
+    }
+
+    let body = if method == Method::GET || method == Method::HEAD {
+        None
+    } else {
+        Some(
+            to_bytes(request.into_body(), usize::MAX)
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "invalid proxy request body" })),
+                    )
+                })?
+                .to_vec(),
+        )
+    };
+
+    let client = reqwest::Client::new();
+    let mut upstream = client.request(method, target).headers(headers);
+    if let Some(body) = body {
+        upstream = upstream.body(body);
+    }
+    let upstream = upstream.send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "failed to reach execution owner",
+                "details": error.to_string(),
+            })),
+        )
+    })?;
+
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    let bytes = upstream.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "failed to read execution owner response",
+                "details": error.to_string(),
+            })),
+        )
+    })?;
+
+    let mut response = Response::builder().status(status);
+    for (key, value) in upstream_headers.iter() {
+        response = response.header(key, value);
+    }
+    response.body(Body::from(bytes)).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "proxy response build failed" })),
+        )
+    })
 }
 
 async fn workspace_files(
@@ -1028,6 +1148,10 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             get(workspace_runtime),
         )
         .route(
+            &format!("{prefix}/workspaces/:id/proxy/*path"),
+            any(workspace_app_proxy),
+        )
+        .route(
             &format!("{prefix}/workspaces/:id/files"),
             get(workspace_files),
         )
@@ -1186,6 +1310,7 @@ mod tests {
             ("/api/v1/workspaces/missing/restart", "POST"),
             ("/api/v1/workspaces/missing/logs", "GET"),
             ("/api/v1/workspaces/missing/runtime", "GET"),
+            ("/api/v1/workspaces/missing/proxy/index.html", "GET"),
             ("/api/v1/workspaces/missing/files", "GET"),
             ("/api/v1/workspaces/missing/files/package.json", "GET"),
             ("/api/v1/workspaces/missing/files/package.json", "PUT"),
@@ -1193,6 +1318,10 @@ mod tests {
             ("/api/proxy/api/v1/workspaces/missing/restart", "POST"),
             ("/api/proxy/api/v1/workspaces/missing/logs", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/runtime", "GET"),
+            (
+                "/api/proxy/api/v1/workspaces/missing/proxy/index.html",
+                "GET",
+            ),
             ("/api/proxy/api/v1/workspaces/missing/files", "GET"),
             (
                 "/api/proxy/api/v1/workspaces/missing/files/package.json",
