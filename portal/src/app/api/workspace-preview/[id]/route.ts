@@ -64,7 +64,7 @@ export async function GET(
     }
     return NextResponse.json(
       payload ?? { error: "Workspace app is not ready yet." },
-      { status: readiness.status === 502 ? 503 : readiness.status },
+      { status: readiness.status },
     );
   }
 

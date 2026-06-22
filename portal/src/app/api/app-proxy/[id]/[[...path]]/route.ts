@@ -15,14 +15,26 @@ type WorkspaceInfo = {
   ports?: Array<{ port?: number }>;
 };
 
+const FRAMEWORK_STARTUP_TIMEOUTS_MS: Record<string, number> = {
+  vite: 30_000,
+  react: 30_000,
+  svelte: 30_000,
+  node: 30_000,
+  nextjs: 45_000,
+  "next.js": 45_000,
+  nuxt: 45_000,
+  python: 45_000,
+  angular: 60_000,
+  django: 60_000,
+  fastapi: 30_000,
+  fast_api: 30_000,
+  "fast api": 30_000,
+};
+
 function startupTimeoutMs(framework?: string): number {
   const normalized = framework?.toLowerCase();
   if (!normalized) return 45_000;
-  if (["vite", "react", "svelte", "node"].includes(normalized)) return 30_000;
-  if (["nextjs", "next.js", "nuxt", "python"].includes(normalized)) return 45_000;
-  if (["angular", "django"].includes(normalized)) return 60_000;
-  if (["fastapi", "fast_api", "fast api"].includes(normalized)) return 30_000;
-  return 45_000;
+  return FRAMEWORK_STARTUP_TIMEOUTS_MS[normalized] ?? 45_000;
 }
 
 function retryDelayMs(attempt: number): number {
@@ -33,7 +45,7 @@ function retryDelayMs(attempt: number): number {
 
 function progressPercent(elapsedMs: number, maxWaitMs: number): number {
   if (maxWaitMs <= 0) return 0;
-  return Math.min(100, Math.floor((elapsedMs / maxWaitMs) * 100));
+  return Math.max(0, Math.min(100, Math.floor((elapsedMs / maxWaitMs) * 100)));
 }
 
 function shouldFetchLogs(attempt: number, hasLogs: boolean): boolean {
@@ -131,7 +143,7 @@ async function handle(
           method: request.method,
           headers: forwardHeaders,
           body: bodyBytes,
-          signal: AbortSignal.timeout(Math.min(500, remaining)),
+          signal: AbortSignal.timeout(Math.max(100, Math.min(500, remaining))),
         });
 
         const contentType = upstreamRes.headers.get("content-type") ?? "";
@@ -211,15 +223,11 @@ async function handle(
 
     const delay = retryDelayMs(attempt);
     const elapsed = Date.now() - startedAt;
-    if (elapsed >= maxWaitMs) {
-      break;
-    }
     const remainingAfterWork = maxWaitMs - elapsed;
-    const boundedDelay = Math.min(delay, remainingAfterWork);
-    const waitMs = Math.max(100, boundedDelay);
     if (remainingAfterWork < 100) {
       break;
     }
+    const waitMs = Math.max(100, Math.min(delay, remainingAfterWork));
     await new Promise((r) => setTimeout(r, waitMs));
     attempt += 1;
     const refreshed = await getWorkspace(id);
