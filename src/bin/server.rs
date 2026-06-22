@@ -620,12 +620,10 @@ async fn workspace_files(
     let manager = state.manager;
     tokio::task::spawn_blocking(move || {
         let fs = manager.filesystem(&id)?;
-        let snapshot = fs.snapshot()?;
-        let mut files = snapshot
-            .entries
-            .keys()
+        let mut files = fs
+            .list(1000)?
+            .into_iter()
             .filter(|path| !is_workspace_internal_file(path))
-            .cloned()
             .collect::<Vec<_>>();
         files.sort_by(|left, right| {
             workspace_file_priority(left)

@@ -15644,6 +15644,16 @@ impl VirtualFileSystem {
         Ok(())
     }
 
+    /// List relative paths of all files under the root, up to `limit` entries.
+    /// Does not read file contents.
+    pub fn list(&self, limit: usize) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        if self.root.exists() {
+            list_paths(&self.root, &self.root, &mut paths, limit);
+        }
+        Ok(paths)
+    }
+
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
         let mut entries = HashMap::new();
         collect_files(&self.root, &self.root, &mut entries)?;
@@ -18198,6 +18208,31 @@ fn package_manager_declares(content: &str, package_manager: &str) -> bool {
     compact.contains(&format!("\"packagemanager\":\"{}@", package_manager))
 }
 
+fn list_paths(root: &Path, current: &Path, paths: &mut Vec<String>, limit: usize) {
+    if paths.len() >= limit {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(current) else { return };
+    for entry in entries.flatten() {
+        if paths.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else { continue };
+        let is_dir = if file_type.is_symlink() {
+            path.metadata().map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
+            list_paths(root, &path, paths, limit);
+        } else {
+            let Ok(relative) = path.strip_prefix(root) else { continue };
+            paths.push(relative.to_string_lossy().to_string());
+        }
+    }
+}
+
 fn collect_files(
     root: &Path,
     current: &Path,
@@ -18206,7 +18241,13 @@ fn collect_files(
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        let is_dir = if file_type.is_symlink() {
+            path.metadata().map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
             collect_files(root, &path, entries)?;
         } else {
             let relative = path
@@ -18214,7 +18255,7 @@ fn collect_files(
                 .map_err(|_| RuntimeError::InvalidPath(path.display().to_string()))?
                 .to_string_lossy()
                 .to_string();
-            entries.insert(relative, fs::read(path)?);
+            entries.insert(relative, fs::read(&path)?);
         }
     }
     Ok(())

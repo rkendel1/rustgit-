@@ -823,7 +823,7 @@ export default function Home() {
                 <strong>CPU</strong>
                 <span>{workspace.resource_quotas?.max_cpu_millis ?? "—"} m</span>
               </div>
-              {workspace.ports.map((p, i) => (
+              {(workspace.ports ?? []).map((p, i) => (
                 <div key={i} className={styles.tile}>
                   <strong>Port {p.port}</strong>
                   <a
