@@ -39,7 +39,7 @@ Ranking uses proximity + reliability + affinity bonuses - latency - cost (`src/l
 - Escalation policy gates external/cloud tiers (`src/lib.rs:3067-3074`).
 - Policy defaults allow external + cloud fallback (`src/lib.rs:1939-1946`).
 - Escalation trace is recorded in `RuntimeSelection` (`src/lib.rs:3080-3090`, `3195`).
-- Workspace router has separate runtime failover priority: Dea -> Docker -> External -> Cloud (`src/lib.rs:11741-11746`, `11916-11924`).
+- Workspace failover now derives from the same execution-tier chain (`src/lib.rs:1765-1772`, `3038-3041`, `11760-11788`, `11939-11943`).
 
 ## Configuration/feature flags observed
 - Escalation policy fields: `max_local_wait_ms`, `allow_external_fallback`, `allow_cloud_fallback`, `prefer_local` (`src/lib.rs:1932-1937`).
@@ -50,5 +50,5 @@ Requested chain: `Instant -> WASM -> Native -> Workspace -> Remote`.
 
 Verified implementation is different:
 - Primary runtime-router escalation is by **tier** (`LocalMachine -> LocalDocker -> ExternalProvider -> CloudPartner -> DDockitCloud`) (`src/lib.rs:3026-3033`).
-- Workspace failover priority is `Dea -> Docker -> External -> Cloud` (`src/lib.rs:11741-11746`).
+- Workspace failover reuses that same canonical chain through runtime-type mapping (`src/lib.rs:11686-11703`, `11760-11788`, `11939-11943`).
 - No concrete `Instant` provider was found.

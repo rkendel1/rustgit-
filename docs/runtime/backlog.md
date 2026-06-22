@@ -61,9 +61,10 @@ DDockitCloud`, `src/lib.rs:3026-3033`); the workspace router uses a *different*
 order (`Dea → Docker → External → Cloud`, `src/lib.rs:11741-11746`). No `Instant`
 provider exists.
 
-**Fix.** Decide whether the requested spec or the current implementation is
-canonical, then either update the spec/docs or refactor selection to match. This
-is partly resolved by PR-4 (the two orderings are the two selection systems).
+**Fix.** Canonicalize on tier-based escalation naming and order:
+`LocalMachine → LocalDocker → ExternalProvider → CloudPartner → DDockitCloud`.
+Use this as the single source for workspace failover ordering (mapped runtime
+types) and mirror the same naming in user-facing UI copy.
 
 **Effort:** S (decision/doc) or folds into PR-4 · **Risk:** Low if doc-only.
 
@@ -73,14 +74,14 @@ is partly resolved by PR-4 (the two orderings are the two selection systems).
 
 ### PR-4 · Unify the two runtime-selection systems
 **Problem.** `ExecutionRouter` (tier + capability ranking,
-`src/lib.rs:3011-3312`) and `WorkspaceRouter` (failover priority,
+`src/lib.rs:3011-3312`) and `WorkspaceRouter` (post-launch failover,
 `src/lib.rs:11741-11746`, `11916-11924`) are both active with different
-abstractions and different orderings. Divergent selection decisions are possible.
+abstractions. If they diverge again, selection decisions can drift.
 
-**Fix.** Define one authoritative selector, or a clear boundary (e.g.
-ExecutionRouter for initial selection, WorkspaceRouter strictly for
-post-launch failover) with a single shared priority source. Resolves the
-ordering mismatch behind PR-3.
+**Fix.** Keep a clear boundary: `ExecutionRouter` is authoritative for initial
+selection; `WorkspaceRouter` is strictly post-launch failover and must derive
+priority from the shared execution-tier chain. This resolves the PR-3 ordering
+mismatch.
 
 **Effort:** L · **Risk:** High (selection semantics).
 
