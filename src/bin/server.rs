@@ -1426,7 +1426,15 @@ mod tests {
             payload.get("repository_ask").is_none(),
             "analyze should only include repository summary projections when explicitly requested"
         );
-        assert!(repo.join(".ddockit/manifest.json").exists());
+        assert!(repo.join(".execution.json").exists());
+        assert_eq!(
+            payload["manifest"]["path"].as_str(),
+            Some(".execution.json")
+        );
+        assert_eq!(
+            payload["execution_intelligence"]["execution"]["preferred"].as_str(),
+            Some("pnpm")
+        );
 
         let second = app
             .oneshot(
@@ -1462,7 +1470,7 @@ mod tests {
                 "fingerprint_id": fingerprint_id,
                 "runtime": { "language": "typescript", "packageManager": "pnpm", "framework": "nextjs" },
                 "execution": { "preferredProvider": "browser-wasm", "fallback": ["fly", "docker", "codespaces"] },
-                "manifest": { "version": 1, "path": ".ddockit/manifest.json" },
+                "manifest": { "version": 1, "path": ".execution.json" },
                 "confidence": 98,
                 "cached": false,
                 "durationMs": 0
