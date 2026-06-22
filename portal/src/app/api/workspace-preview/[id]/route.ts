@@ -40,7 +40,7 @@ async function getBrowser(): Promise<Browser> {
 }
 
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   const { id } = await context.params;
@@ -53,12 +53,29 @@ export async function GET(
       { status: 409 },
     );
   }
+  const proxyUrl = new URL(`/api/app-proxy/${id}/`, request.url).toString();
+  const readiness = await fetch(proxyUrl, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(2_000),
+  });
+  if (!readiness.ok) {
+    let payload: unknown = null;
+    try {
+      payload = await readiness.json();
+    } catch {
+      payload = null;
+    }
+    return NextResponse.json(
+      payload ?? { error: "Workspace app is not ready yet." },
+      { status: readiness.status },
+    );
+  }
 
   let page: Page | null = null;
   try {
     const browser = await getBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(`http://127.0.0.1:${port}/`, {
+    await page.goto(proxyUrl, {
       waitUntil: "domcontentloaded",
       timeout: 15_000,
     });
@@ -76,6 +93,10 @@ export async function GET(
     const message =
       error instanceof Error && error.name === "TimeoutError"
         ? "Workspace app did not finish loading within 15 seconds."
+        // Keep this fallback to handle brief races between successful readiness checks
+        // and browser navigation while the upstream process is still finalizing binds.
+        : error instanceof Error && error.message.includes("ERR_CONNECTION_REFUSED")
+          ? "Workspace app is still starting. Please retry in a few seconds."
         : "Failed to capture preview screenshot.";
     return NextResponse.json(
       { error: message },
