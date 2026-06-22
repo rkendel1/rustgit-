@@ -13650,10 +13650,11 @@ impl WorkspaceManager {
         ctx: &ExecutionContext,
         overrides: &LaunchOverrides,
         logs: &mut Vec<String>,
-    ) -> (Option<std::process::Child>, Option<u16>) {
+    ) -> (Option<std::process::Child>, Option<u16>, String) {
+        let mut provider_selected = "local-supervised-process".to_string();
         let run_cmd = match Self::resolved_run_command(ctx, overrides) {
             Some(cmd) => cmd,
-            None => return (None, None),
+            None => return (None, None, provider_selected),
         };
         let repo_path = std::path::Path::new(&ctx.repo_path);
         let is_python = matches!(
@@ -13805,13 +13806,20 @@ impl WorkspaceManager {
                 "run command only changes directory and has no run step; skipping process spawn"
                     .to_string(),
             );
-            return (None, None);
+            return (None, None, provider_selected);
+        }
+        if DockerExecutionProvider::is_docker_command(&run_cmd) {
+            if let Err(err) = DockerExecutionProvider::ensure_docker_ready(&run_cmd) {
+                logs.push(format!("docker runtime readiness check failed: {err}"));
+                return (None, None, provider_selected);
+            }
+            provider_selected = DockerExecutionProvider::id_static().to_string();
         }
 
         let mut parts = run_cmd.splitn(2, ' ');
         let program = match parts.next() {
             Some(p) if !p.is_empty() => p.to_string(),
-            _ => return (None, None),
+            _ => return (None, None, provider_selected),
         };
         let args_str = parts.next().unwrap_or("");
         let args: Vec<&str> = args_str.split_whitespace().collect();
@@ -13848,11 +13856,11 @@ impl WorkspaceManager {
                         }
                     }
                 }
-                (Some(child), assigned_port)
+                (Some(child), assigned_port, provider_selected)
             }
             Err(err) => {
                 logs.push(format!("spawn failed: {err}"));
-                (None, None)
+                (None, None, provider_selected)
             }
         }
     }
@@ -13937,7 +13945,7 @@ impl WorkspaceManager {
 
         // Spawn the new process without holding the lock (can take seconds)
         let mut spawn_logs: Vec<String> = vec![];
-        let (child, assigned_port) =
+        let (child, assigned_port, provider_selected) =
             Self::spawn_run_command(&ctx, &effective_overrides, &mut spawn_logs);
 
         let mut workspaces = self.workspaces.lock().expect("workspace lock poisoned");
@@ -13951,6 +13959,9 @@ impl WorkspaceManager {
             for p in &mut record.workspace.ports {
                 p.port = port;
             }
+        }
+        if let Some(runtime) = record.runtime.as_mut() {
+            runtime.provider_selected = provider_selected.clone();
         }
         record.child_process = child;
         record.workspace.state = WorkspaceState::Running;
@@ -13968,7 +13979,11 @@ impl WorkspaceManager {
             .as_ref()
             .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
         let execution_trace = record.process_handle.as_ref().map(|handle| {
-            let provider = infer_provider_from_pid_hint(&handle.pid_hint);
+            let provider = if runtime.provider_selected.trim().is_empty() {
+                infer_provider_from_pid_hint(&handle.pid_hint)
+            } else {
+                runtime.provider_selected.clone()
+            };
             let fallback_providers = record
                 .execution_context
                 .as_ref()
@@ -14212,7 +14227,7 @@ impl WasmWorkspace for WorkspaceManager {
         match launch_result {
             Ok((ctx, handle)) => {
                 let overrides = record.launch_overrides.clone();
-                let (child, assigned_port) =
+                let (child, assigned_port, provider_selected) =
                     Self::spawn_run_command(&ctx, &overrides, &mut record.logs);
                 // Patch the port list to use the actual assigned port
                 if let Some(port) = assigned_port {
@@ -14220,11 +14235,23 @@ impl WasmWorkspace for WorkspaceManager {
                         p.port = port;
                     }
                 }
+                let mut runtime = child.as_ref().map(|spawned| {
+                    let requested_port = assigned_port
+                        .or_else(|| workspace.ports.first().map(|port| port.port))
+                        .unwrap_or_default();
+                    let mut runtime = ExecutionTruth::new(id.clone(), requested_port, spawned.id());
+                    runtime.provider_selected = provider_selected.clone();
+                    runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(true));
+                    runtime.update_from_event(ExecutionTruthEvent::ObservedPort(assigned_port));
+                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Running));
+                    runtime
+                });
                 record.workspace = workspace.clone();
                 record.logs.extend(logs);
                 record.execution_context = Some(ctx);
                 record.process_handle = Some(handle);
                 record.child_process = child;
+                record.runtime = runtime.take();
                 Ok(workspace)
             }
             Err(err) => {
@@ -25950,6 +25977,40 @@ all = ["network"]
                     handle.endpoint
                 );
             }
+        }
+
+        manager.stop(&workspace.id).expect("stop workspace");
+    }
+
+    #[test]
+    fn launch_runtime_provider_matches_spawn_authority() {
+        let runtime_root = temp_dir("launch-runtime-provider");
+        let local_repo = temp_dir("launch-runtime-provider-repo");
+        fs::write(
+            local_repo.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"},"dependencies":{}}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            local_repo.join("server.js"),
+            "require('http').createServer((_, res) => res.end('ok')).listen(process.env.PORT || 3000);\n",
+        )
+        .expect("write server.js");
+
+        let manager = WorkspaceManager::new(&runtime_root);
+        let workspace = manager
+            .launch(local_repo.to_string_lossy().as_ref())
+            .expect("launch workspace");
+
+        {
+            let workspaces = manager.workspaces.lock().expect("workspace lock poisoned");
+            let record = workspaces
+                .get(&workspace.id)
+                .expect("workspace record should exist");
+            assert_eq!(
+                record.runtime.as_ref().map(|runtime| runtime.provider_selected.as_str()),
+                Some("local-supervised-process")
+            );
         }
 
         manager.stop(&workspace.id).expect("stop workspace");
