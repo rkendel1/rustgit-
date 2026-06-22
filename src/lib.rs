@@ -12156,26 +12156,10 @@ impl ExecutionTruth {
     fn update_from_event(&mut self, event: ExecutionTruthEvent) {
         match event {
             ExecutionTruthEvent::StdoutLine(line) => {
-                WorkspaceManager::append_capped(&mut self.stdout_tail, line.clone());
-                if self.detected_start_signal.is_none()
-                    && STARTUP_LOG_PATTERNS
-                        .iter()
-                        .any(|pattern| line.to_ascii_lowercase().contains(pattern))
-                {
-                    self.detected_start_signal = Some(line);
-                    self.readiness_state = ExecutionReadinessState::SignalDetected;
-                }
+                self.apply_runtime_log_line(line, false);
             }
             ExecutionTruthEvent::StderrLine(line) => {
-                WorkspaceManager::append_capped(&mut self.stderr_tail, line.clone());
-                if self.detected_start_signal.is_none()
-                    && STARTUP_LOG_PATTERNS
-                        .iter()
-                        .any(|pattern| line.to_ascii_lowercase().contains(pattern))
-                {
-                    self.detected_start_signal = Some(line);
-                    self.readiness_state = ExecutionReadinessState::SignalDetected;
-                }
+                self.apply_runtime_log_line(line, true);
             }
             ExecutionTruthEvent::ProcessAlive(alive) => {
                 self.process_alive = alive;
@@ -12225,6 +12209,22 @@ impl ExecutionTruth {
             }
         }
         self.evaluate_readiness();
+    }
+
+    fn apply_runtime_log_line(&mut self, line: String, is_stderr: bool) {
+        if is_stderr {
+            WorkspaceManager::append_capped(&mut self.stderr_tail, line.clone());
+        } else {
+            WorkspaceManager::append_capped(&mut self.stdout_tail, line.clone());
+        }
+        if self.detected_start_signal.is_none()
+            && STARTUP_LOG_PATTERNS
+                .iter()
+                .any(|pattern| line.to_ascii_lowercase().contains(pattern))
+        {
+            self.detected_start_signal = Some(line);
+            self.readiness_state = ExecutionReadinessState::SignalDetected;
+        }
     }
 
     fn evaluate_readiness(&mut self) {

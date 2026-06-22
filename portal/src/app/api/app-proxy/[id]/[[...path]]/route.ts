@@ -52,7 +52,7 @@ function startupHtml(id: string, runtime: WorkspaceRuntime): string {
     `Framework: ${escapeHtml(runtime.framework ?? "unknown")}`,
     `Status: ${escapeHtml(runtime.lifecycle_state ?? "Initializing")}`,
     `PID: ${escapeHtml(String(runtime.pid ?? "unknown"))}`,
-    `Probe: ${escapeHtml(runtime.last_http_probe ?? runtime.last_probe ?? "connection refused")}`,
+    `Probe: ${escapeHtml(runtime.last_http_probe ?? "connection refused")}`,
   ]
     .map((line) => `<div>${line}</div>`)
     .join("");
@@ -82,7 +82,7 @@ async function handle(
       actualPort: truth.actual_port ?? null,
       processAlive: truth.alive ?? false,
       httpReady: truth.http_ready ?? false,
-      lastProbe: truth.last_http_probe ?? truth.last_probe ?? "connection refused",
+      lastProbe: truth.last_http_probe ?? "connection refused",
       detectedStartSignal: truth.detected_start_signal ?? null,
       logs: [...(truth.stdout ?? []), ...(truth.stderr ?? [])].slice(-20),
       truth,
