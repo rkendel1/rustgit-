@@ -671,7 +671,7 @@ impl BuildStrategyPlanner {
                     "bun install --frozen-lockfile".to_string(),
                     "bun run build".to_string(),
                 ]),
-                _ => commands.extend(["npm ci".to_string(), "npm run build".to_string()]),
+                _ => commands.extend(["npm install".to_string(), "npm run build".to_string()]),
             },
             ImageRuntimeKind::Python => match package_manager.unwrap_or(PackageManagerKind::Pip) {
                 PackageManagerKind::Uv => commands.extend([
@@ -14939,7 +14939,7 @@ fn infer_install_command(package_manager: Option<&str>, runtime: RuntimeType) ->
         (Some("pnpm"), _) => Some("pnpm install --frozen-lockfile".to_string()),
         (Some("yarn"), _) => Some("yarn install --frozen-lockfile".to_string()),
         (Some("bun"), _) => Some("bun install --frozen-lockfile".to_string()),
-        (Some("npm"), _) => Some("npm ci".to_string()),
+        (Some("npm"), _) => Some("npm install".to_string()),
         (Some("cargo"), RuntimeType::Rust) => Some("cargo fetch".to_string()),
         (Some("poetry"), RuntimeType::Python) => Some("poetry install".to_string()),
         (Some("uv"), RuntimeType::Python) => Some("uv sync".to_string()),
@@ -15926,7 +15926,7 @@ impl BuildPlanner {
             "pnpm" => "pnpm install --frozen-lockfile".to_string(),
             "yarn" => "yarn install --frozen-lockfile".to_string(),
             "bun" => "bun install --frozen-lockfile".to_string(),
-            _ => "npm ci".to_string(),
+            _ => "npm install".to_string(),
         };
         let js_build_fallback = match package_manager {
             "pnpm" => "pnpm run build".to_string(),
@@ -19249,7 +19249,7 @@ fn service_install_command(service: &ServiceDefinition) -> Option<String> {
             "pnpm" => format!("cd {service_root} && pnpm install --frozen-lockfile"),
             "yarn" => format!("cd {service_root} && yarn install --frozen-lockfile"),
             "bun" => format!("cd {service_root} && bun install --frozen-lockfile"),
-            _ => format!("cd {service_root} && npm ci"),
+            _ => format!("cd {service_root} && npm install"),
         }),
         RuntimeType::Python => Some(format!(
             "cd {service_root} && python -m pip install -r requirements.txt"
@@ -20326,6 +20326,14 @@ dependencies:
         assert_eq!(ordered.get(1).map(String::as_str), Some("build"));
         assert!(ordered.contains(&"dev".to_string()));
         assert!(ordered.contains(&"test".to_string()));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == "install")
+                .and_then(|node| node.command.as_deref()),
+            Some("npm install")
+        );
         assert_eq!(
             graph
                 .nodes
