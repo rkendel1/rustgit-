@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use rustgit_wasm_runtime::{
-    analyze::{AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
+    analyze::{runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, LaunchOverrides,
     RuntimeError, WasmWorkspace, Workspace, WorkspaceManager, WorkspaceRuntimeStatus,
@@ -203,7 +203,11 @@ fn resolve_repo_url(
     }
 }
 
-fn prepare_repository_for_analysis(repo_url: &str, branch: &str, commit: &str) -> rustgit_wasm_runtime::Result<PathBuf> {
+fn prepare_repository_for_analysis(
+    repo_url: &str,
+    branch: &str,
+    commit: &str,
+) -> rustgit_wasm_runtime::Result<PathBuf> {
     if FsPath::new(repo_url).exists() {
         return Ok(PathBuf::from(repo_url));
     }
@@ -360,7 +364,10 @@ fn discover_launch_override_branches(repo_root: &FsPath) -> Vec<Value> {
 }
 
 fn build_launch_plan(payload: &Value, branch: &str) -> Value {
-    let execution_intelligence = payload.get("execution_intelligence").cloned().unwrap_or_default();
+    let execution_intelligence = payload
+        .get("execution_intelligence")
+        .cloned()
+        .unwrap_or_default();
     let env_count = execution_intelligence
         .get("environmentVariables")
         .and_then(Value::as_array)
@@ -369,6 +376,15 @@ fn build_launch_plan(payload: &Value, branch: &str) -> Value {
     json!({
         "repository": payload.get("repo_url").or_else(|| payload.get("repo")).and_then(Value::as_str),
         "branch": branch,
+        "provider": payload
+            .get("execution")
+            .and_then(|execution| execution.get("preferredProvider")),
+        "reason": payload
+            .get("execution")
+            .and_then(|execution| execution.get("selectedBecause")),
+        "fallbacks": payload
+            .get("execution")
+            .and_then(|execution| execution.get("fallback")),
         "runtime": execution_intelligence
             .get("preferredRuntime")
             .or_else(|| execution_intelligence.get("execution").and_then(|v| v.get("preferred"))),
@@ -380,6 +396,12 @@ fn build_launch_plan(payload: &Value, branch: &str) -> Value {
         "environmentCount": env_count,
         "autoHealsApplied": execution_intelligence.get("autoHealsApplied"),
     })
+}
+
+async fn runtime_capabilities() -> Json<Value> {
+    Json(json!({
+        "providers": runtime_capability_statuses()
+    }))
 }
 
 async fn health() -> StatusCode {
@@ -404,7 +426,12 @@ async fn launch_execution(
     Json(body): Json<ExecutionRequest>,
 ) -> Result<(StatusCode, Json<ExecutionResponse>), (StatusCode, Json<Value>)> {
     let overrides = body.launch_overrides();
-    let repo_url = resolve_repo_url(body.repo_url.clone(), None, body.owner.clone(), body.repo.clone())?;
+    let repo_url = resolve_repo_url(
+        body.repo_url.clone(),
+        None,
+        body.owner.clone(),
+        body.repo.clone(),
+    )?;
     let manager = state.manager;
 
     // Allocate the workspace ID synchronously (fast — just inserts a pending record)
@@ -458,7 +485,8 @@ async fn analyze_repository(
         }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
-                idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
+                idx.entry(fingerprint_id.to_string())
+                    .or_insert(payload.clone());
             }
         }
         return Ok((StatusCode::OK, Json(payload)));
@@ -484,7 +512,8 @@ async fn analyze_repository(
         }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
-                idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
+                idx.entry(fingerprint_id.to_string())
+                    .or_insert(payload.clone());
             }
         }
         return Ok((StatusCode::OK, Json(payload)));
@@ -522,7 +551,10 @@ async fn analyze_repository(
 }
 
 fn repository_intelligence_from_payload(fingerprint_id: &str, payload: &Value) -> Value {
-    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let confidence = payload
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let health_score = confidence / 100.0;
 
     let preferred_provider = payload
@@ -597,7 +629,10 @@ fn repository_ask_from_payload(payload: &Value, question: Option<&str>) -> Value
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty() && *s != "unknown");
 
-    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let confidence = payload
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let answer_confidence = (confidence / 100.0).min(1.0) as f32;
 
     let question = question.unwrap_or("Summarize this repository.");
@@ -628,13 +663,17 @@ fn repository_ask_from_payload(payload: &Value, question: Option<&str>) -> Value
         ));
     }
 
-    let answer = if question.to_lowercase().contains("run") || question.to_lowercase().contains("summar") {
+    let answer = if question.to_lowercase().contains("run")
+        || question.to_lowercase().contains("summar")
+    {
         format!(
             "{} {}",
             parts.join(" ").trim(),
             preferred_provider
                 .map(|p| format!("Run using: {p}"))
-                .unwrap_or_else(|| "No specific run instructions could be determined automatically.".to_string())
+                .unwrap_or_else(|| {
+                    "No specific run instructions could be determined automatically.".to_string()
+                })
         )
     } else {
         parts.join(" ").trim().to_string()
@@ -800,7 +839,10 @@ fn is_workspace_internal_file(path: &str) -> bool {
 
 fn workspace_file_priority(path: &str) -> (u8, u8) {
     let root_file = !path.contains('/');
-    let Some(name) = FsPath::new(path).file_name().and_then(|value| value.to_str()) else {
+    let Some(name) = FsPath::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
         return (1, u8::MAX);
     };
     match (root_file, name.to_ascii_lowercase().as_str()) {
@@ -974,9 +1016,18 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             &format!("{prefix}/workspaces/:id/restart"),
             post(restart_workspace),
         )
-        .route(&format!("{prefix}/workspaces/:id/logs"), get(workspace_logs))
-        .route(&format!("{prefix}/workspaces/:id/runtime"), get(workspace_runtime))
-        .route(&format!("{prefix}/workspaces/:id/files"), get(workspace_files))
+        .route(
+            &format!("{prefix}/workspaces/:id/logs"),
+            get(workspace_logs),
+        )
+        .route(
+            &format!("{prefix}/workspaces/:id/runtime"),
+            get(workspace_runtime),
+        )
+        .route(
+            &format!("{prefix}/workspaces/:id/files"),
+            get(workspace_files),
+        )
         .route(
             &format!("{prefix}/workspaces/:id/files/*path"),
             get(workspace_file).put(update_workspace_file),
@@ -1006,40 +1057,39 @@ fn app(state: AppState) -> Router {
         ),
         "/api/proxy/api/v1",
     )
-        .route("/health", get(health))
-        .route("/api/analyze", post(analyze_repository))
-        .route("/api/v1/executions", post(launch_execution))
-        .route("/api/proxy/api/v1/executions", post(launch_execution))
-        .route(
-            "/api/v1/repositories/analyze",
-            post(analyze_repository),
-        )
-        .route(
-            "/api/proxy/api/v1/repositories/analyze",
-            post(analyze_repository),
-        )
-        .route("/api/cleanup", post(cleanup_disk))
-        .route("/api/proxy/api/cleanup", post(cleanup_disk))
-        .route("/api/badges/generate", post(generate_badge))
-        .route("/api/badge/generate", post(generate_badge))
-        .route("/badge/:owner/:repo.svg", get(runtime_badge))
-        .route("/badge/healed/:owner/:repo.svg", get(healed_badge))
-        .route("/seed/:owner/:repo", get(seed_launch))
-        .route(
-            "/api/repositories/:id/intelligence",
-            get(repository_intelligence),
-        )
-        .route(
-            "/api/proxy/api/repositories/:id/intelligence",
-            get(repository_intelligence),
-        )
-        .route("/api/repositories/:id/ask", post(repository_ask))
-        .route(
-            "/api/proxy/api/repositories/:id/ask",
-            post(repository_ask),
-        )
-        .layer(cors_layer())
-        .with_state(state)
+    .route("/health", get(health))
+    .route("/api/analyze", post(analyze_repository))
+    .route("/api/runtime/capabilities", get(runtime_capabilities))
+    .route(
+        "/api/proxy/api/runtime/capabilities",
+        get(runtime_capabilities),
+    )
+    .route("/api/v1/executions", post(launch_execution))
+    .route("/api/proxy/api/v1/executions", post(launch_execution))
+    .route("/api/v1/repositories/analyze", post(analyze_repository))
+    .route(
+        "/api/proxy/api/v1/repositories/analyze",
+        post(analyze_repository),
+    )
+    .route("/api/cleanup", post(cleanup_disk))
+    .route("/api/proxy/api/cleanup", post(cleanup_disk))
+    .route("/api/badges/generate", post(generate_badge))
+    .route("/api/badge/generate", post(generate_badge))
+    .route("/badge/:owner/:repo.svg", get(runtime_badge))
+    .route("/badge/healed/:owner/:repo.svg", get(healed_badge))
+    .route("/seed/:owner/:repo", get(seed_launch))
+    .route(
+        "/api/repositories/:id/intelligence",
+        get(repository_intelligence),
+    )
+    .route(
+        "/api/proxy/api/repositories/:id/intelligence",
+        get(repository_intelligence),
+    )
+    .route("/api/repositories/:id/ask", post(repository_ask))
+    .route("/api/proxy/api/repositories/:id/ask", post(repository_ask))
+    .layer(cors_layer())
+    .with_state(state)
 }
 
 #[tokio::main]
@@ -1141,7 +1191,10 @@ mod tests {
             ("/api/proxy/api/v1/workspaces/missing/logs", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/runtime", "GET"),
             ("/api/proxy/api/v1/workspaces/missing/files", "GET"),
-            ("/api/proxy/api/v1/workspaces/missing/files/package.json", "GET"),
+            (
+                "/api/proxy/api/v1/workspaces/missing/files/package.json",
+                "GET",
+            ),
             (
                 "/api/proxy/api/v1/workspaces/missing/files/package.json",
                 "PUT",
@@ -1151,22 +1204,20 @@ mod tests {
         for (uri, method) in checks {
             let response = app
                 .clone()
-                .oneshot(
-                    if method == "PUT" {
-                        Request::builder()
-                            .method(method)
-                            .uri(uri)
-                            .header(header::CONTENT_TYPE, "application/json")
-                            .body(Body::from(r#"{"content":"updated"}"#))
-                            .expect("request")
-                    } else {
-                        Request::builder()
-                            .method(method)
-                            .uri(uri)
-                            .body(Body::empty())
-                            .expect("request")
-                    },
-                )
+                .oneshot(if method == "PUT" {
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"content":"updated"}"#))
+                        .expect("request")
+                } else {
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request")
+                })
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
@@ -1200,6 +1251,50 @@ mod tests {
                 .expect("response");
             assert_ne!(response.status(), StatusCode::NOT_FOUND, "POST {uri}");
         }
+
+        for uri in [
+            "/api/runtime/capabilities",
+            "/api/proxy/api/runtime/capabilities",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_endpoint_reports_registered_providers() {
+        let app = app(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/runtime/capabilities")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let providers = payload["providers"].as_array().expect("providers array");
+        assert!(providers.iter().any(|provider| {
+            provider["name"].as_str() == Some("WASM")
+                && provider["enabled"].as_bool() == Some(true)
+                && provider["healthy"].as_bool() == Some(true)
+        }));
     }
 
     #[tokio::test]
@@ -1357,7 +1452,9 @@ mod tests {
                     .method("PUT")
                     .uri(format!("/api/v1/workspaces/{id}/files/package.json"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"content":"{\"scripts\":{\"dev\":\"node index.js\"}}"}"#))
+                    .body(Body::from(
+                        r#"{"content":"{\"scripts\":{\"dev\":\"node index.js\"}}"}"#,
+                    ))
                     .expect("request"),
             )
             .await
@@ -1501,6 +1598,9 @@ mod tests {
             "analyze should only include repository summary projections when explicitly requested"
         );
         assert!(repo.join(".execution.json").exists());
+        assert!(repo.join(".execution-plan.json").exists());
+        assert!(repo.join(".runtime-capabilities.json").exists());
+        assert!(repo.join(".launch-plan.json").exists());
         assert_eq!(
             payload["manifest"]["path"].as_str(),
             Some(".execution.json")
@@ -1513,21 +1613,30 @@ mod tests {
             payload["execution_intelligence"]["preferredRuntime"].as_str(),
             Some("pnpm")
         );
-        assert!(
-            payload["execution_intelligence"]["recommendedCommand"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("--host 0.0.0.0")
+        assert_eq!(
+            payload["execution_plan"]["recommendedProviders"][0]["provider"].as_str(),
+            Some("UserMachine")
         );
-        assert!(
-            payload["execution_intelligence"]["recommendedCommand"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("--port {PORT}")
-        );
+        assert!(payload["runtime_capabilities"]["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .any(|provider| provider["name"].as_str() == Some("WASM")));
+        assert!(payload["execution_intelligence"]["recommendedCommand"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--host 0.0.0.0"));
+        assert!(payload["execution_intelligence"]["recommendedCommand"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--port {PORT}"));
         assert_eq!(
             payload["execution_intelligence"]["autoHealsApplied"][0].as_str(),
             Some("hostInjection")
+        );
+        assert_eq!(
+            payload["launch_plan"]["provider"].as_str(),
+            Some("UserMachine")
         );
         assert_eq!(payload["launch_plan"]["branch"].as_str(), Some("main"));
         assert!(payload["launch_overrides"]["branches"].is_array());
@@ -1649,7 +1758,8 @@ mod tests {
         let ask_body = to_bytes(ask_response.into_body(), 1024 * 1024)
             .await
             .expect("ask body");
-        let ask_payload: serde_json::Value = serde_json::from_slice(&ask_body).expect("ask payload");
+        let ask_payload: serde_json::Value =
+            serde_json::from_slice(&ask_body).expect("ask payload");
         assert_eq!(payload["repository_ask"], ask_payload);
     }
 }

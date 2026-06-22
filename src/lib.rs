@@ -12102,6 +12102,19 @@ pub struct WorkspaceRuntimeStatus {
     pub last_probe: String,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
+    #[serde(rename = "executionTrace", skip_serializing_if = "Option::is_none")]
+    pub execution_trace: Option<WorkspaceExecutionTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceExecutionTrace {
+    pub provider: String,
+    #[serde(rename = "selectedBecause")]
+    pub selected_because: Vec<String>,
+    pub fallbacks: Vec<String>,
+    #[serde(rename = "actualStartup")]
+    pub actual_startup: String,
+    pub successful: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -12380,7 +12393,12 @@ impl WorkspaceManager {
         }
     }
 
-    fn update_runtime_line(workspaces: &Arc<Mutex<HashMap<String, LocalWorkspaceRecord>>>, id: &str, line: String, is_stderr: bool) {
+    fn update_runtime_line(
+        workspaces: &Arc<Mutex<HashMap<String, LocalWorkspaceRecord>>>,
+        id: &str,
+        line: String,
+        is_stderr: bool,
+    ) {
         if let Ok(mut table) = workspaces.lock() {
             if let Some(record) = table.get_mut(id) {
                 Self::append_capped(&mut record.logs, line.clone());
@@ -12409,7 +12427,12 @@ impl WorkspaceManager {
                     continue;
                 }
                 let prefixed = format!("{stream_name}: {trimmed}");
-                Self::update_runtime_line(&workspaces, &workspace_id, prefixed, stream_name == "stderr");
+                Self::update_runtime_line(
+                    &workspaces,
+                    &workspace_id,
+                    prefixed,
+                    stream_name == "stderr",
+                );
             }
         });
     }
@@ -12523,9 +12546,9 @@ impl WorkspaceManager {
                                 &mut record.logs,
                                 format!(
                                     "process exited unexpectedly ({})",
-                                    status
-                                        .code()
-                                        .map_or("signal".to_string(), |code| format!("code {code}"))
+                                    status.code().map_or("signal".to_string(), |code| format!(
+                                        "code {code}"
+                                    ))
                                 ),
                             );
                             if let Some(runtime) = record.runtime.as_mut() {
@@ -12571,7 +12594,9 @@ impl WorkspaceManager {
                 .filter(|(_, r)| {
                     matches!(
                         r.workspace.state,
-                        WorkspaceState::Failed | WorkspaceState::Stopped | WorkspaceState::Destroyed
+                        WorkspaceState::Failed
+                            | WorkspaceState::Stopped
+                            | WorkspaceState::Destroyed
                     )
                 })
                 .map(|(id, r)| (id.clone(), r.workspace.root.clone()))
@@ -12615,10 +12640,15 @@ impl WorkspaceManager {
         (evicted, free_bytes)
     }
 
-    fn materialize_repository(&self, repo_url: &str, branch: Option<&str>, destination: &Path) -> Result<()> {
-        const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024;      // 1 GB
-        const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB
-        const MAX_REPO_BYTES_TO_CACHE: u64 = 200 * 1024 * 1024;        // 200 MB
+    fn materialize_repository(
+        &self,
+        repo_url: &str,
+        branch: Option<&str>,
+        destination: &Path,
+    ) -> Result<()> {
+        const MIN_FREE_BYTES_TO_CLONE: u64 = 1024 * 1024 * 1024; // 1 GB
+        const MIN_FREE_BYTES_TO_CACHE: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+        const MAX_REPO_BYTES_TO_CACHE: u64 = 200 * 1024 * 1024; // 200 MB
 
         if destination.exists() {
             fs::remove_dir_all(destination)?;
@@ -12692,24 +12722,33 @@ impl WorkspaceManager {
                     }
                     fs::create_dir_all(destination)?;
                     let output2 = clone_command
-                        .args(["--branch"])  // remove last --branch arg isn't possible; rebuild
+                        .args(["--branch"]) // remove last --branch arg isn't possible; rebuild
                         .output();
                     // Rebuild without --branch and retry
                     let mut retry = Command::new("git");
                     retry
-                        .arg("-c").arg("credential.helper=")
-                        .arg("-c").arg("credential.username=")
-                        .arg("clone").arg("--depth").arg("1")
+                        .arg("-c")
+                        .arg("credential.helper=")
+                        .arg("-c")
+                        .arg("credential.username=")
+                        .arg("clone")
+                        .arg("--depth")
+                        .arg("1")
                         .env("GIT_TERMINAL_PROMPT", "0")
-                        .arg(repo_url).arg(destination);
+                        .arg(repo_url)
+                        .arg(destination);
                     drop(output2);
-                    let retry_out = retry.output()
-                        .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+                    let retry_out = retry.output().map_err(|e| {
+                        RuntimeError::CommandFailed(format!("git clone failed: {e}"))
+                    })?;
                     if !retry_out.status.success() {
-                        let err = String::from_utf8_lossy(&retry_out.stderr).trim().to_string();
+                        let err = String::from_utf8_lossy(&retry_out.stderr)
+                            .trim()
+                            .to_string();
                         let reason = github_clone_error_reason(repo_url, &err);
                         return Err(RuntimeError::CommandFailed(format!(
-                            "git clone exited with status {}: {}", retry_out.status, reason
+                            "git clone exited with status {}: {}",
+                            retry_out.status, reason
                         )));
                     }
                 } else {
@@ -12843,7 +12882,9 @@ impl WorkspaceManager {
         self.evict_terminal_workspaces();
 
         self.set_workspace_state(id, WorkspaceState::Materializing);
-        if let Err(e) = self.materialize_repository(repo_url, overrides.branch.as_deref(), &repository_root) {
+        if let Err(e) =
+            self.materialize_repository(repo_url, overrides.branch.as_deref(), &repository_root)
+        {
             self.fail_workspace(id, format!("workspace failed: {e}"));
             return;
         }
@@ -12878,16 +12919,16 @@ impl WorkspaceManager {
             Self::resolved_run_command(&ctx, &overrides).unwrap_or_else(|| "none".to_string());
         self.push_workspace_log(id, format!("planned execution command: {planned_command}"));
         if !overrides.environment.is_empty() {
-            self.push_workspace_log(id, format!(
-                "applied env overrides: {}",
-                overrides.environment.len()
-            ));
+            self.push_workspace_log(
+                id,
+                format!("applied env overrides: {}", overrides.environment.len()),
+            );
         }
         if !overrides.versions.is_empty() {
-            self.push_workspace_log(id, format!(
-                "applied version overrides: {}",
-                overrides.versions.len()
-            ));
+            self.push_workspace_log(
+                id,
+                format!("applied version overrides: {}", overrides.versions.len()),
+            );
         }
 
         workspace.framework = ctx.analysis.framework;
@@ -12947,10 +12988,20 @@ impl WorkspaceManager {
         }
 
         if let Some(stdout) = stdout {
-            Self::start_stream_reader(Arc::clone(&self.workspaces), id.to_string(), "stdout", stdout);
+            Self::start_stream_reader(
+                Arc::clone(&self.workspaces),
+                id.to_string(),
+                "stdout",
+                stdout,
+            );
         }
         if let Some(stderr) = stderr {
-            Self::start_stream_reader(Arc::clone(&self.workspaces), id.to_string(), "stderr", stderr);
+            Self::start_stream_reader(
+                Arc::clone(&self.workspaces),
+                id.to_string(),
+                "stderr",
+                stderr,
+            );
         }
 
         self.set_workspace_state(id, WorkspaceState::Initializing);
@@ -13055,12 +13106,7 @@ impl WorkspaceManager {
         if install_cmd.is_empty() {
             return Ok(());
         }
-        Self::update_runtime_line(
-            workspaces,
-            id,
-            format!("install: {install_cmd}"),
-            false,
-        );
+        Self::update_runtime_line(workspaces, id, format!("install: {install_cmd}"), false);
         let mut parts = install_cmd.split_whitespace();
         let Some(program) = parts.next() else {
             return Ok(());
@@ -13072,11 +13118,18 @@ impl WorkspaceManager {
             .envs(&overrides.environment)
             .envs(&overrides.versions)
             .output()
-            .map_err(|err| RuntimeError::CommandFailed(format!("failed to run install command: {err}")))?;
+            .map_err(|err| {
+                RuntimeError::CommandFailed(format!("failed to run install command: {err}"))
+            })?;
 
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if !line.trim().is_empty() {
-                Self::update_runtime_line(workspaces, id, format!("stdout: {}", line.trim()), false);
+                Self::update_runtime_line(
+                    workspaces,
+                    id,
+                    format!("stdout: {}", line.trim()),
+                    false,
+                );
             }
         }
         for line in String::from_utf8_lossy(&output.stderr).lines() {
@@ -13097,7 +13150,8 @@ impl WorkspaceManager {
             Self::update_runtime_line(
                 workspaces,
                 id,
-                "stderr: pnpm frozen lockfile install failed, retrying with regenerated lockfile".to_string(),
+                "stderr: pnpm frozen lockfile install failed, retrying with regenerated lockfile"
+                    .to_string(),
                 true,
             );
             let retry = Command::new("pnpm")
@@ -13106,20 +13160,37 @@ impl WorkspaceManager {
                 .envs(&overrides.environment)
                 .envs(&overrides.versions)
                 .output()
-                .map_err(|err| RuntimeError::CommandFailed(format!("failed to run pnpm install retry: {err}")))?;
+                .map_err(|err| {
+                    RuntimeError::CommandFailed(format!("failed to run pnpm install retry: {err}"))
+                })?;
 
             for line in String::from_utf8_lossy(&retry.stdout).lines() {
                 if !line.trim().is_empty() {
-                    Self::update_runtime_line(workspaces, id, format!("stdout: {}", line.trim()), false);
+                    Self::update_runtime_line(
+                        workspaces,
+                        id,
+                        format!("stdout: {}", line.trim()),
+                        false,
+                    );
                 }
             }
             for line in String::from_utf8_lossy(&retry.stderr).lines() {
                 if !line.trim().is_empty() {
-                    Self::update_runtime_line(workspaces, id, format!("stderr: {}", line.trim()), true);
+                    Self::update_runtime_line(
+                        workspaces,
+                        id,
+                        format!("stderr: {}", line.trim()),
+                        true,
+                    );
                 }
             }
             if retry.status.success() {
-                Self::update_runtime_line(workspaces, id, "stdout: lockfile regenerated".to_string(), false);
+                Self::update_runtime_line(
+                    workspaces,
+                    id,
+                    "stdout: lockfile regenerated".to_string(),
+                    false,
+                );
                 return Ok(());
             }
             return Err(RuntimeError::CommandFailed(format!(
@@ -13133,7 +13204,10 @@ impl WorkspaceManager {
         )))
     }
 
-    fn spawn_supervised_process(ctx: &ExecutionContext, overrides: &LaunchOverrides) -> Result<(Child, u16)> {
+    fn spawn_supervised_process(
+        ctx: &ExecutionContext,
+        overrides: &LaunchOverrides,
+    ) -> Result<(Child, u16)> {
         let run_cmd = Self::resolved_run_command(ctx, overrides)
             .ok_or_else(|| RuntimeError::CommandFailed("no run command resolved".to_string()))?;
         let repo_path = Path::new(&ctx.repo_path);
@@ -13147,12 +13221,16 @@ impl WorkspaceManager {
                 | Framework::Gradio
         );
 
-        let (requested_port, prebound_port_listener) = Self::reserve_prebound_port()
-            .ok_or_else(|| RuntimeError::CommandFailed("failed to reserve runtime port via bind(127.0.0.1:0)".to_string()))?;
+        let (requested_port, prebound_port_listener) =
+            Self::reserve_prebound_port().ok_or_else(|| {
+                RuntimeError::CommandFailed(
+                    "failed to reserve runtime port via bind(127.0.0.1:0)".to_string(),
+                )
+            })?;
 
         let run_cmd = Self::auto_heal_runtime_command(
             &Self::apply_command_overrides(&run_cmd, overrides)
-                .replace("{PORT}", &requested_port.to_string())
+                .replace("{PORT}", &requested_port.to_string()),
         );
         let run_cmd = if is_python {
             let venv_bin = repo_path.join(".venv").join("bin");
@@ -13250,16 +13328,20 @@ impl WorkspaceManager {
                 }
                 if let Some(runtime) = record.runtime.as_mut() {
                     runtime.process_alive = exited_status.is_none();
-                    runtime.actual_port = Self::parse_listening_ports(runtime.pid)
-                        .into_iter()
-                        .next();
+                    runtime.actual_port =
+                        Self::parse_listening_ports(runtime.pid).into_iter().next();
 
-                    let log_ready = runtime.stdout.iter().chain(runtime.stderr.iter()).any(|line| {
-                        let lowercase_line = line.to_ascii_lowercase();
-                        STARTUP_LOG_PATTERNS
+                    let log_ready =
+                        runtime
+                            .stdout
                             .iter()
-                            .any(|pattern| lowercase_line.contains(pattern))
-                    });
+                            .chain(runtime.stderr.iter())
+                            .any(|line| {
+                                let lowercase_line = line.to_ascii_lowercase();
+                                STARTUP_LOG_PATTERNS
+                                    .iter()
+                                    .any(|pattern| lowercase_line.contains(pattern))
+                            });
                     if log_ready {
                         runtime.last_probe = "startup logs indicate ready".to_string();
                     }
@@ -13523,12 +13605,15 @@ impl WorkspaceManager {
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             record.workspace.state = WorkspaceState::Failed;
-                            Self::append_capped(&mut record.logs, format!(
-                                "process exited unexpectedly ({})",
-                                status
-                                    .code()
-                                    .map_or("signal".to_string(), |c| format!("code {c}"))
-                            ));
+                            Self::append_capped(
+                                &mut record.logs,
+                                format!(
+                                    "process exited unexpectedly ({})",
+                                    status
+                                        .code()
+                                        .map_or("signal".to_string(), |c| format!("code {c}"))
+                                ),
+                            );
                             if let Some(runtime) = record.runtime.as_mut() {
                                 runtime.exit_code = status.code();
                                 runtime.process_alive = false;
@@ -13611,6 +13696,56 @@ impl WorkspaceManager {
             .runtime
             .as_ref()
             .ok_or_else(|| RuntimeError::ExecutionContextMissing(id.to_string()))?;
+        let execution_trace = record.process_handle.as_ref().map(|handle| {
+            let provider = infer_provider_from_pid_hint(&handle.pid_hint);
+            let fallback_providers = record
+                .execution_context
+                .as_ref()
+                .map(|ctx| {
+                    ctx.analysis
+                        .execution_profile
+                        .runtime_affinity
+                        .fallback_providers
+                        .clone()
+                })
+                .unwrap_or_default();
+            let preferred_provider = record
+                .execution_context
+                .as_ref()
+                .map(|ctx| {
+                    ctx.analysis
+                        .execution_profile
+                        .runtime_affinity
+                        .preferred_provider
+                        .clone()
+                })
+                .unwrap_or_default();
+            let selected_because = if provider == preferred_provider {
+                vec![
+                    "compatible".to_string(),
+                    "preferred provider".to_string(),
+                    "healthy".to_string(),
+                ]
+            } else {
+                vec![
+                    "compatible".to_string(),
+                    "lowest startup".to_string(),
+                    "healthy".to_string(),
+                ]
+            };
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let startup_ms = now_ms.saturating_sub(runtime.started_at_unix_ms);
+            WorkspaceExecutionTrace {
+                provider,
+                selected_because,
+                fallbacks: fallback_providers,
+                actual_startup: format!("{startup_ms}ms"),
+                successful: runtime.process_alive || runtime.exit_code == Some(0),
+            }
+        });
         Ok(WorkspaceRuntimeStatus {
             pid: runtime.pid,
             alive: runtime.process_alive,
@@ -13623,8 +13758,28 @@ impl WorkspaceManager {
             last_probe: runtime.last_probe.clone(),
             stdout: runtime.stdout.clone(),
             stderr: runtime.stderr.clone(),
+            execution_trace,
         })
     }
+}
+
+fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
+    if pid_hint.starts_with("wasm:") {
+        return "WasmExecutionProvider".to_string();
+    }
+    if pid_hint.starts_with("dea:") {
+        return "LocalAgentProvider".to_string();
+    }
+    if pid_hint.starts_with("node:") {
+        return "NodeRuntimeProvider".to_string();
+    }
+    if pid_hint.starts_with("rust:") {
+        return "RustRuntimeProvider".to_string();
+    }
+    if pid_hint.starts_with("static:") {
+        return "StaticRuntimeProvider".to_string();
+    }
+    pid_hint.to_string()
 }
 
 impl WasmWorkspace for WorkspaceManager {
@@ -17381,25 +17536,45 @@ fn can_transition(from: WorkspaceState, to: WorkspaceState) -> bool {
     match from {
         WorkspaceState::Created => to == WorkspaceState::Materializing,
         WorkspaceState::Materializing => {
-            matches!(to, WorkspaceState::Installing | WorkspaceState::Analyzing | WorkspaceState::Failed)
+            matches!(
+                to,
+                WorkspaceState::Installing | WorkspaceState::Analyzing | WorkspaceState::Failed
+            )
         }
         WorkspaceState::Installing => {
-            matches!(to, WorkspaceState::Analyzing | WorkspaceState::Launching | WorkspaceState::Failed)
+            matches!(
+                to,
+                WorkspaceState::Analyzing | WorkspaceState::Launching | WorkspaceState::Failed
+            )
         }
         WorkspaceState::Analyzing => {
             matches!(to, WorkspaceState::Planning | WorkspaceState::Failed)
         }
-        WorkspaceState::Planning => matches!(to, WorkspaceState::Starting | WorkspaceState::Launching | WorkspaceState::Failed),
+        WorkspaceState::Planning => matches!(
+            to,
+            WorkspaceState::Starting | WorkspaceState::Launching | WorkspaceState::Failed
+        ),
         WorkspaceState::Pending => {
             matches!(to, WorkspaceState::Provisioning | WorkspaceState::Failed)
         }
         WorkspaceState::Provisioning => {
             matches!(to, WorkspaceState::Starting | WorkspaceState::Failed)
         }
-        WorkspaceState::Starting => matches!(to, WorkspaceState::Launching | WorkspaceState::Running | WorkspaceState::Failed),
-        WorkspaceState::Launching => matches!(to, WorkspaceState::Initializing | WorkspaceState::Failed),
-        WorkspaceState::Initializing => matches!(to, WorkspaceState::Ready | WorkspaceState::Running | WorkspaceState::Failed),
-        WorkspaceState::Ready => matches!(to, WorkspaceState::Running | WorkspaceState::Failed | WorkspaceState::Stopping),
+        WorkspaceState::Starting => matches!(
+            to,
+            WorkspaceState::Launching | WorkspaceState::Running | WorkspaceState::Failed
+        ),
+        WorkspaceState::Launching => {
+            matches!(to, WorkspaceState::Initializing | WorkspaceState::Failed)
+        }
+        WorkspaceState::Initializing => matches!(
+            to,
+            WorkspaceState::Ready | WorkspaceState::Running | WorkspaceState::Failed
+        ),
+        WorkspaceState::Ready => matches!(
+            to,
+            WorkspaceState::Running | WorkspaceState::Failed | WorkspaceState::Stopping
+        ),
         WorkspaceState::Running => {
             matches!(
                 to,
@@ -18803,7 +18978,11 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
     // Line 0: headers; Line 1: data — "Filesystem 1K-blocks Used Available ..."
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.lines().nth(1)?;
-    line.split_whitespace().nth(3)?.parse::<u64>().ok().map(|kb| kb * 1024)
+    line.split_whitespace()
+        .nth(3)?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
 }
 
 fn directory_size_bytes(path: &Path) -> u64 {
@@ -18976,13 +19155,17 @@ fn list_paths(root: &Path, current: &Path, paths: &mut Vec<String>, limit: usize
     if paths.len() >= limit {
         return;
     }
-    let Ok(entries) = fs::read_dir(current) else { return };
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
     for entry in entries.flatten() {
         if paths.len() >= limit {
             return;
         }
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let is_dir = if file_type.is_symlink() {
             path.metadata().map(|m| m.is_dir()).unwrap_or(false)
         } else {
@@ -18991,7 +19174,9 @@ fn list_paths(root: &Path, current: &Path, paths: &mut Vec<String>, limit: usize
         if is_dir {
             list_paths(root, &path, paths, limit);
         } else {
-            let Ok(relative) = path.strip_prefix(root) else { continue };
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
             paths.push(relative.to_string_lossy().to_string());
         }
     }
@@ -21186,6 +21371,30 @@ dependencies:
         assert_eq!(
             handle.trace_url.as_deref(),
             Some("https://trythissoftware.com/e/ws-router-fallback")
+        );
+    }
+
+    #[test]
+    fn runtime_trace_provider_inference_maps_known_pid_prefixes() {
+        assert_eq!(
+            infer_provider_from_pid_hint("wasm:serve:cache"),
+            "WasmExecutionProvider"
+        );
+        assert_eq!(
+            infer_provider_from_pid_hint("dea:agent:workspace"),
+            "LocalAgentProvider"
+        );
+        assert_eq!(
+            infer_provider_from_pid_hint("node:cache"),
+            "NodeRuntimeProvider"
+        );
+        assert_eq!(
+            infer_provider_from_pid_hint("rust:cache"),
+            "RustRuntimeProvider"
+        );
+        assert_eq!(
+            infer_provider_from_pid_hint("static:cache"),
+            "StaticRuntimeProvider"
         );
     }
 
