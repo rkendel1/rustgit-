@@ -139,12 +139,9 @@ function withCorsHeaders(response: NextResponse, allowedOrigin: string | null): 
 }
 
 function forbiddenOriginResponse(origin: string): NextResponse {
-  return withCorsHeaders(
-    NextResponse.json(
-      { error: "Origin is not allowed." },
-      { status: 403 },
-    ),
-    origin,
+  return NextResponse.json(
+    { error: "Origin is not allowed.", origin },
+    { status: 403 },
   );
 }
 
