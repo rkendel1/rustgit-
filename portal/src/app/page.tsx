@@ -55,7 +55,7 @@ type Workspace = {
   state: WorkspaceState;
   framework: string;
   ports: { port: number; protocol: string; route: string }[];
-  resource_quotas: { max_memory_mb: number; max_cpu_millis: number };
+  resource_quotas?: { max_memory_mb: number; max_cpu_millis: number };
 };
 
 type RepositoryIdentity = {
@@ -650,11 +650,11 @@ export default function Home() {
               </div>
               <div className={styles.tile}>
                 <strong>Memory</strong>
-                <span>{workspace.resource_quotas.max_memory_mb} MB</span>
+                <span>{workspace.resource_quotas?.max_memory_mb ?? "—"} MB</span>
               </div>
               <div className={styles.tile}>
                 <strong>CPU</strong>
-                <span>{workspace.resource_quotas.max_cpu_millis} m</span>
+                <span>{workspace.resource_quotas?.max_cpu_millis ?? "—"} m</span>
               </div>
               {workspace.ports.map((p, i) => (
                 <div key={i} className={styles.tile}>
