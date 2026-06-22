@@ -685,7 +685,7 @@ async fn workspace_files(
     tokio::task::spawn_blocking(move || {
         let fs = manager.filesystem(&id)?;
         let mut files = fs
-            .list(1000)?
+            .list(usize::MAX)?
             .into_iter()
             .filter(|path| !is_workspace_internal_file(path))
             .collect::<Vec<_>>();
@@ -1145,6 +1145,14 @@ mod tests {
         )
         .expect("write package");
         fs::write(repo.join("server.js"), "setInterval(() => {}, 1000);\n").expect("write server");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        for index in 0..1_100 {
+            fs::write(
+                repo.join("src").join(format!("file-{index}.txt")),
+                format!("file {index}\n"),
+            )
+            .expect("write source file");
+        }
 
         let app = app(test_state());
         let create_response = app
@@ -1201,6 +1209,8 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect::<Vec<_>>();
         assert!(files.iter().any(|path| *path == "package.json"));
+        assert!(files.len() > 1000);
+        assert!(files.iter().any(|path| *path == "src/file-1099.txt"));
 
         let file_response = app
             .oneshot(

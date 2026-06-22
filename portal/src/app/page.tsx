@@ -58,6 +58,12 @@ type WorkspaceFileResponse = {
   content?: string;
 };
 
+type WorkspaceTreeNode = {
+  name: string;
+  path: string | null;
+  children: WorkspaceTreeNode[];
+};
+
 type WorkspaceState =
   | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
   | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
@@ -202,6 +208,55 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
+function buildWorkspaceFileTree(files: string[]): WorkspaceTreeNode[] {
+  type MutableWorkspaceTreeNode = {
+    name: string;
+    path: string | null;
+    children: Map<string, MutableWorkspaceTreeNode>;
+  };
+
+  const root: MutableWorkspaceTreeNode = {
+    name: "",
+    path: null,
+    children: new Map(),
+  };
+
+  for (const file of files) {
+    const segments = file.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+    let cursor = root;
+    const resolvedPath: string[] = [];
+    for (const segment of segments) {
+      resolvedPath.push(segment);
+      let next = cursor.children.get(segment);
+      if (!next) {
+        next = { name: segment, path: null, children: new Map() };
+        cursor.children.set(segment, next);
+      }
+      cursor = next;
+    }
+    cursor.path = resolvedPath.join("/");
+  }
+
+  const finalize = (node: MutableWorkspaceTreeNode): WorkspaceTreeNode => {
+    const children = Array.from(node.children.values())
+      .map(finalize)
+      .sort((left, right) => {
+        const leftIsDirectory = left.children.length > 0;
+        const rightIsDirectory = right.children.length > 0;
+        if (leftIsDirectory !== rightIsDirectory) {
+          return leftIsDirectory ? -1 : 1;
+        }
+        return left.name.localeCompare(right.name);
+      });
+    return { name: node.name, path: node.path, children };
+  };
+
+  return Array.from(root.children.values())
+    .map(finalize)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export default function Home() {
   const repoInputRef = useRef<HTMLInputElement>(null);
   const [repository, setRepository] = useState("");
@@ -230,6 +285,7 @@ export default function Home() {
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
+  const workspaceFileTree = useMemo(() => buildWorkspaceFileTree(workspaceFiles), [workspaceFiles]);
   const anonymousIdentity = useMemo(
     () => ({
       anonUserId: createAnonymousId("anon-portal"),
@@ -358,7 +414,7 @@ export default function Home() {
         const response = await fetch(`/api/proxy/workspaces/${wsId}/files`, { cache: "no-store" });
         const payload = await readJsonResponse<WorkspaceFilesResponse>(response);
         if (cancelled) return;
-        const files = (payload.files ?? []).slice(0, 200);
+        const files = payload.files ?? [];
         setWorkspaceFiles(files);
         if (files.length === 0) {
           setSelectedWorkspaceFile(null);
@@ -441,6 +497,38 @@ export default function Home() {
 
   function formatConfidence(value: number | undefined): string {
     return typeof value === "number" ? value.toFixed(CONFIDENCE_DECIMAL_PLACES) : "n/a";
+  }
+
+  function renderWorkspaceFileTree(nodes: WorkspaceTreeNode[]) {
+    return (
+      <ul className={styles.fileTreeList}>
+        {nodes.map((node) => {
+          if (node.children.length === 0 && node.path) {
+            return (
+              <li key={node.path}>
+                <button
+                  type="button"
+                  className={`${styles.fileTreeFileButton} ${
+                    selectedWorkspaceFile === node.path ? styles.fileTreeFileButtonActive : ""
+                  }`}
+                  onClick={() => setSelectedWorkspaceFile(node.path)}
+                >
+                  {node.name}
+                </button>
+              </li>
+            );
+          }
+          return (
+            <li key={node.path ?? node.name}>
+              <details className={styles.fileTreeDirectory} open>
+                <summary>{node.name}</summary>
+                {renderWorkspaceFileTree(node.children)}
+              </details>
+            </li>
+          );
+        })}
+      </ul>
+    );
   }
 
   async function handleAnalyze() {
@@ -740,18 +828,8 @@ export default function Home() {
               <p className={styles.hint}>No files available yet.</p>
             ) : (
               <>
-                <div className={styles.actions}>
-                  {workspaceFiles.slice(0, 24).map((file) => (
-                    <button
-                      key={file}
-                      type="button"
-                      className={styles.btn}
-                      onClick={() => setSelectedWorkspaceFile(file)}
-                      disabled={selectedWorkspaceFile === file}
-                    >
-                      {file}
-                    </button>
-                  ))}
+                <div className={styles.fileTree}>
+                  {renderWorkspaceFileTree(workspaceFileTree)}
                 </div>
                 <div className={styles.logSection}>
                   <div className={styles.logHeader}>

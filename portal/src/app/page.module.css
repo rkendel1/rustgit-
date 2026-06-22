@@ -389,6 +389,49 @@
   margin-bottom: 0.15rem;
 }
 
+.fileTree {
+  margin-top: 0.75rem;
+  border: 1px solid #dbeafe;
+  border-radius: 0.6rem;
+  padding: 0.6rem;
+  max-height: 260px;
+  overflow: auto;
+  background: #f8fbff;
+}
+
+.fileTreeList {
+  list-style: none;
+  padding-left: 0.7rem;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.fileTreeDirectory summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #334155;
+}
+
+.fileTreeFileButton {
+  border: 0;
+  background: transparent;
+  padding: 0.15rem 0.25rem;
+  font: inherit;
+  color: #0f172a;
+  cursor: pointer;
+  border-radius: 0.4rem;
+  text-align: left;
+}
+
+.fileTreeFileButton:hover {
+  background: #e2e8f0;
+}
+
+.fileTreeFileButtonActive {
+  background: #bfdbfe;
+  color: #1e3a8a;
+}
+
 .logSection {
   margin-top: 0.85rem;
   border-top: 1px solid #e2e8f0;
@@ -576,6 +619,28 @@
 
   .healTitle {
     color: #fca5a5;
+  }
+
+  .fileTree {
+    border-color: #334155;
+    background: #0f172a;
+  }
+
+  .fileTreeDirectory summary {
+    color: #cbd5e1;
+  }
+
+  .fileTreeFileButton {
+    color: #e2e8f0;
+  }
+
+  .fileTreeFileButton:hover {
+    background: #1e293b;
+  }
+
+  .fileTreeFileButtonActive {
+    background: #1e3a8a;
+    color: #dbeafe;
   }
 
   .logSection {
