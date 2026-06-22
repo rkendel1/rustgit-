@@ -54,7 +54,10 @@ export async function GET(
     );
   }
   const proxyUrl = new URL(`/api/app-proxy/${id}/`, request.url).toString();
-  const readiness = await fetch(proxyUrl, { cache: "no-store" });
+  const readiness = await fetch(proxyUrl, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(2_000),
+  });
   if (!readiness.ok) {
     let payload: unknown = null;
     try {

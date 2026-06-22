@@ -5,7 +5,7 @@ const BACKEND_BASE =
     ? "http://localhost:8080"
     : `https://api.${process.env.NEXT_PUBLIC_BASE_DOMAIN?.replace(/^https?:\/\//, "") ?? "trythissoftware.com"}`;
 
-const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v\d+)\b/i;
+const READY_LOG_PATTERN = /\b(ready|listening|compiled|started server|vite v[\d.]+)\b/i;
 const MIN_POLL_INTERVAL_MS = 100;
 const MAX_PROBE_TIMEOUT_MS = 500;
 
@@ -61,10 +61,14 @@ function probeError(error: unknown): string {
 }
 
 function extractProcessInfo(logs: string[]): string {
-  const pidLine = logs.find((line) => line.includes("spawned pid:"));
+  const pidLine = logs.find((line) => /spawned pid:/i.test(line));
   if (!pidLine) return "unknown";
   const match = pidLine.match(/spawned pid:\s*(\d+)/i);
   return match ? `running (pid ${match[1]})` : "running";
+}
+
+function validPort(port: number | null): port is number {
+  return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65_535;
 }
 
 async function getWorkspace(id: string): Promise<WorkspaceInfo | null> {
@@ -135,7 +139,7 @@ async function handle(
       break;
     }
     const port = workspace.ports?.[0]?.port ?? null;
-    if (!port) {
+    if (!validPort(port)) {
       lastProbe = "port unavailable";
     } else {
       forwardHeaders.set("host", `127.0.0.1:${port}`);
@@ -216,7 +220,7 @@ async function handle(
       const logs = await getWorkspaceLogs(id);
       if (logs.length > 0) {
         lastLogs = logs.slice(-5);
-        if (READY_LOG_PATTERN.test(lastLogs.join("\n"))) {
+        if (lastLogs.some((line) => READY_LOG_PATTERN.test(line))) {
           lastProbe = "startup logs indicate server may be ready";
         }
       }
