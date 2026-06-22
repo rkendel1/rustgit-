@@ -9,6 +9,8 @@ const DEFAULT_API_BASE_URL =
     ? "http://localhost:8080"
     : `https://api.${PRODUCTION_BASE_DOMAIN}`;
 const UPSTREAM_PROXY_PREFIX_SEGMENTS = ["api", "proxy"] as const;
+const CORS_ALLOW_METHODS = "GET, POST, DELETE, OPTIONS";
+const CORS_ALLOW_HEADERS = "Content-Type, Authorization";
 
 // Default timeout for most proxy calls.
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -75,13 +77,23 @@ function upstreamFailureResponse(error: unknown, path: string): NextResponse {
       `Proxy upstream request timed out after ${timeoutMs}ms for path: ${path}`,
     );
   }
-  return NextResponse.json(
+  return withCorsHeaders(
+    NextResponse.json(
     {
       error: isTimeout ? "Upstream request timed out." : "Upstream request failed.",
       path,
     },
     { status: isTimeout ? 504 : 502 },
+    ),
   );
+}
+
+function withCorsHeaders(response: NextResponse): NextResponse {
+  response.headers.set("Access-Control-Allow-Origin", "*");
+  response.headers.set("Access-Control-Allow-Methods", CORS_ALLOW_METHODS);
+  response.headers.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
+  response.headers.set("Access-Control-Max-Age", "3600");
+  return response;
 }
 
 async function proxyRequest(
@@ -155,13 +167,15 @@ async function proxyRequest(
     }
   }
 
-  return new NextResponse(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: {
-      "content-type":
-        upstreamResponse.headers.get("content-type") ?? "application/json",
-    },
-  });
+  return withCorsHeaders(
+    new NextResponse(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: {
+        "content-type":
+          upstreamResponse.headers.get("content-type") ?? "application/json",
+      },
+    }),
+  );
 }
 
 export async function GET(
@@ -183,4 +197,8 @@ export async function DELETE(
   context: { params: Promise<{ path: string[] }> },
 ) {
   return proxyRequest(request, context.params);
+}
+
+export async function OPTIONS() {
+  return withCorsHeaders(new NextResponse(null, { status: 204 }));
 }
