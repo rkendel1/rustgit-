@@ -12495,44 +12495,123 @@ impl WorkspaceManager {
             None => return (None, None),
         };
         let repo_path = std::path::Path::new(&ctx.repo_path);
+        let is_python = matches!(
+            ctx.analysis.framework,
+            Framework::Python | Framework::Flask | Framework::FastApi |
+            Framework::Django | Framework::Streamlit | Framework::Gradio
+        );
 
-        // Run install step (npm install, pip install, etc.) if present in the graph
-        let install_cmd = ctx.execution_graph.nodes.iter()
-            .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
-            .and_then(|n| n.command.clone());
-        if let Some(install) = install_cmd {
-            let mut parts = install.split_whitespace();
-            if let Some(program) = parts.next() {
-                let args: Vec<&str> = parts.collect();
-                logs.push(format!("installing dependencies: {install}"));
-                let _ = Command::new(program)
-                    .args(&args)
+        // For Python apps, create a venv and install into it
+        if is_python {
+            let venv_path = repo_path.join(".venv");
+            if !venv_path.exists() {
+                logs.push("creating virtual environment: python -m venv .venv".to_string());
+                let _ = Command::new("python3")
+                    .args(["-m", "venv", ".venv"])
                     .current_dir(repo_path)
                     .output();
             }
+
+            let install_cmd = ctx.execution_graph.nodes.iter()
+                .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+                .and_then(|n| n.command.clone());
+            if let Some(install) = install_cmd {
+                // Rewrite the install command to use the venv pip
+                let venv_pip = venv_path.join("bin").join("pip");
+                let pip_path = venv_pip.to_string_lossy().to_string();
+                // Strip leading "python -m pip" or "pip" and replace with venv pip
+                let install_args: Vec<&str> = if install.contains("pip install") {
+                    let idx = install.find("pip install").unwrap();
+                    install[idx + 4..].split_whitespace().collect()
+                } else {
+                    install.split_whitespace().skip(1).collect()
+                };
+                logs.push(format!("installing dependencies: {pip_path} {}", install_args.join(" ")));
+                let _ = Command::new(&pip_path)
+                    .args(&install_args)
+                    .current_dir(repo_path)
+                    .output();
+            }
+        } else {
+            // JS/other: run install command as-is
+            let install_cmd = ctx.execution_graph.nodes.iter()
+                .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+                .and_then(|n| n.command.clone());
+            if let Some(install) = install_cmd {
+                let mut parts = install.split_whitespace();
+                if let Some(program) = parts.next() {
+                    let args: Vec<&str> = parts.collect();
+                    logs.push(format!("installing dependencies: {install}"));
+                    let _ = Command::new(program)
+                        .args(&args)
+                        .current_dir(repo_path)
+                        .output();
+                }
+            }
+        }
+
+        // For Django: run migrations before starting the server
+        if ctx.analysis.framework == Framework::Django {
+            let venv_python = repo_path.join(".venv").join("bin").join("python");
+            let python = if venv_python.exists() {
+                venv_python.to_string_lossy().to_string()
+            } else {
+                "python3".to_string()
+            };
+            logs.push("running migrations: manage.py migrate".to_string());
+            let _ = Command::new(&python)
+                .args(["manage.py", "migrate", "--run-syncdb"])
+                .current_dir(repo_path)
+                .output();
         }
 
         let assigned_port = Self::find_free_port();
-        let mut parts = run_cmd.split_whitespace();
-        let program = match parts.next() {
-            Some(p) => p,
-            None => return (None, None),
-        };
-        let args: Vec<&str> = parts.collect();
+        let port_str = assigned_port.map_or("8000".to_string(), |p| p.to_string());
 
-        let mut cmd = Command::new(program);
+        // Substitute {PORT} placeholder used in Python command templates, then
+        // rewrite the program path to the venv binary if this is a Python app
+        let run_cmd = run_cmd.replace("{PORT}", &port_str);
+        let run_cmd = if is_python {
+            let venv_bin = repo_path.join(".venv").join("bin");
+            let mut parts = run_cmd.splitn(2, ' ');
+            let prog = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("");
+            let venv_prog = venv_bin.join(prog);
+            if venv_prog.exists() {
+                if rest.is_empty() {
+                    venv_prog.to_string_lossy().to_string()
+                } else {
+                    format!("{} {rest}", venv_prog.display())
+                }
+            } else {
+                run_cmd
+            }
+        } else {
+            run_cmd
+        };
+
+        let mut parts = run_cmd.splitn(2, ' ');
+        let program = match parts.next() {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => return (None, None),
+        };
+        let args_str = parts.next().unwrap_or("");
+        let args: Vec<&str> = args_str.split_whitespace().collect();
+
+        let mut cmd = Command::new(&program);
         cmd.args(&args)
             .current_dir(repo_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        // Always set PORT env var for frameworks that read it (Node.js etc.)
         if let Some(port) = assigned_port {
             cmd.env("PORT", port.to_string());
         }
 
         match cmd.spawn() {
             Ok(child) => {
-                logs.push(format!("spawned pid: {} on port {}", child.id(), assigned_port.map_or("default".to_string(), |p| p.to_string())));
+                logs.push(format!("spawned pid: {} on port {port_str}", child.id()));
                 (Some(child), assigned_port)
             }
             Err(err) => {
@@ -14381,16 +14460,16 @@ impl BuildPlanner {
         };
         let py_dev = match framework {
             Framework::FastApi => {
-                format!("uvicorn {fastapi_app_path} --host 0.0.0.0 --port 8000")
+                format!("uvicorn {fastapi_app_path} --host 0.0.0.0 --port {{PORT}}")
             }
-            Framework::Django => "python manage.py runserver 0.0.0.0:8000".to_string(),
-            Framework::Flask => "flask run --host 0.0.0.0 --port 8000".to_string(),
+            Framework::Django => "python manage.py runserver 0.0.0.0:{PORT}".to_string(),
+            Framework::Flask => "flask run --host 0.0.0.0 --port {PORT}".to_string(),
             Framework::Streamlit => {
                 format!(
-                    "streamlit run {streamlit_entry} --server.address 0.0.0.0 --server.port 8501"
+                    "streamlit run {streamlit_entry} --server.address 0.0.0.0 --server.port {{PORT}}"
                 )
             }
-            _ => "python -m app".to_string(),
+            _ => "python -m app --port {PORT}".to_string(),
         };
 
         match framework {
