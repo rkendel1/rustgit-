@@ -12674,6 +12674,8 @@ impl WorkspaceManager {
         };
         let (raw_dir, raw_command) = if let Some((dir, rest)) = remainder.split_once("&&") {
             (dir.trim(), rest.trim())
+        } else if let Some((dir, rest)) = remainder.split_once(';') {
+            (dir.trim(), rest.trim())
         } else {
             (remainder.trim(), "")
         };
@@ -12796,7 +12798,7 @@ impl WorkspaceManager {
             if let Some(install) = install_cmd {
                 let (install_cwd, install) = Self::extract_workdir_and_command(&install, repo_path);
                 if install.is_empty() {
-                    logs.push("install command resolved to directory-only command; skipping".to_string());
+                    logs.push("install command is cd-only without subsequent command; skipping".to_string());
                 } else {
                     let mut parts = install.split_whitespace();
                     if let Some(program) = parts.next() {
@@ -12857,7 +12859,7 @@ impl WorkspaceManager {
         };
         let (run_cwd, run_cmd) = Self::extract_workdir_and_command(&run_cmd, repo_path);
         if run_cmd.is_empty() {
-            logs.push("run command resolved to directory-only command; skipping process spawn".to_string());
+            logs.push("run command is cd-only without subsequent command; skipping process spawn".to_string());
             return (None, None);
         }
 
@@ -19314,6 +19316,15 @@ dependencies:
             WorkspaceManager::extract_workdir_and_command("cd apps/server && npm ci", default_dir);
         assert_eq!(workdir, PathBuf::from("/workspace/repo/apps/server"));
         assert_eq!(command, "npm ci");
+    }
+
+    #[test]
+    fn extract_workdir_and_command_supports_semicolon_separator() {
+        let default_dir = Path::new("/workspace/repo");
+        let (workdir, command) =
+            WorkspaceManager::extract_workdir_and_command("cd apps/server; npm run dev", default_dir);
+        assert_eq!(workdir, PathBuf::from("/workspace/repo/apps/server"));
+        assert_eq!(command, "npm run dev");
     }
 
     #[test]
