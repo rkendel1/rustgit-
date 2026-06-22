@@ -16,8 +16,9 @@ use axum::{
 use rustgit_wasm_runtime::{
     analyze::{runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
-    healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, LaunchOverrides,
-    RuntimeError, WasmWorkspace, Workspace, WorkspaceManager, WorkspaceRuntimeStatus,
+    healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, ExecutionHandle,
+    ExecutionRoutingMode, LaunchOverrides, RuntimeError, WasmWorkspace, Workspace,
+    WorkspaceManager, WorkspaceRuntimeStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -832,18 +833,11 @@ async fn workspace_app_proxy(
             Json(json!({ "error": "execution handle unavailable", "workspace_id": id })),
         )
     })?;
-    let endpoint = handle.endpoint.ok_or_else(|| {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "execution owner is not HTTP-forwardable",
-                "workspace_id": handle.workspace_id,
-                "provider": handle.provider_id,
-                "routing_mode": handle.routing_mode,
-                "stream_channel": handle.stream_channel,
-            })),
-        )
-    })?;
+    let endpoint = handle
+        .endpoint
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| app_proxy_non_forwardable_conflict(&handle))?;
 
     let query = request
         .uri()
@@ -928,6 +922,31 @@ async fn workspace_app_proxy(
             Json(json!({ "error": "proxy response build failed" })),
         )
     })
+}
+
+fn app_proxy_non_forwardable_conflict(handle: &ExecutionHandle) -> (StatusCode, Json<Value>) {
+    let (reason, retry_hint) = match handle.routing_mode {
+        ExecutionRoutingMode::Wasm => (
+            "execution owner is stream-only; use stream_channel instead of proxying",
+            false,
+        ),
+        ExecutionRoutingMode::Remote | ExecutionRoutingMode::Hybrid => (
+            "execution owner has not published an HTTP endpoint yet",
+            true,
+        ),
+        ExecutionRoutingMode::Local => ("execution owner has no observed port yet", true),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": reason,
+            "workspace_id": handle.workspace_id,
+            "provider": handle.provider_id,
+            "routing_mode": handle.routing_mode,
+            "stream_channel": handle.stream_channel,
+            "retry_may_help": retry_hint,
+        })),
+    )
 }
 
 async fn workspace_files(
@@ -1262,7 +1281,11 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{app, runtime_badge, AnalyzeCache, AppState, WorkspaceManager};
+    use super::{
+        app, app_proxy_non_forwardable_conflict, runtime_badge, AnalyzeCache, AppState,
+        ExecutionHandle, ExecutionRoutingMode, WorkspaceManager,
+    };
+    use rustgit_wasm_runtime::ExecutionReadinessState;
 
     fn test_state() -> AppState {
         let root = std::env::temp_dir().join(format!(
@@ -1893,5 +1916,65 @@ mod tests {
         let ask_payload: serde_json::Value =
             serde_json::from_slice(&ask_body).expect("ask payload");
         assert_eq!(payload["repository_ask"], ask_payload);
+    }
+
+    #[tokio::test]
+    async fn app_proxy_conflict_reason_distinguishes_stream_only_from_transient_unavailability() {
+        let wasm_handle = ExecutionHandle {
+            workspace_id: "ws-1".to_string(),
+            provider_id: "WasmExecutionProvider".to_string(),
+            execution_id: "exec-1".to_string(),
+            routing_mode: ExecutionRoutingMode::Wasm,
+            endpoint: None,
+            stream_channel: Some("/api/v1/workspaces/ws-1/runtime".to_string()),
+            readiness_state: ExecutionReadinessState::Ready,
+            authority_node: "workspace-manager".to_string(),
+        };
+        let local_handle = ExecutionHandle {
+            workspace_id: "ws-1".to_string(),
+            provider_id: "LocalExecutionProvider".to_string(),
+            execution_id: "exec-2".to_string(),
+            routing_mode: ExecutionRoutingMode::Local,
+            endpoint: None,
+            stream_channel: Some("/api/v1/workspaces/ws-1/runtime".to_string()),
+            readiness_state: ExecutionReadinessState::SignalDetected,
+            authority_node: "workspace-manager".to_string(),
+        };
+
+        let (wasm_status, wasm_json) = app_proxy_non_forwardable_conflict(&wasm_handle);
+        let wasm_payload = wasm_json.0;
+        assert_eq!(wasm_status, StatusCode::CONFLICT);
+        assert_eq!(
+            wasm_payload["error"],
+            "execution owner is stream-only; use stream_channel instead of proxying"
+        );
+        assert_eq!(wasm_payload["routing_mode"], "Wasm");
+        assert_eq!(wasm_payload["retry_may_help"], false);
+
+        let (local_status, local_json) = app_proxy_non_forwardable_conflict(&local_handle);
+        let local_payload = local_json.0;
+        assert_eq!(local_status, StatusCode::CONFLICT);
+        assert_eq!(
+            local_payload["error"],
+            "execution owner has no observed port yet"
+        );
+        assert_eq!(local_payload["routing_mode"], "Local");
+        assert_eq!(local_payload["retry_may_help"], true);
+
+        for routing_mode in [ExecutionRoutingMode::Remote, ExecutionRoutingMode::Hybrid] {
+            let handle = ExecutionHandle {
+                routing_mode,
+                execution_id: "exec-3".to_string(),
+                ..local_handle.clone()
+            };
+            let (status, payload_json) = app_proxy_non_forwardable_conflict(&handle);
+            let payload = payload_json.0;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                payload["error"],
+                "execution owner has not published an HTTP endpoint yet"
+            );
+            assert_eq!(payload["retry_may_help"], true);
+        }
     }
 }
