@@ -1762,6 +1762,16 @@ pub enum ExecutionTier {
     DDockitCloud,
 }
 
+impl ExecutionTier {
+    pub const ESCALATION_CHAIN: [Self; 5] = [
+        Self::LocalMachine,
+        Self::LocalDocker,
+        Self::ExternalProvider,
+        Self::CloudPartner,
+        Self::DDockitCloud,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum RuntimeTier {
     DeaLocal,
@@ -3036,13 +3046,7 @@ impl ExecutionRouter {
     }
 
     fn tier_order() -> [ExecutionTier; 5] {
-        [
-            ExecutionTier::LocalMachine,
-            ExecutionTier::LocalDocker,
-            ExecutionTier::ExternalProvider,
-            ExecutionTier::CloudPartner,
-            ExecutionTier::DDockitCloud,
-        ]
+        ExecutionTier::ESCALATION_CHAIN
     }
 
     fn execution_trace_uri(workspace_id: &str) -> String {
@@ -11684,6 +11688,15 @@ pub enum WorkspaceRuntimeType {
 }
 
 impl WorkspaceRuntimeType {
+    pub fn from_execution_tier(tier: ExecutionTier) -> Self {
+        match tier {
+            ExecutionTier::LocalMachine => Self::Dea,
+            ExecutionTier::LocalDocker => Self::Docker,
+            ExecutionTier::ExternalProvider => Self::External,
+            ExecutionTier::CloudPartner | ExecutionTier::DDockitCloud => Self::Cloud,
+        }
+    }
+
     pub fn to_runtime_type(self) -> RuntimeType {
         match self {
             Self::Dea => RuntimeType::Node,
@@ -11750,12 +11763,16 @@ pub struct WorkspaceRouterEvent {
     pub timestamp: DateTime,
 }
 
-const RUNTIME_FAILOVER_PRIORITY: [WorkspaceRuntimeType; 4] = [
-    WorkspaceRuntimeType::Dea,
-    WorkspaceRuntimeType::Docker,
-    WorkspaceRuntimeType::External,
-    WorkspaceRuntimeType::Cloud,
-];
+fn runtime_failover_priority() -> Vec<WorkspaceRuntimeType> {
+    let mut priority = Vec::new();
+    for tier in ExecutionTier::ESCALATION_CHAIN {
+        let runtime = WorkspaceRuntimeType::from_execution_tier(tier);
+        if !priority.contains(&runtime) {
+            priority.push(runtime);
+        }
+    }
+    priority
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceRouter {
@@ -11929,9 +11946,8 @@ impl WorkspaceRouter {
         &self,
         available: &[WorkspaceRuntimeType],
     ) -> Option<WorkspaceRuntimeType> {
-        RUNTIME_FAILOVER_PRIORITY
-            .iter()
-            .copied()
+        runtime_failover_priority()
+            .into_iter()
             .find(|candidate| available.contains(candidate))
     }
 }
@@ -22018,6 +22034,20 @@ dependencies:
                 && step.provider_id.as_deref() == Some("RustRuntimeProvider")
                 && step.result == "selected"
         }));
+    }
+
+    #[test]
+    fn runtime_escalation_chain_is_shared_between_execution_and_workspace_routers() {
+        assert_eq!(ExecutionRouter::tier_order(), ExecutionTier::ESCALATION_CHAIN);
+        assert_eq!(
+            runtime_failover_priority(),
+            vec![
+                WorkspaceRuntimeType::Dea,
+                WorkspaceRuntimeType::Docker,
+                WorkspaceRuntimeType::External,
+                WorkspaceRuntimeType::Cloud
+            ]
+        );
     }
 
     #[test]

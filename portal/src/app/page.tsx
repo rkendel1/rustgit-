@@ -1135,6 +1135,9 @@ export default function Home() {
           <p className={styles.hint}>
             Override runtime and start command for Retry run.
           </p>
+          <p className={styles.hint}>
+            Auto escalation chain: LocalMachine → LocalDocker → ExternalProvider → CloudPartner → DDockitCloud.
+          </p>
           <label htmlFor="runtime-override" className={styles.label}>Override runtime</label>
           <select
             id="runtime-override"
