@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
@@ -22,11 +23,13 @@ use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 type SharedManager = Arc<WorkspaceManager>;
+type FingerprintIndex = Arc<Mutex<HashMap<String, Value>>>;
 
 #[derive(Clone)]
 struct AppState {
     manager: SharedManager,
     analyze_cache: Arc<AnalyzeCache>,
+    fingerprint_index: FingerprintIndex,
 }
 
 #[derive(Deserialize)]
@@ -125,23 +128,52 @@ fn prepare_repository_for_analysis(repo_url: &str, branch: &str, commit: &str) -
     }
     fs::create_dir_all(&workspace)?;
 
-    let mut clone = Command::new("git");
-    clone
-        .arg("-c")
-        .arg("credential.helper=")
-        .arg("-c")
-        .arg("credential.username=")
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(branch)
-        .arg(repo_url)
-        .arg(&workspace);
-    clone.env("GIT_TERMINAL_PROMPT", "0");
-    let output = clone
+    let build_clone_command = |with_branch: bool| -> Command {
+        let mut clone = Command::new("git");
+        clone
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg("credential.username=")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1");
+        if with_branch && !branch.is_empty() {
+            clone.arg("--branch").arg(branch);
+        }
+        clone.arg(repo_url).arg(&workspace);
+        clone.env("GIT_TERMINAL_PROMPT", "0");
+        clone
+    };
+
+    let output = build_clone_command(true)
         .output()
         .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+
+    let output = if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let branch_not_found = stderr.contains("Remote branch") && stderr.contains("not found");
+        if branch_not_found && !branch.is_empty() {
+            // Branch doesn't exist on remote — retry without --branch to use the default branch
+            if workspace.exists() {
+                fs::remove_dir_all(&workspace)?;
+            }
+            fs::create_dir_all(&workspace)?;
+            let fallback_output = build_clone_command(false)
+                .output()
+                .map_err(|e| RuntimeError::CommandFailed(format!("git clone failed: {e}")))?;
+            fallback_output
+        } else {
+            return Err(RuntimeError::CommandFailed(format!(
+                "git clone exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+    } else {
+        output
+    };
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(RuntimeError::CommandFailed(format!(
@@ -255,6 +287,11 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
+            if let Ok(mut idx) = state.fingerprint_index.lock() {
+                idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
+            }
+        }
         return Ok((StatusCode::OK, Json(payload)));
     }
 
@@ -273,6 +310,11 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
+            if let Ok(mut idx) = state.fingerprint_index.lock() {
+                idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
+            }
+        }
         return Ok((StatusCode::OK, Json(payload)));
     }
 
@@ -291,7 +333,170 @@ async fn analyze_repository(
     if request_cache_key != resolved_cache_key {
         state.analyze_cache.put(request_cache_key, payload.clone());
     }
+    if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
+        if let Ok(mut idx) = state.fingerprint_index.lock() {
+            idx.insert(fingerprint_id.to_string(), payload.clone());
+        }
+    }
     Ok((StatusCode::OK, Json(payload)))
+}
+
+async fn repository_intelligence(
+    State(state): State<AppState>,
+    Path(fingerprint_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let payload = state
+        .fingerprint_index
+        .lock()
+        .ok()
+        .and_then(|idx| idx.get(&fingerprint_id).cloned());
+
+    let Some(payload) = payload else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "repository not found; run analyze first" })),
+        ));
+    };
+
+    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let health_score = confidence / 100.0;
+
+    let preferred_provider = payload
+        .get("execution")
+        .and_then(|e| e.get("preferredProvider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let execution_score = if preferred_provider.is_empty() || preferred_provider == "unknown" {
+        0.0_f64
+    } else {
+        0.7
+    };
+
+    let runtime = payload
+        .get("runtime")
+        .and_then(|r| r.get("framework"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown")
+        .or_else(|| {
+            payload
+                .get("frameworks")
+                .and_then(|f| f.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && *s != "unknown")
+        })
+        .map(|s| s.to_string());
+
+    Ok(Json(json!({
+        "repository_id": fingerprint_id,
+        "health_score": health_score,
+        "execution_score": execution_score,
+        "healing_score": null,
+        "runtime": runtime,
+        "repository_identity": null
+    })))
+}
+
+#[derive(Deserialize)]
+struct AskRequest {
+    question: Option<String>,
+}
+
+async fn repository_ask(
+    State(state): State<AppState>,
+    Path(fingerprint_id): Path<String>,
+    Json(body): Json<AskRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let payload = state
+        .fingerprint_index
+        .lock()
+        .ok()
+        .and_then(|idx| idx.get(&fingerprint_id).cloned());
+
+    let Some(payload) = payload else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "repository not found; run analyze first" })),
+        ));
+    };
+
+    let repo_url = payload
+        .get("repo_url")
+        .or_else(|| payload.get("repo"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("this repository");
+
+    let frameworks: Vec<&str> = payload
+        .get("frameworks")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).filter(|s| *s != "unknown").collect())
+        .unwrap_or_default();
+
+    let runtime_lang = payload
+        .get("runtime")
+        .and_then(|r| r.get("language"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let runtime_framework = payload
+        .get("runtime")
+        .and_then(|r| r.get("framework"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let preferred_provider = payload
+        .get("execution")
+        .and_then(|e| e.get("preferredProvider"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let answer_confidence = (confidence / 100.0).min(1.0) as f32;
+
+    let question = body.question.as_deref().unwrap_or("Summarize this repository.");
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(fw) = runtime_framework {
+        parts.push(format!("This repository uses the {} framework", fw));
+    } else if !frameworks.is_empty() {
+        parts.push(format!("This repository uses {}", frameworks.join(", ")));
+    } else {
+        parts.push(format!("This repository at {} could not be automatically classified", repo_url));
+    }
+
+    if let Some(lang) = runtime_lang {
+        parts.push(format!("written in {}", lang));
+    }
+
+    parts.push(".".to_string());
+
+    if let Some(provider) = preferred_provider {
+        parts.push(format!(" The recommended way to run it is via {}.", provider));
+    }
+
+    let answer = if question.to_lowercase().contains("run") || question.to_lowercase().contains("summar") {
+        format!(
+            "{} {}",
+            parts.join(" ").trim(),
+            preferred_provider
+                .map(|p| format!("Run using: {p}"))
+                .unwrap_or_else(|| "No specific run instructions could be determined automatically.".to_string())
+        )
+    } else {
+        parts.join(" ").trim().to_string()
+    };
+
+    let mut evidence: Vec<&str> = Vec::new();
+    if let Some(fw) = runtime_framework { evidence.push(fw); }
+    if let Some(lang) = runtime_lang { evidence.push(lang); }
+    if let Some(p) = preferred_provider { evidence.push(p); }
+
+    Ok(Json(json!({
+        "answer": answer,
+        "confidence": answer_confidence,
+        "evidence": evidence
+    })))
 }
 
 async fn stop_workspace(
@@ -464,6 +669,19 @@ fn app(state: AppState) -> Router {
         .route("/badge/:owner/:repo.svg", get(runtime_badge))
         .route("/badge/healed/:owner/:repo.svg", get(healed_badge))
         .route("/seed/:owner/:repo", get(seed_launch))
+        .route(
+            "/api/repositories/:id/intelligence",
+            get(repository_intelligence),
+        )
+        .route(
+            "/api/proxy/api/repositories/:id/intelligence",
+            get(repository_intelligence),
+        )
+        .route("/api/repositories/:id/ask", post(repository_ask))
+        .route(
+            "/api/proxy/api/repositories/:id/ask",
+            post(repository_ask),
+        )
         .layer(cors_layer())
         .with_state(state)
 }
@@ -488,6 +706,7 @@ async fn main() {
     let app = app(AppState {
         manager,
         analyze_cache: Arc::new(AnalyzeCache::default()),
+        fingerprint_index: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let addr = format!("0.0.0.0:{port}");
@@ -498,8 +717,9 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::{
         body::{to_bytes, Body},
@@ -522,6 +742,7 @@ mod tests {
         AppState {
             manager: Arc::new(WorkspaceManager::new(root)),
             analyze_cache: Arc::new(AnalyzeCache::default()),
+            fingerprint_index: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
