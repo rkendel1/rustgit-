@@ -200,6 +200,21 @@
   font-size: 0.9rem;
 }
 
+.envConfigGrid {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.5rem;
+}
+
+.envVarName {
+  display: block;
+  font-family: monospace;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #475569;
+  margin-bottom: 0.25rem;
+}
+
 .branchRow {
   margin-top: 0.75rem;
 }
@@ -587,6 +602,10 @@
   .sidebarMeta,
   .answerBox {
     border-top-color: #334155;
+  }
+
+  .envVarName {
+    color: #94a3b8;
   }
 
   .input {

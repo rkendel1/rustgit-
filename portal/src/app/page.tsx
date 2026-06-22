@@ -324,6 +324,7 @@ export default function Home() {
   const [workspacePreviewVersion, setWorkspacePreviewVersion] = useState(0);
   const [workspacePreviewError, setWorkspacePreviewError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
+  const [envConfig, setEnvConfig] = useState<Record<string, string>>({});
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
@@ -368,6 +369,7 @@ export default function Home() {
     setWorkspaceFilesError(null);
     setWorkspacePreviewVersion(0);
     setWorkspacePreviewError(null);
+    setEnvConfig({});
     setError(null);
   }
 
@@ -375,7 +377,10 @@ export default function Home() {
     const payload: LaunchOverridesPayload = {};
     const b = branch.trim();
     const command = startCommand.trim();
-    const environment = parseKeyValueLines(envOverrides);
+    const configuredEnv = Object.fromEntries(
+      Object.entries(envConfig).filter(([, v]) => v.trim() !== ""),
+    );
+    const environment = { ...parseKeyValueLines(envOverrides), ...configuredEnv };
     const versions = parseKeyValueLines(versionOverrides);
     if (overrideRuntime !== "auto") {
       versions.RUNTIME_OVERRIDE = overrideRuntime;
@@ -1177,14 +1182,22 @@ export default function Home() {
 
         <section className={styles.panel}>
           <h2>Environment Variables</h2>
+          <p className={styles.hint}>Values are sent with every Run and Retry run for this repository.</p>
           {requiredEnvVars.length === 0 ? (
-            <p className={styles.hint}>No required environment variables detected yet.</p>
+            <p className={styles.hint}>No required environment variables detected yet. Analyze a repository first.</p>
           ) : (
-            <div className={styles.grid}>
+            <div className={styles.envConfigGrid}>
               {requiredEnvVars.map((name) => (
-                <div className={styles.tile} key={name}>
-                  <strong>{name}</strong>
-                  <span>required</span>
+                <div key={name}>
+                  <label htmlFor={`env-${name}`} className={styles.envVarName}>{name}</label>
+                  <input
+                    id={`env-${name}`}
+                    type="text"
+                    className={styles.input}
+                    placeholder="value"
+                    value={envConfig[name] ?? ""}
+                    onChange={(e) => setEnvConfig((prev) => ({ ...prev, [name]: e.target.value }))}
+                  />
                 </div>
               ))}
             </div>
