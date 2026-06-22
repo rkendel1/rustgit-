@@ -359,7 +359,7 @@ The repository root `fly.toml` is intentionally configured for the frontend (`ru
 
 Required runtime environment variables:
 
-- API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`, `WORKSPACE_ROOT=/data/workspaces`
+- API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`, `WORKSPACE_ROOT=/data/workspaces` (if unset, server falls back to `./.workspace-data`)
 - Portal: `NEXT_PUBLIC_API_URL=https://api.trythissoftware.com`, `NEXT_PUBLIC_BASE_DOMAIN=trythissoftware.com`
 
 OAuth callback endpoints (API):

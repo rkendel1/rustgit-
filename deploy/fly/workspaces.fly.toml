@@ -20,7 +20,7 @@ primary_region = "iad"
   min_machines_running = 1
   max_machines_running = 1
 
-[[vm]]
+[vm]
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
