@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styles from "./page.module.css";
 
 const API_BASE_URL =
@@ -37,6 +37,25 @@ type RunResponse = {
   workspace_id?: string;
   workspace_url?: string;
   status?: string;
+};
+
+type WorkspaceState =
+  | "Created" | "Materializing" | "Analyzing" | "Planning" | "Pending"
+  | "Provisioning" | "Starting" | "Running" | "Degraded" | "Restarting"
+  | "Migrating" | "Paused" | "Failed" | "Stopping" | "Stopped" | "Destroyed";
+
+const ACTIVE_WORKSPACE_STATES = new Set<WorkspaceState>([
+  "Created", "Materializing", "Analyzing", "Planning",
+  "Provisioning", "Starting", "Running", "Restarting",
+]);
+
+type Workspace = {
+  id: string;
+  repo_url: string;
+  state: WorkspaceState;
+  framework: string;
+  ports: { port: number; protocol: string; route: string }[];
+  resource_quotas: { max_memory_mb: number; max_cpu_millis: number };
 };
 
 type RepositoryIdentity = {
@@ -151,6 +170,9 @@ export default function Home() {
   const [intelligence, setIntelligence] = useState<RepositoryIntelligenceResponse | null>(null);
   const [repoAnswer, setRepoAnswer] = useState<RepositoryAskResponse | null>(null);
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [workspaceLogs, setWorkspaceLogs] = useState<string[]>([]);
+  const logBoxRef = useRef<HTMLDivElement>(null);
   const anonymousIdentity = useMemo(
     () => ({
       anonUserId: createAnonymousId("anon-portal"),
@@ -174,8 +196,52 @@ export default function Home() {
     setIntelligence(null);
     setRepoAnswer(null);
     setRunResult(null);
+    setWorkspace(null);
+    setWorkspaceLogs([]);
     setError(null);
   }
+
+  const fetchWorkspaceData = useCallback(async (wsId: string) => {
+    const [wsRes, logsRes] = await Promise.all([
+      fetch(`/api/proxy/workspaces/${wsId}`, { cache: "no-store" }),
+      fetch(`/api/proxy/workspaces/${wsId}/logs`, { cache: "no-store" }),
+    ]);
+    const ws: Workspace = await wsRes.json();
+    const logsBody: { logs: string[] } = logsRes.ok ? await logsRes.json() : { logs: [] };
+    setWorkspace(ws);
+    setWorkspaceLogs(logsBody.logs ?? []);
+    return ws;
+  }, []);
+
+  // Poll workspace when a run is in flight
+  useEffect(() => {
+    const wsId = runResult?.execution_id;
+    if (!wsId) return;
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const ws = await fetchWorkspaceData(wsId!);
+        if (cancelled) return;
+        if (ACTIVE_WORKSPACE_STATES.has(ws.state)) {
+          setTimeout(poll, 3000);
+        }
+      } catch {
+        // silently retry
+        if (!cancelled) setTimeout(poll, 3000);
+      }
+    }
+
+    poll();
+    return () => { cancelled = true; };
+  }, [runResult?.execution_id, fetchWorkspaceData]);
+
+  // Auto-scroll log box
+  useEffect(() => {
+    if (logBoxRef.current) {
+      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+    }
+  }, [workspaceLogs]);
 
   function scoreValue(
     identityScore: number | undefined,
@@ -516,7 +582,75 @@ export default function Home() {
           <p>Launch and monitor execution from the same workspace.</p>
         </header>
 
-        {runResult ? (
+        {workspace ? (
+          <section className={styles.panel}>
+            <div className={styles.workspaceHeader}>
+              <h2>Run status</h2>
+              <span className={`${styles.badge} ${
+                workspace.state === "Running" ? styles.badgeRunning :
+                workspace.state === "Failed" ? styles.badgeFailed :
+                workspace.state === "Stopped" || workspace.state === "Destroyed" ? styles.badgeStopped :
+                styles.badgeStarting
+              }`}>
+                {ACTIVE_WORKSPACE_STATES.has(workspace.state) && <span className={styles.dot} />}
+                {workspace.state}
+              </span>
+            </div>
+            <div className={styles.grid}>
+              <div className={styles.tile}>
+                <strong>Execution ID</strong>
+                <code>{runResult?.execution_id ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Framework</strong>
+                <span>{workspace.framework}</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>Memory</strong>
+                <span>{workspace.resource_quotas.max_memory_mb} MB</span>
+              </div>
+              <div className={styles.tile}>
+                <strong>CPU</strong>
+                <span>{workspace.resource_quotas.max_cpu_millis} m</span>
+              </div>
+              {workspace.ports.map((p, i) => (
+                <div key={i} className={styles.tile}>
+                  <strong>Port {p.port}</strong>
+                  <a
+                    href={`/api/app-proxy/${workspace.id}${p.route || "/"}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open app ↗
+                  </a>
+                </div>
+              ))}
+            </div>
+
+            <div className={styles.logSection}>
+              <div className={styles.logHeader}>
+                <span className={styles.logTitle}>Logs</span>
+                {ACTIVE_WORKSPACE_STATES.has(workspace.state) && (
+                  <span className={styles.livePill}>
+                    <span className={styles.dot} /> live
+                  </span>
+                )}
+              </div>
+              <div className={styles.logBox} ref={logBoxRef}>
+                {workspaceLogs.length === 0 ? (
+                  <span className={styles.logEmpty}>No logs yet…</span>
+                ) : (
+                  workspaceLogs.map((line, i) => (
+                    <div key={i} className={styles.logLine}>
+                      <span className={styles.logNum}>{i + 1}</span>
+                      <span>{line}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </section>
+        ) : runResult ? (
           <section className={styles.panel}>
             <h2>Run status</h2>
             <div className={styles.grid}>
@@ -525,27 +659,8 @@ export default function Home() {
                 <code>{runResult.execution_id ?? "n/a"}</code>
               </div>
               <div className={styles.tile}>
-                <strong>Workspace ID</strong>
-                <code>{runResult.workspace_id ?? "n/a"}</code>
-              </div>
-              <div className={styles.tile}>
                 <strong>Status</strong>
                 <span>{runResult.status ?? "starting"}</span>
-              </div>
-              <div className={styles.tile}>
-                <strong>Workspace URL</strong>
-                {runResult.workspace_url ? (
-                  <a
-                    href={runResult.workspace_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    aria-label="Open workspace in a new tab"
-                  >
-                    Open workspace
-                  </a>
-                ) : (
-                  <span>pending</span>
-                )}
               </div>
             </div>
           </section>

@@ -265,6 +265,108 @@
   gap: 0.35rem;
 }
 
+/* Workspace live view inside Execution Details */
+.workspaceHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.workspaceHeader h2 {
+  margin-bottom: 0;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.badgeRunning { background: #dcfce7; color: #15803d; }
+.badgeFailed  { background: #fee2e2; color: #b91c1c; }
+.badgeStopped { background: #e2e8f0; color: #475569; }
+.badgeStarting { background: #dbeafe; color: #1d4ed8; }
+
+.dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+.logSection {
+  margin-top: 0.85rem;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 0.75rem;
+}
+
+.logHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.logTitle {
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #475569;
+}
+
+.livePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: #15803d;
+}
+
+.logBox {
+  background: #0f172a;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.85rem;
+  max-height: 220px;
+  overflow-y: auto;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.logLine {
+  display: flex;
+  gap: 0.75rem;
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #94a3b8;
+  line-height: 1.5;
+}
+
+.logNum {
+  color: #334155;
+  min-width: 1.5rem;
+  text-align: right;
+  user-select: none;
+}
+
+.logEmpty {
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #334155;
+}
+
 @media (max-width: 1200px) {
   .page {
     --sidebar-column-width: 250px;
@@ -367,4 +469,21 @@
     color: #fecaca;
     background: #3f1115;
   }
+
+  .logSection {
+    border-top-color: #334155;
+  }
+
+  .logBox {
+    background: #020617;
+  }
+
+  .logLine { color: #94a3b8; }
+  .logNum  { color: #1e293b; }
+  .logEmpty { color: #1e293b; }
+
+  .badgeRunning  { background: #14532d; color: #86efac; }
+  .badgeFailed   { background: #7f1d1d; color: #fca5a5; }
+  .badgeStopped  { background: #1e293b; color: #94a3b8; }
+  .badgeStarting { background: #1e3a8a; color: #93c5fd; }
 }
