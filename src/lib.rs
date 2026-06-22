@@ -12584,6 +12584,7 @@ impl WorkspaceManager {
         let providers: Vec<Box<dyn ExecutionProvider + Send + Sync>> = vec![
             Box::new(WasmExecutionProvider),
             Box::new(LocalAgentProvider::default_agent()),
+            Box::new(DockerExecutionProvider),
             Box::new(NodeRuntimeProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
@@ -13224,13 +13225,14 @@ impl WorkspaceManager {
         }
 
         self.set_workspace_state(id, WorkspaceState::Launching);
-        let (mut child, requested_port) = match Self::spawn_supervised_process(&ctx, &overrides) {
-            Ok(value) => value,
-            Err(err) => {
-                self.fail_workspace(id, format!("launch failed: {err}"));
-                return;
-            }
-        };
+        let (mut child, requested_port, provider_selected) =
+            match Self::spawn_supervised_process(&ctx, &overrides) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.fail_workspace(id, format!("launch failed: {err}"));
+                    return;
+                }
+            };
 
         let pid = child.id();
         self.push_workspace_log(
@@ -13241,6 +13243,7 @@ impl WorkspaceManager {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let mut runtime = ExecutionTruth::new(id.to_string(), requested_port, pid);
+        runtime.provider_selected = provider_selected;
         runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Launching));
 
         if let Ok(mut workspaces) = self.workspaces.lock() {
@@ -13470,7 +13473,7 @@ impl WorkspaceManager {
     fn spawn_supervised_process(
         ctx: &ExecutionContext,
         overrides: &LaunchOverrides,
-    ) -> Result<(Child, u16)> {
+    ) -> Result<(Child, u16, String)> {
         let run_cmd = Self::resolved_run_command(ctx, overrides)
             .ok_or_else(|| RuntimeError::CommandFailed("no run command resolved".to_string()))?;
         let repo_path = Path::new(&ctx.repo_path);
@@ -13520,6 +13523,12 @@ impl WorkspaceManager {
                 "run command only changes directory and has no run step".to_string(),
             ));
         }
+        let provider_selected = if DockerExecutionProvider::is_docker_command(&run_cmd) {
+            DockerExecutionProvider::ensure_docker_ready(&run_cmd)?;
+            DockerExecutionProvider::id_static().to_string()
+        } else {
+            "local-supervised-process".to_string()
+        };
         let mut parts = run_cmd.splitn(2, ' ');
         let program = parts
             .next()
@@ -13539,7 +13548,7 @@ impl WorkspaceManager {
         let child = cmd
             .spawn()
             .map_err(|err| RuntimeError::CommandFailed(format!("spawn failed: {err}")))?;
-        Ok((child, requested_port))
+        Ok((child, requested_port, provider_selected))
     }
 
     fn auto_heal_runtime_command(command: &str) -> String {
@@ -14075,6 +14084,9 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
     if pid_hint.starts_with("node:") {
         return "NodeRuntimeProvider".to_string();
     }
+    if pid_hint.starts_with("docker:") {
+        return DockerExecutionProvider::id_static().to_string();
+    }
     if pid_hint.starts_with("rust:") {
         return "RustRuntimeProvider".to_string();
     }
@@ -14086,6 +14098,7 @@ fn infer_provider_from_pid_hint(pid_hint: &str) -> String {
 
 const LOCAL_AGENT_TRANSPORT_MODE: ExecutionRoutingMode = ExecutionRoutingMode::Local;
 static WASM_PROVIDER_FOR_TRANSPORT: WasmExecutionProvider = WasmExecutionProvider;
+static DOCKER_PROVIDER_FOR_TRANSPORT: DockerExecutionProvider = DockerExecutionProvider;
 static NODE_PROVIDER_FOR_TRANSPORT: NodeRuntimeProvider = NodeRuntimeProvider;
 static RUST_PROVIDER_FOR_TRANSPORT: RustRuntimeProvider = RustRuntimeProvider;
 static STATIC_PROVIDER_FOR_TRANSPORT: StaticRuntimeProvider = StaticRuntimeProvider;
@@ -14096,6 +14109,7 @@ fn transport_for_provider_id(provider_id: &str) -> ExecutionRoutingMode {
         // LocalAgentProvider requires an agent instance, so it cannot be
         // instantiated as a stateless singleton just to call the default trait method.
         "LocalAgentProvider" => LOCAL_AGENT_TRANSPORT_MODE,
+        "DockerExecutionProvider" => DOCKER_PROVIDER_FOR_TRANSPORT.transport(),
         "NodeRuntimeProvider" => NODE_PROVIDER_FOR_TRANSPORT.transport(),
         "RustRuntimeProvider" => RUST_PROVIDER_FOR_TRANSPORT.transport(),
         "StaticRuntimeProvider" => STATIC_PROVIDER_FOR_TRANSPORT.transport(),
@@ -17460,6 +17474,7 @@ impl Default for RestApiSpec {
 }
 
 struct NodeRuntimeProvider;
+struct DockerExecutionProvider;
 struct RustRuntimeProvider;
 struct StaticRuntimeProvider;
 struct LocalAgentProvider {
@@ -17493,6 +17508,75 @@ impl LocalAgentProvider {
             supports_wasm: false,
         });
         Self::new(agent)
+    }
+}
+
+impl DockerExecutionProvider {
+    fn id_static() -> &'static str {
+        "DockerExecutionProvider"
+    }
+
+    fn docker_command_lowercase(command: &str) -> Option<String> {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "docker"
+            || lower.starts_with("docker ")
+            || lower.starts_with("docker-compose ")
+            || lower.starts_with("docker compose ")
+        {
+            Some(lower)
+        } else {
+            None
+        }
+    }
+
+    fn is_docker_command(command: &str) -> bool {
+        Self::docker_command_lowercase(command).is_some()
+    }
+
+    fn is_compose_command(lower_command: &str) -> bool {
+        lower_command.starts_with("docker compose ") || lower_command.starts_with("docker-compose ")
+    }
+
+    fn command_for_context(ctx: &ExecutionContext) -> Option<String> {
+        load_execution_manifest_start_command(Path::new(&ctx.repo_path))
+            .or_else(|| ctx.execution_graph.primary_run_command())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn ensure_docker_ready(command: &str) -> Result<()> {
+        let Some(lower) = Self::docker_command_lowercase(command) else {
+            return Ok(());
+        };
+        if lower == "docker" {
+            return Err(RuntimeError::CommandFailed(
+                "docker command is missing a subcommand".to_string(),
+            ));
+        }
+
+        let mut docker_version = Command::new("docker");
+        docker_version.arg("--version");
+        run_command_with_timeout(&mut docker_version, INSTALL_TIMEOUT_SECS).map_err(|err| {
+            RuntimeError::CommandFailed(format!("docker runtime readiness check failed: {err}"))
+        })?;
+
+        if Self::is_compose_command(&lower) {
+            let mut docker_compose_version = Command::new("docker");
+            docker_compose_version.args(["compose", "version"]);
+            run_command_with_timeout(&mut docker_compose_version, INSTALL_TIMEOUT_SECS).map_err(
+                |err| {
+                    RuntimeError::CommandFailed(format!(
+                        "docker compose readiness check failed: {err}"
+                    ))
+                },
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -17679,6 +17763,67 @@ impl ExecutionProvider for NodeRuntimeProvider {
             healthy: true,
             message: "healthy".to_string(),
         })
+    }
+}
+
+impl ExecutionProvider for DockerExecutionProvider {
+    fn id(&self) -> &'static str {
+        Self::id_static()
+    }
+
+    fn tier(&self) -> ExecutionTier {
+        ExecutionTier::LocalDocker
+    }
+
+    fn runtime(&self) -> RuntimeType {
+        RuntimeType::Unknown
+    }
+
+    fn can_handle(&self, ctx: &ExecutionContext) -> bool {
+        Self::command_for_context(ctx)
+            .as_deref()
+            .is_some_and(Self::is_docker_command)
+    }
+
+    fn prepare(&self, ctx: &mut ExecutionContext) -> Result<()> {
+        if let Some(command) = Self::command_for_context(ctx) {
+            Self::ensure_docker_ready(&command)?;
+        }
+        Ok(())
+    }
+
+    fn start(&self, ctx: &ExecutionContext) -> Result<ProcessHandle> {
+        let command = Self::command_for_context(ctx).ok_or_else(|| {
+            RuntimeError::CommandFailed("docker provider could not resolve run command".to_string())
+        })?;
+        Self::ensure_docker_ready(&command)?;
+        Ok(ProcessHandle {
+            pid_hint: format!("docker:{}", ctx.execution_graph.cache_key()),
+            ..ProcessHandle::default()
+        })
+    }
+
+    fn stop(&self, _handle: &ProcessHandle) -> Result<()> {
+        Ok(())
+    }
+
+    fn health(&self, _handle: &ProcessHandle) -> Result<HealthStatus> {
+        let mut docker_info = Command::new("docker");
+        docker_info.arg("info");
+        match run_command_with_timeout(&mut docker_info, INSTALL_TIMEOUT_SECS) {
+            Ok(output) if output.status.success() => Ok(HealthStatus {
+                healthy: true,
+                message: "docker daemon reachable".to_string(),
+            }),
+            Ok(output) => Ok(HealthStatus {
+                healthy: false,
+                message: format!("docker health check exited with status {}", output.status),
+            }),
+            Err(err) => Ok(HealthStatus {
+                healthy: false,
+                message: format!("docker health check failed: {err}"),
+            }),
+        }
     }
 }
 
@@ -21736,6 +21881,7 @@ dependencies:
         let engine = ExecutionEngine::new(
             vec![
                 Box::new(WasmExecutionProvider),
+                Box::new(DockerExecutionProvider),
                 Box::new(NodeRuntimeProvider),
                 Box::new(RustRuntimeProvider),
                 Box::new(StaticRuntimeProvider),
@@ -21768,6 +21914,10 @@ dependencies:
         assert_eq!(
             infer_provider_from_pid_hint("node:cache"),
             "NodeRuntimeProvider"
+        );
+        assert_eq!(
+            infer_provider_from_pid_hint("docker:cache"),
+            "DockerExecutionProvider"
         );
         assert_eq!(
             infer_provider_from_pid_hint("rust:cache"),
@@ -21823,6 +21973,7 @@ dependencies:
         };
         let router = ExecutionRouter::new(vec![
             Box::new(WasmExecutionProvider),
+            Box::new(DockerExecutionProvider),
             Box::new(NodeRuntimeProvider),
             Box::new(RustRuntimeProvider),
             Box::new(StaticRuntimeProvider),
@@ -21840,6 +21991,86 @@ dependencies:
                 && step.provider_id.as_deref() == Some("RustRuntimeProvider")
                 && step.result == "selected"
         }));
+    }
+
+    #[test]
+    fn execution_router_selects_docker_provider_for_docker_manifest_command() {
+        let repo = temp_dir("router-docker-provider");
+        fs::write(
+            repo.join(".execution.json"),
+            r#"{"startCommand":"docker compose up"}"#,
+        )
+        .expect("write execution manifest");
+
+        let graph = ExecutionGraph {
+            nodes: vec![ExecutionNode {
+                id: "run".to_string(),
+                node_type: ExecutionNodeType::DevServer,
+                command: Some("docker compose up".to_string()),
+                execution_mode: ExecutionMode::Native,
+                inputs: vec![],
+                outputs: vec![],
+                cache_key: None,
+                runtime: None,
+                cache_binding: None,
+            }],
+            edges: vec![],
+        }
+        .with_cache_keys();
+
+        let mut analysis = test_analysis(graph.clone(), WasmCompatibility::NotSupported, Framework::Node);
+        analysis.execution_profile.runtime_affinity = RuntimeAffinity {
+            preferred_provider: "DockerExecutionProvider".to_string(),
+            fallback_providers: vec!["NodeRuntimeProvider".to_string()],
+        };
+        let runtime_spec = analysis.runtime_spec.clone();
+        let compiled_runtime = analysis.compiled_runtime.clone();
+        let ctx = ExecutionContext {
+            workspace_id: "ws-docker-manifest-routing".to_string(),
+            repo_path: repo.to_string_lossy().to_string(),
+            runtime_spec,
+            compiled_runtime,
+            analysis,
+            execution_graph: graph,
+            wasm_sandbox: None,
+            resources: ResourceQuotas {
+                max_memory_mb: 512,
+                max_cpu_millis: 1000,
+            },
+            network: NetworkPolicy {
+                allow_outbound: false,
+                allowed_hosts: vec![],
+            },
+        };
+
+        let router = ExecutionRouter::new(vec![
+            Box::new(DockerExecutionProvider),
+            Box::new(NodeRuntimeProvider),
+            Box::new(RustRuntimeProvider),
+        ]);
+        let selection = router.select(&ctx).expect("select docker provider");
+        assert_eq!(selection.provider_id, "DockerExecutionProvider");
+        assert_eq!(selection.selected_tier, ExecutionTier::LocalDocker);
+    }
+
+    #[test]
+    fn docker_provider_rejects_bare_docker_command() {
+        let err = DockerExecutionProvider::ensure_docker_ready("docker")
+            .expect_err("bare docker command should be rejected");
+        assert!(matches!(
+            err,
+            RuntimeError::CommandFailed(message)
+                if message.contains("missing a subcommand")
+        ));
+    }
+
+    #[test]
+    fn docker_provider_detects_compose_command_prefixes() {
+        assert!(DockerExecutionProvider::is_compose_command("docker compose up"));
+        assert!(DockerExecutionProvider::is_compose_command(
+            "docker-compose up --build"
+        ));
+        assert!(!DockerExecutionProvider::is_compose_command("docker run hello-world"));
     }
 
     #[test]
@@ -25613,6 +25844,10 @@ all = ["network"]
             ExecutionRoutingMode::Wasm
         ));
         assert!(matches!(
+            DockerExecutionProvider.transport(),
+            ExecutionRoutingMode::Local
+        ));
+        assert!(matches!(
             NodeRuntimeProvider.transport(),
             ExecutionRoutingMode::Local
         ));
@@ -25628,6 +25863,10 @@ all = ["network"]
         assert!(matches!(
             transport_for_provider_id("WasmExecutionProvider"),
             ExecutionRoutingMode::Wasm
+        ));
+        assert!(matches!(
+            transport_for_provider_id("DockerExecutionProvider"),
+            ExecutionRoutingMode::Local
         ));
         assert!(matches!(
             transport_for_provider_id("NodeRuntimeProvider"),
