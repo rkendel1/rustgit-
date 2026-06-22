@@ -7980,6 +7980,7 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
+
             let Some((name, _)) = trimmed.split_once('=') else {
                 continue;
             };
@@ -7994,6 +7995,18 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
         }
     }
     keys
+}
+
+fn load_execution_manifest_start_command(repo_root: &Path) -> Option<String> {
+    let manifest_path = repo_root.join(".execution.json");
+    let payload = fs::read_to_string(manifest_path).ok()?;
+    let value = serde_json::from_str::<Value>(&payload).ok()?;
+    value
+        .get("startCommand")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_package_dependency_names(root: &Path) -> HashSet<String> {
@@ -13009,6 +13022,7 @@ impl WorkspaceManager {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .map(str::to_string)
+            .or_else(|| load_execution_manifest_start_command(Path::new(&ctx.repo_path)))
             .or_else(|| ctx.execution_graph.primary_run_command())
     }
 
@@ -15294,8 +15308,41 @@ pub fn analyze_repository(root: &Path) -> Result<RepositoryAnalysis> {
         warm_pool.prewarm(&analysis.execution_image, WarmPoolType::LocalDea, 1);
         warm_pool.bind_cache_layer(&analysis.fingerprint, &analysis.execution_image);
     }
+    persist_execution_manifest(root, &analysis);
 
     Ok(analysis)
+}
+
+fn persist_execution_manifest(root: &Path, analysis: &RepositoryAnalysis) {
+    let confidence = (analysis.fingerprint.confidence * 100.0)
+        .round()
+        .clamp(1.0, 99.0) as u8;
+    let build_command = analysis
+        .execution_graph
+        .nodes
+        .iter()
+        .find(|node| node.node_type == ExecutionNodeType::Build)
+        .and_then(|node| node.command.as_deref());
+    let start_command = analysis.execution_graph.primary_run_command();
+    let dev_command = analysis
+        .build_intelligence
+        .scripts
+        .get("dev")
+        .map(String::as_str);
+    let runtime = analysis.runtime_spec.language.as_str();
+    let package_manager = analysis.build_intelligence.package_manager.as_deref();
+    let framework = format!("{:?}", analysis.framework).to_ascii_lowercase();
+    let manifest = analyze::manifest_builder::AnalyzeManifest::synthesize(
+        root,
+        &framework,
+        runtime,
+        package_manager,
+        build_command,
+        start_command.as_deref(),
+        dev_command,
+        confidence,
+    );
+    let _ = analyze::manifest_builder::write_manifest(root, &manifest);
 }
 
 impl BuildPlanner {
@@ -19912,6 +19959,20 @@ dependencies:
             WorkspaceManager::extract_workdir_and_command(&command, default_dir.as_path());
         assert_eq!(workdir, default_dir);
         assert_eq!(extracted, "npm run dev");
+    }
+
+    #[test]
+    fn load_execution_manifest_start_command_reads_persisted_manifest() {
+        let repo = temp_dir("execution-manifest-start-command");
+        fs::write(
+            repo.join(".execution.json"),
+            r#"{"startCommand":"pnpm run dev -- --host 0.0.0.0 --port {PORT}"}"#,
+        )
+        .expect("write manifest");
+        assert_eq!(
+            load_execution_manifest_start_command(repo.as_path()),
+            Some("pnpm run dev -- --host 0.0.0.0 --port {PORT}".to_string())
+        );
     }
 
     #[test]

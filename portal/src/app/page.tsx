@@ -4,12 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import styles from "./page.module.css";
 
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ??
-  (process.env.NODE_ENV === "development"
-    ? "http://localhost:8080"
-    : "https://api.trythissoftware.com");
-
 const DEFAULT_ASK_QUESTION = "Summarize what this repository does and the best way to run it.";
 const SCORE_DECIMAL_PLACES = 1;
 const CONFIDENCE_DECIMAL_PLACES = 2;
@@ -31,8 +25,21 @@ type AnalyzeResponse = {
   fingerprint_id?: string;
   frameworks?: string[];
   services?: string[];
+  manifest?: { version?: number; path?: string };
+  execution_intelligence?: ExecutionIntelligence;
   repository_intelligence?: RepositoryIntelligenceResponse;
   repository_ask?: RepositoryAskResponse;
+};
+
+type ExecutionIntelligence = {
+  framework?: string;
+  execution?: { preferred?: string; fallback?: string; confidence?: number };
+  docker?: { dockerfile?: boolean; compose?: boolean; command?: string };
+  packageManager?: string;
+  startCommand?: string;
+  buildCommand?: string;
+  environmentVariables?: { name?: string; required?: boolean }[];
+  workspace?: { requiresDocker?: boolean; requiresSecrets?: boolean };
 };
 
 type RunResponse = {
@@ -266,6 +273,7 @@ export default function Home() {
   const repoInputRef = useRef<HTMLInputElement>(null);
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("main");
+  const [overrideRuntime, setOverrideRuntime] = useState("auto");
   const [startCommand, setStartCommand] = useState("");
   const [envOverrides, setEnvOverrides] = useState("");
   const [versionOverrides, setVersionOverrides] = useState("");
@@ -273,7 +281,6 @@ export default function Home() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [analyzeResult, setAnalyzeResult] = useState<AnalyzeResponse | null>(null);
-  const [analyzedRepoUrl, setAnalyzedRepoUrl] = useState<string | null>(null);
   const [intelligence, setIntelligence] = useState<RepositoryIntelligenceResponse | null>(null);
   const [repoAnswer, setRepoAnswer] = useState<RepositoryAskResponse | null>(null);
   const [runResult, setRunResult] = useState<RunResponse | null>(null);
@@ -319,7 +326,7 @@ export default function Home() {
     setRepository(nextRepositoryValue);
     try { localStorage.setItem("rustgit:lastRepoUrl", nextRepositoryValue); } catch { /* ignore */ }
     setAnalyzeResult(null);
-    setAnalyzedRepoUrl(null);
+    setOverrideRuntime("auto");
     setIntelligence(null);
     setRepoAnswer(null);
     setRunResult(null);
@@ -344,6 +351,9 @@ export default function Home() {
     const command = startCommand.trim();
     const environment = parseKeyValueLines(envOverrides);
     const versions = parseKeyValueLines(versionOverrides);
+    if (overrideRuntime !== "auto") {
+      versions.RUNTIME_OVERRIDE = overrideRuntime;
+    }
     if (b) payload.branch = b;
     if (command) payload.start_command = command;
     if (Object.keys(environment).length > 0) payload.environment = environment;
@@ -595,7 +605,6 @@ export default function Home() {
     setError(null);
     setAnalyzing(true);
     setAnalyzeResult(null);
-    setAnalyzedRepoUrl(null);
     setIntelligence(null);
     setRepoAnswer(null);
     setRunResult(null);
@@ -622,7 +631,6 @@ export default function Home() {
       const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
-      setAnalyzedRepoUrl(repo.repoUrl);
       setIntelligence(analyzed.repository_intelligence ?? null);
       setRepoAnswer(analyzed.repository_ask ?? null);
       const missing: string[] = [];
@@ -633,7 +641,6 @@ export default function Home() {
       }
     } catch (caught) {
       setAnalyzeResult(null);
-      setAnalyzedRepoUrl(null);
       setIntelligence(null);
       setRepoAnswer(null);
       setError(caught instanceof Error ? caught.message : "Analyze request failed.");
@@ -717,6 +724,16 @@ export default function Home() {
     ? `${parsedRepo.owner}/${parsedRepo.repo}`
     : NO_REPOSITORY_SELECTED;
   const avatarLetter = parsedRepo?.owner?.charAt(0).toUpperCase() || DEFAULT_AVATAR_LETTER;
+  const executionIntelligence = analyzeResult?.execution_intelligence;
+  const requiredEnvVars = (executionIntelligence?.environmentVariables ?? [])
+    .filter((entry) => entry?.name)
+    .map((entry) => entry.name as string);
+  const healActions = [
+    executionIntelligence?.workspace?.requiresSecrets ? "Fix missing .env" : null,
+    !executionIntelligence?.docker?.dockerfile ? "Generate Dockerfile" : null,
+    executionIntelligence?.packageManager ? "Normalize package manager" : null,
+    "Fix lockfiles",
+  ].filter((entry): entry is string => Boolean(entry));
   const workspacePreviewSrc = workspace?.id
     ? `/api/workspace-preview/${workspace.id}?v=${workspacePreviewVersion}`
     : null;
@@ -758,10 +775,10 @@ export default function Home() {
             className={styles.input}
           />
           <p className={styles.hint}>Paste a GitHub URL or <code>owner/repo</code>.</p>
-          <button type="button" onClick={handleAnalyze} disabled={analyzing} className={styles.analyzeButton}>
+          <button type="button" onClick={handleAnalyze} disabled={!canAnalyze} className={styles.analyzeButton}>
             {analyzing ? "Analyzing..." : "Analyze"}
           </button>
-          <button type="button" onClick={handleRun} disabled={running} className={styles.secondaryButton}>
+          <button type="button" onClick={handleRun} disabled={!canRun} className={styles.secondaryButton}>
             {running ? "Starting..." : "Run"}
           </button>
         </div>
@@ -866,10 +883,10 @@ export default function Home() {
           <p>Launch and monitor execution from the same workspace.</p>
         </header>
 
-        {workspace ? (
-          <section className={styles.panel}>
-            <div className={styles.workspaceHeader}>
-              <h2>Run status</h2>
+        <section className={styles.panel}>
+          <div className={styles.workspaceHeader}>
+            <h2>Run status</h2>
+            {workspace ? (
               <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                 <span className={`${styles.badge} ${
                   workspace.state === "Running" ? styles.badgeRunning :
@@ -900,87 +917,117 @@ export default function Home() {
                   Stop
                 </button>
               </div>
+            ) : null}
+          </div>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Execution ID</strong>
+              <code>{runResult?.execution_id ?? "n/a"}</code>
             </div>
-            <div className={styles.grid}>
-              <div className={styles.tile}>
-                <strong>Execution ID</strong>
-                <code>{runResult?.execution_id ?? "n/a"}</code>
-              </div>
-              <div className={styles.tile}>
-                <strong>Framework</strong>
-                <span>{workspace.framework}</span>
-              </div>
-              <div className={styles.tile}>
-                <strong>Memory</strong>
-                <span>{workspace.resource_quotas?.max_memory_mb ?? "—"} MB</span>
-              </div>
-              <div className={styles.tile}>
-                <strong>CPU</strong>
-                <span>{workspace.resource_quotas?.max_cpu_millis ?? "—"} m</span>
-              </div>
-              {(workspace.ports ?? []).map((p, i) => (
-                <div key={i} className={styles.tile}>
-                  <strong>Port {p.port}</strong>
-                  <a
-                    href={`/api/app-proxy/${workspace.id}${p.route || "/"}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open app ↗
-                  </a>
-                </div>
-              ))}
+            <div className={styles.tile}>
+              <strong>Status</strong>
+              <span>{workspace?.state ?? runResult?.status ?? "idle"}</span>
             </div>
-
-            <div className={styles.logSection}>
-              <div className={styles.logHeader}>
-                <span className={styles.logTitle}>Logs</span>
-                {ACTIVE_WORKSPACE_STATES.has(workspace.state) && (
-                  <span className={styles.livePill}>
-                    <span className={styles.dot} /> live
-                  </span>
-                )}
-              </div>
-              <div className={styles.logBox} ref={logBoxRef}>
-                {workspaceLogs.length === 0 ? (
-                  <span className={styles.logEmpty}>No logs yet…</span>
-                ) : (
-                  workspaceLogs.map((line, i) => (
-                    <div key={i} className={styles.logLine}>
-                      <span className={styles.logNum}>{i + 1}</span>
-                      <span>{line}</span>
-                    </div>
-                  ))
-                )}
-              </div>
+            <div className={styles.tile}>
+              <strong>Framework</strong>
+              <span>{workspace?.framework ?? executionIntelligence?.framework ?? "n/a"}</span>
             </div>
-          </section>
-        ) : runResult ? (
-          <section className={styles.panel}>
-            <h2>Run status</h2>
-            <div className={styles.grid}>
-              <div className={styles.tile}>
-                <strong>Execution ID</strong>
-                <code>{runResult.execution_id ?? "n/a"}</code>
-              </div>
-              <div className={styles.tile}>
-                <strong>Status</strong>
-                <span>{runResult.status ?? "starting"}</span>
-              </div>
+            <div className={styles.tile}>
+              <strong>Memory</strong>
+              <span>{workspace?.resource_quotas?.max_memory_mb ?? "—"} MB</span>
             </div>
-          </section>
-        ) : (
-          <section className={styles.emptyPanel}>
-            <h2>{EMPTY_STATE_HEADING}</h2>
-            <p>Run a repository to populate execution status and workspace links.</p>
-          </section>
-        )}
+          </div>
+        </section>
 
         <section className={styles.panel}>
-          <h2>Launch overrides</h2>
+          <h2>Execution Intelligence</h2>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Repository</strong>
+              <code>{analyzeResult?.repo_url ?? parsedRepo?.repoUrl ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Framework</strong>
+              <span>{executionIntelligence?.framework ?? intelligence?.runtime ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Docker</strong>
+              <span>{executionIntelligence?.docker?.dockerfile || executionIntelligence?.docker?.compose ? "enabled" : "not detected"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Confidence</strong>
+              <span>{executionIntelligence?.execution?.confidence ?? analyzeResult?.repository_intelligence?.health_score ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Recommended runtime</strong>
+              <span>{executionIntelligence?.execution?.preferred ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Command</strong>
+              <span>{executionIntelligence?.docker?.command ?? executionIntelligence?.execution?.preferred ?? "n/a"}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Start command</strong>
+              <code>{executionIntelligence?.startCommand ?? "n/a"}</code>
+            </div>
+            <div className={styles.tile}>
+              <strong>Manifest</strong>
+              <code>{analyzeResult?.manifest?.path ?? ".execution.json"}</code>
+            </div>
+          </div>
+        </section>
+
+        <section className={styles.panel}>
+          <h2>Repository Health</h2>
+          <div className={styles.grid}>
+            <div className={styles.tile}>
+              <strong>Health</strong>
+              <span>{formatScore(healthScore)}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Execution</strong>
+              <span>{formatScore(executionScore)}</span>
+            </div>
+            <div className={styles.tile}>
+              <strong>Healing</strong>
+              <span>{formatScore(healingScore)}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className={styles.panel}>
+          <h2>Heal Repository</h2>
+          <p className={styles.hint}>Heal recommendations stay pinned for this repository.</p>
+          <ul className={styles.fileTreeList}>
+            {healActions.map((action) => (
+              <li key={action}>{action}</li>
+            ))}
+          </ul>
+          <div className={styles.actions}>
+            <button type="button" className={styles.primaryButton} disabled>
+              Heal Repository
+            </button>
+          </div>
+        </section>
+
+        <section className={styles.panel}>
+          <h2>Retry Execution</h2>
           <p className={styles.hint}>
-            Set optional branch, start command, environment, and version values for Run and Retry run.
+            Override runtime and start command for Retry run.
           </p>
+          <label htmlFor="runtime-override" className={styles.label}>Override runtime</label>
+          <select
+            id="runtime-override"
+            value={overrideRuntime}
+            onChange={(event) => setOverrideRuntime(event.target.value)}
+            className={styles.input}
+          >
+            <option value="auto">Auto</option>
+            <option value="docker">Docker</option>
+            <option value="node">Node</option>
+            <option value="python">Python</option>
+            <option value="bun">Bun</option>
+          </select>
           <label htmlFor="launch-branch" className={styles.label}>Branch</label>
           <input
             id="launch-branch"
@@ -1017,6 +1064,22 @@ export default function Home() {
             className={styles.input}
             rows={2}
           />
+        </section>
+
+        <section className={styles.panel}>
+          <h2>Environment Variables</h2>
+          {requiredEnvVars.length === 0 ? (
+            <p className={styles.hint}>No required environment variables detected yet.</p>
+          ) : (
+            <div className={styles.grid}>
+              {requiredEnvVars.map((name) => (
+                <div className={styles.tile} key={name}>
+                  <strong>{name}</strong>
+                  <span>required</span>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         {runResult?.execution_id ? (
@@ -1066,6 +1129,30 @@ export default function Home() {
             )}
           </section>
         ) : null}
+
+        <section className={styles.panel}>
+          <h2>Logs</h2>
+          <div className={styles.logHeader}>
+            <span className={styles.logTitle}>Runtime output</span>
+            {workspace && ACTIVE_WORKSPACE_STATES.has(workspace.state) && (
+              <span className={styles.livePill}>
+                <span className={styles.dot} /> live
+              </span>
+            )}
+          </div>
+          <div className={styles.logBox} ref={logBoxRef}>
+            {workspaceLogs.length === 0 ? (
+              <span className={styles.logEmpty}>No logs yet…</span>
+            ) : (
+              workspaceLogs.map((line, i) => (
+                <div key={i} className={styles.logLine}>
+                  <span className={styles.logNum}>{i + 1}</span>
+                  <span>{line}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
 
         {workspace ? (
           <section className={styles.panel}>

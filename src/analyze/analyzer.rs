@@ -59,16 +59,18 @@ impl AnalyzeEngine {
 
         let confidence = compute_confidence(&framework.framework, &runtime.runtime);
 
-        let manifest = AnalyzeManifest {
-            runtime: runtime.runtime.clone(),
-            framework: framework.framework.clone(),
-            package_manager: runtime.package_manager.clone(),
-            build: runtime.build.clone(),
-            start: runtime.start.clone(),
-            dev: runtime.dev.clone(),
+        let manifest = AnalyzeManifest::synthesize(
+            root,
+            &framework.framework,
+            &runtime.runtime,
+            runtime.package_manager.as_deref(),
+            runtime.build.as_deref(),
+            runtime.start.as_deref(),
+            runtime.dev.as_deref(),
             confidence,
-        };
+        );
         write_manifest(root, &manifest)?;
+        let framework_name = manifest.framework.clone();
 
         let duration_ms = total_start.elapsed().as_millis() as u64;
         let response = json!({
@@ -82,9 +84,10 @@ impl AnalyzeEngine {
             "execution": blueprint,
             "manifest": {
                 "version": 1,
-                "path": ".ddockit/manifest.json"
+                "path": ".execution.json"
             },
-            "frameworks": [manifest.framework],
+            "execution_intelligence": manifest,
+            "frameworks": [framework_name],
             "services": ["root"],
             "fingerprint_id": request.commit,
             "confidence": confidence,
