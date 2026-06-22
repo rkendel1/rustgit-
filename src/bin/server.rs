@@ -702,22 +702,29 @@ async fn workspace_files(
 }
 
 fn is_workspace_internal_file(path: &str) -> bool {
-    path == ".git" || path.starts_with(".git/")
+    path == ".git"
+        || path.starts_with(".git/")
+        || path_segments(path).any(|segment| segment == "node_modules")
 }
 
 fn workspace_file_priority(path: &str) -> (u8, u8) {
+    let root_file = !path.contains('/');
     let Some(name) = FsPath::new(path).file_name().and_then(|value| value.to_str()) else {
         return (1, u8::MAX);
     };
-    match name.to_ascii_lowercase().as_str() {
-        "package.json" => (0, 0),
-        "requirements.txt" => (0, 1),
-        "readme.md" | "readme" => (0, 2),
-        "pyproject.toml" => (0, 3),
-        "cargo.toml" => (0, 4),
-        "go.mod" => (0, 5),
+    match (root_file, name.to_ascii_lowercase().as_str()) {
+        (true, "package.json") => (0, 0),
+        (true, "requirements.txt") => (0, 1),
+        (true, "readme.md" | "readme") => (0, 2),
+        (true, "pyproject.toml") => (0, 3),
+        (true, "cargo.toml") => (0, 4),
+        (true, "go.mod") => (0, 5),
         _ => (1, u8::MAX),
     }
+}
+
+fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|segment| !segment.is_empty())
 }
 
 async fn workspace_file(
@@ -1222,8 +1229,10 @@ mod tests {
         let mut files = vec![
             ".git/config".to_string(),
             "src/main.rs".to_string(),
+            "node_modules/vue/package.json".to_string(),
             "README.md".to_string(),
             "requirements.txt".to_string(),
+            "app/package.json".to_string(),
             "package.json".to_string(),
             ".git/hooks/pre-commit.sample".to_string(),
         ];
@@ -1239,6 +1248,7 @@ mod tests {
                 "package.json",
                 "requirements.txt",
                 "README.md",
+                "app/package.json",
                 "src/main.rs",
             ]
         );
