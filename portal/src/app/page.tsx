@@ -30,6 +30,8 @@ type AnalyzeResponse = {
   fingerprint_id?: string;
   frameworks?: string[];
   services?: string[];
+  repository_intelligence?: RepositoryIntelligenceResponse;
+  repository_ask?: RepositoryAskResponse;
 };
 
 type RunResponse = {
@@ -460,57 +462,21 @@ export default function Home() {
           repo_url: repo.repoUrl,
           branch: branch.trim() || "main",
           commit: null,
+          include_repository_summary: true,
+          ask_question: DEFAULT_ASK_QUESTION,
         }),
       };
       const analyzeResponse = await fetch(ANALYZE_PATH, analyzeRequest);
       const analyzed = await readJsonResponse<AnalyzeResponse>(analyzeResponse);
       setAnalyzeResult(analyzed);
       setAnalyzedRepoUrl(repo.repoUrl);
-
-      if (!analyzed.fingerprint_id) {
-        return;
-      }
-
-      try {
-        const intelligenceResponse = await fetch(
-          `/api/proxy/api/repositories/${encodeURIComponent(analyzed.fingerprint_id)}/intelligence`,
-          {
-            method: "GET",
-            cache: "no-store",
-          },
-        );
-        const intelligenceBody = await readJsonResponse<RepositoryIntelligenceResponse>(
-          intelligenceResponse,
-        );
-        setIntelligence(intelligenceBody);
-      } catch (caught) {
-        setError(
-          caught instanceof Error
-            ? `Analysis succeeded, but repository intelligence could not be loaded: ${caught.message}`
-            : "Analysis succeeded, but repository intelligence could not be loaded.",
-        );
-      }
-
-      try {
-        const askResponse = await fetch(
-          `/api/proxy/api/repositories/${encodeURIComponent(analyzed.fingerprint_id)}/ask`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ question: DEFAULT_ASK_QUESTION }),
-          },
-        );
-        const askBody = await readJsonResponse<RepositoryAskResponse>(askResponse);
-        setRepoAnswer(askBody);
-      } catch (caught) {
-        setRepoAnswer(null);
-        setError(
-          caught instanceof Error
-            ? `Analysis succeeded, but repository summary could not be loaded: ${caught.message}`
-            : "Analysis succeeded, but repository summary could not be loaded.",
-        );
+      setIntelligence(analyzed.repository_intelligence ?? null);
+      setRepoAnswer(analyzed.repository_ask ?? null);
+      const missing: string[] = [];
+      if (!analyzed.repository_intelligence) missing.push("repository intelligence");
+      if (!analyzed.repository_ask) missing.push("repository ask");
+      if (missing.length > 0) {
+        setError(`Analysis succeeded, but ${missing.join(" and ")} could not be loaded.`);
       }
     } catch (caught) {
       setAnalyzeResult(null);

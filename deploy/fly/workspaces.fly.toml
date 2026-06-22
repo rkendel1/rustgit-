@@ -1,11 +1,26 @@
 app = "trythissoftware-workspaces"
+primary_region = "iad"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   BASE_DOMAIN = "trythissoftware.com"
+  WORKSPACE_ROOT = "/data/workspaces"
+
+[[mounts]]
+  # Fly volumes are single-machine attachments; this app is intentionally a warm singleton.
+  source = "workspace_data"
+  destination = "/data/workspaces"
 
 [http_service]
   internal_port = 8080
   force_https = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  max_machines_running = 1
+
+[vm]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

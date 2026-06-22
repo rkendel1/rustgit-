@@ -150,6 +150,8 @@ struct AnalyzeRequest {
     repo_url: Option<String>,
     branch: Option<String>,
     commit: Option<String>,
+    include_repository_summary: Option<bool>,
+    ask_question: Option<String>,
 }
 
 fn err_response(err: RuntimeError) -> (StatusCode, Json<Value>) {
@@ -357,6 +359,8 @@ async fn analyze_repository(
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let started = Instant::now();
+    let include_repository_summary = body.include_repository_summary.unwrap_or(false);
+    let ask_question = body.ask_question.as_deref();
     let repo_url = resolve_repo_url(body.repo_url, body.url, body.owner, body.repo)?;
     let branch = body
         .branch
@@ -375,6 +379,9 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        if include_repository_summary {
+            enrich_analyze_payload(&mut payload, ask_question);
+        }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
                 idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
@@ -398,6 +405,9 @@ async fn analyze_repository(
         let mut payload = cached.payload;
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+        if include_repository_summary {
+            enrich_analyze_payload(&mut payload, ask_question);
+        }
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
                 idx.entry(fingerprint_id.to_string()).or_insert(payload.clone());
@@ -415,6 +425,9 @@ async fn analyze_repository(
     let mut payload = result.payload;
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
+    if include_repository_summary {
+        enrich_analyze_payload(&mut payload, ask_question);
+    }
     state
         .analyze_cache
         .put(resolved_cache_key.clone(), payload.clone());
@@ -429,23 +442,7 @@ async fn analyze_repository(
     Ok((StatusCode::OK, Json(payload)))
 }
 
-async fn repository_intelligence(
-    State(state): State<AppState>,
-    Path(fingerprint_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let payload = state
-        .fingerprint_index
-        .lock()
-        .ok()
-        .and_then(|idx| idx.get(&fingerprint_id).cloned());
-
-    let Some(payload) = payload else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "repository not found; run analyze first" })),
-        ));
-    };
-
+fn repository_intelligence_from_payload(fingerprint_id: &str, payload: &Value) -> Value {
     let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let health_score = confidence / 100.0;
 
@@ -475,14 +472,142 @@ async fn repository_intelligence(
         })
         .map(|s| s.to_string());
 
-    Ok(Json(json!({
+    json!({
         "repository_id": fingerprint_id,
         "health_score": health_score,
         "execution_score": execution_score,
         "healing_score": null,
         "runtime": runtime,
         "repository_identity": null
-    })))
+    })
+}
+
+fn repository_ask_from_payload(payload: &Value, question: Option<&str>) -> Value {
+    let repo_url = payload
+        .get("repo_url")
+        .or_else(|| payload.get("repo"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("this repository");
+
+    let frameworks: Vec<&str> = payload
+        .get("frameworks")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| *s != "unknown")
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let runtime_lang = payload
+        .get("runtime")
+        .and_then(|r| r.get("language"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let runtime_framework = payload
+        .get("runtime")
+        .and_then(|r| r.get("framework"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let preferred_provider = payload
+        .get("execution")
+        .and_then(|e| e.get("preferredProvider"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown");
+
+    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let answer_confidence = (confidence / 100.0).min(1.0) as f32;
+
+    let question = question.unwrap_or("Summarize this repository.");
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(fw) = runtime_framework {
+        parts.push(format!("This repository uses the {} framework", fw));
+    } else if !frameworks.is_empty() {
+        parts.push(format!("This repository uses {}", frameworks.join(", ")));
+    } else {
+        parts.push(format!(
+            "This repository at {} could not be automatically classified",
+            repo_url
+        ));
+    }
+
+    if let Some(lang) = runtime_lang {
+        parts.push(format!("written in {}", lang));
+    }
+
+    parts.push(".".to_string());
+
+    if let Some(provider) = preferred_provider {
+        parts.push(format!(
+            " The recommended way to run it is via {}.",
+            provider
+        ));
+    }
+
+    let answer = if question.to_lowercase().contains("run") || question.to_lowercase().contains("summar") {
+        format!(
+            "{} {}",
+            parts.join(" ").trim(),
+            preferred_provider
+                .map(|p| format!("Run using: {p}"))
+                .unwrap_or_else(|| "No specific run instructions could be determined automatically.".to_string())
+        )
+    } else {
+        parts.join(" ").trim().to_string()
+    };
+
+    let mut evidence: Vec<&str> = Vec::new();
+    if let Some(fw) = runtime_framework {
+        evidence.push(fw);
+    }
+    if let Some(lang) = runtime_lang {
+        evidence.push(lang);
+    }
+    if let Some(p) = preferred_provider {
+        evidence.push(p);
+    }
+
+    json!({
+        "answer": answer,
+        "confidence": answer_confidence,
+        "evidence": evidence
+    })
+}
+
+fn enrich_analyze_payload(payload: &mut Value, question: Option<&str>) {
+    if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
+        payload["repository_intelligence"] =
+            repository_intelligence_from_payload(fingerprint_id, payload);
+        payload["repository_ask"] = repository_ask_from_payload(payload, question);
+    }
+}
+
+async fn repository_intelligence(
+    State(state): State<AppState>,
+    Path(fingerprint_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let payload = state
+        .fingerprint_index
+        .lock()
+        .ok()
+        .and_then(|idx| idx.get(&fingerprint_id).cloned());
+
+    let Some(payload) = payload else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "repository not found; run analyze first" })),
+        ));
+    };
+
+    Ok(Json(repository_intelligence_from_payload(
+        &fingerprint_id,
+        &payload,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -508,83 +633,10 @@ async fn repository_ask(
         ));
     };
 
-    let repo_url = payload
-        .get("repo_url")
-        .or_else(|| payload.get("repo"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("this repository");
-
-    let frameworks: Vec<&str> = payload
-        .get("frameworks")
-        .and_then(|f| f.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).filter(|s| *s != "unknown").collect())
-        .unwrap_or_default();
-
-    let runtime_lang = payload
-        .get("runtime")
-        .and_then(|r| r.get("language"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty() && *s != "unknown");
-
-    let runtime_framework = payload
-        .get("runtime")
-        .and_then(|r| r.get("framework"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty() && *s != "unknown");
-
-    let preferred_provider = payload
-        .get("execution")
-        .and_then(|e| e.get("preferredProvider"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty() && *s != "unknown");
-
-    let confidence = payload.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let answer_confidence = (confidence / 100.0).min(1.0) as f32;
-
-    let question = body.question.as_deref().unwrap_or("Summarize this repository.");
-
-    let mut parts: Vec<String> = Vec::new();
-
-    if let Some(fw) = runtime_framework {
-        parts.push(format!("This repository uses the {} framework", fw));
-    } else if !frameworks.is_empty() {
-        parts.push(format!("This repository uses {}", frameworks.join(", ")));
-    } else {
-        parts.push(format!("This repository at {} could not be automatically classified", repo_url));
-    }
-
-    if let Some(lang) = runtime_lang {
-        parts.push(format!("written in {}", lang));
-    }
-
-    parts.push(".".to_string());
-
-    if let Some(provider) = preferred_provider {
-        parts.push(format!(" The recommended way to run it is via {}.", provider));
-    }
-
-    let answer = if question.to_lowercase().contains("run") || question.to_lowercase().contains("summar") {
-        format!(
-            "{} {}",
-            parts.join(" ").trim(),
-            preferred_provider
-                .map(|p| format!("Run using: {p}"))
-                .unwrap_or_else(|| "No specific run instructions could be determined automatically.".to_string())
-        )
-    } else {
-        parts.join(" ").trim().to_string()
-    };
-
-    let mut evidence: Vec<&str> = Vec::new();
-    if let Some(fw) = runtime_framework { evidence.push(fw); }
-    if let Some(lang) = runtime_lang { evidence.push(lang); }
-    if let Some(p) = preferred_provider { evidence.push(p); }
-
-    Ok(Json(json!({
-        "answer": answer,
-        "confidence": answer_confidence,
-        "evidence": evidence
-    })))
+    Ok(Json(repository_ask_from_payload(
+        &payload,
+        body.question.as_deref(),
+    )))
 }
 
 async fn stop_workspace(
@@ -1268,6 +1320,14 @@ mod tests {
             payload["traceability"]["phase3_manifest_first"].as_bool(),
             Some(true)
         );
+        assert!(
+            payload.get("repository_intelligence").is_none(),
+            "analyze should only include repository summary projections when explicitly requested"
+        );
+        assert!(
+            payload.get("repository_ask").is_none(),
+            "analyze should only include repository summary projections when explicitly requested"
+        );
         assert!(repo.join(".ddockit/manifest.json").exists());
 
         let second = app
@@ -1287,6 +1347,8 @@ mod tests {
         let second_payload: serde_json::Value =
             serde_json::from_slice(&second_body).expect("second json");
         assert_eq!(second_payload["cached"].as_bool(), Some(true));
+        assert!(second_payload.get("repository_intelligence").is_none());
+        assert!(second_payload.get("repository_ask").is_none());
     }
 
     #[tokio::test]
@@ -1294,10 +1356,12 @@ mod tests {
         let state = test_state();
         let repo_url = "https://github.com/example/slow-repo.git";
         let cache_key = super::AnalyzeCache::key(repo_url, "main", "latest");
+        let fingerprint_id = "repo-fingerprint-123";
         state.analyze_cache.put(
             cache_key,
             serde_json::json!({
                 "repo": repo_url,
+                "fingerprint_id": fingerprint_id,
                 "runtime": { "language": "typescript", "packageManager": "pnpm", "framework": "nextjs" },
                 "execution": { "preferredProvider": "browser-wasm", "fallback": ["fly", "docker", "codespaces"] },
                 "manifest": { "version": 1, "path": ".ddockit/manifest.json" },
@@ -1309,6 +1373,7 @@ mod tests {
         let app = app(state);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1317,7 +1382,9 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "repo_url": repo_url,
-                            "branch": "main"
+                            "branch": "main",
+                            "include_repository_summary": true,
+                            "ask_question": "Summarize what this repository does and the best way to run it."
                         })
                         .to_string(),
                     ))
@@ -1332,5 +1399,55 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload["cached"].as_bool(), Some(true));
         assert_eq!(payload["repo"].as_str(), Some(repo_url));
+        assert_eq!(
+            payload["repository_intelligence"]["repository_id"].as_str(),
+            Some(fingerprint_id)
+        );
+        assert_eq!(
+            payload["repository_ask"]["evidence"][0].as_str(),
+            Some("nextjs")
+        );
+
+        let intelligence_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/repositories/{fingerprint_id}/intelligence"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(intelligence_response.status(), StatusCode::OK);
+        let intelligence_body = to_bytes(intelligence_response.into_body(), 1024 * 1024)
+            .await
+            .expect("intelligence body");
+        let intelligence_payload: serde_json::Value =
+            serde_json::from_slice(&intelligence_body).expect("intelligence payload");
+        assert_eq!(payload["repository_intelligence"], intelligence_payload);
+
+        let ask_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/repositories/{fingerprint_id}/ask"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "question": "Summarize what this repository does and the best way to run it."
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(ask_response.status(), StatusCode::OK);
+        let ask_body = to_bytes(ask_response.into_body(), 1024 * 1024)
+            .await
+            .expect("ask body");
+        let ask_payload: serde_json::Value = serde_json::from_slice(&ask_body).expect("ask payload");
+        assert_eq!(payload["repository_ask"], ask_payload);
     }
 }

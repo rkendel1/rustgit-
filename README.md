@@ -66,6 +66,7 @@ This badge updates automatically based on repository execution health.
 - **Repository knowledge graph assembly** from execution, failure, healing, temporal recovery, dependency, and architecture data.
 - **Repository ask service** (`POST /api/repositories/{id}/ask`) that builds an answer with confidence and evidence links.
 - **Repository intelligence panel endpoint** (`GET /api/repositories/{id}/intelligence`) used by product surfaces for score/runtime/action summaries.
+- **Optional consolidated analyze response** (`POST /api/analyze`) can include `repository_intelligence` and `repository_ask` when `include_repository_summary=true` so UIs can do one efficient call without extra endpoint fan-out.
 - **Preflight Intelligence & Environment Synthesis payloads** embedded in `POST /api/v1/repositories/analyze` and `POST /api/v1/execution/plan` responses.
 - **Execution intelligence loop endpoints** for retrieval, learning, and optimization:
   - `GET /intelligence/{execution}`
@@ -359,7 +360,7 @@ The repository root `fly.toml` is intentionally configured for the frontend (`ru
 
 Required runtime environment variables:
 
-- API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`
+- API: `DATABASE_URL`, `REDIS_URL` (optional), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `JWT_SECRET`, `BASE_DOMAIN=trythissoftware.com`, `WORKSPACE_ROOT=/data/workspaces` (if unset, server falls back to `./.workspace-data`)
 - Portal: `NEXT_PUBLIC_API_URL=https://api.trythissoftware.com`, `NEXT_PUBLIC_BASE_DOMAIN=trythissoftware.com`
 
 OAuth callback endpoints (API):
@@ -373,6 +374,12 @@ Store API credentials/secrets as Fly secrets instead of committing them to confi
 # Deploy Postgres first
 fly deploy --config deploy/fly/postgres.fly.toml
 
+# Create persistent workspace volumes so analyze/runtime caches survive restarts.
+# --size is in GB on Fly; this creates 10GB volumes for each app.
+# Fly volumes are single-machine mounts; API and workspaces each run as one warm machine.
+fly volumes create workspace_data --app trythissoftware-api --region iad --size 10
+fly volumes create workspace_data --app trythissoftware-workspaces --region iad --size 10
+
 # Set the DATABASE_URL pointing to Fly's private network (.flycast)
 fly secrets set --app trythissoftware-api \
   DATABASE_URL="postgresql://postgres:<password>@trythissoftware-db.flycast:5432/rustgit" \
@@ -382,6 +389,9 @@ fly secrets set --app trythissoftware-api \
 
 # Deploy the API
 fly deploy --config deploy/fly/api.fly.toml
+
+# Deploy workspace router (configured to keep one warm machine running)
+fly deploy --config deploy/fly/workspaces.fly.toml
 ```
 
 `POSTGRES_PASSWORD` must be set as a secret on the Postgres app before first deploy:
