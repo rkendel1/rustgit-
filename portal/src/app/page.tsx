@@ -143,6 +143,19 @@ type LaunchPlan = {
   autoHealsApplied?: string[];
 };
 
+type BadgeGenerateResponse = {
+  error?: string;
+  message?: string;
+  badge_url?: string;
+  seed_url?: string;
+  embed_snippets?: {
+    markdown?: string;
+    html?: string;
+    raw_badge_url?: string;
+    seed_link?: string;
+  };
+};
+
 function createAnonymousId(prefix: string): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -329,6 +342,11 @@ export default function Home() {
   const [envExampleHints, setEnvExampleHints] = useState<Record<string, string>>({});
   const [freeingSpace, setFreeingSpace] = useState(false);
   const [freeSpaceResult, setFreeSpaceResult] = useState<string | null>(null);
+  const [badgeMode, setBadgeMode] = useState("auto");
+  const [badgeVisibility, setBadgeVisibility] = useState("public");
+  const [generatingBadge, setGeneratingBadge] = useState(false);
+  const [badgeResult, setBadgeResult] = useState<BadgeGenerateResponse | null>(null);
+  const [badgeError, setBadgeError] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement>(null);
   const workspaceFileTree = useMemo(() => buildWorkspaceFileTree(workspaceFiles), [workspaceFiles]);
   const anonymousIdentity = useMemo(
@@ -373,6 +391,8 @@ export default function Home() {
     setWorkspacePreviewError(null);
     setEnvConfig({});
     setEnvExampleHints({});
+    setBadgeResult(null);
+    setBadgeError(null);
     setError(null);
   }
 
@@ -701,6 +721,41 @@ export default function Home() {
       setError(caught instanceof Error ? caught.message : "Analyze request failed.");
     } finally {
       setAnalyzing(false);
+    }
+  }
+
+  async function handleGenerateBadge() {
+    const domValue = repoInputRef.current?.value ?? "";
+    if (domValue && domValue !== repository) resetResults(domValue);
+    const repo = parsedRepo ?? parseRepositoryInput(domValue);
+    if (!repo) {
+      setBadgeError("Enter a valid GitHub URL — e.g. https://github.com/owner/repo");
+      return;
+    }
+
+    setBadgeError(null);
+    setBadgeResult(null);
+    setGeneratingBadge(true);
+    try {
+      const response = await fetch("/api/proxy/api/badges/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repo_url: repo.repoUrl,
+          branch: branch.trim() || "main",
+          mode: badgeMode,
+          visibility: badgeVisibility,
+        }),
+      });
+      const payload = await readJsonResponse<BadgeGenerateResponse>(response);
+      if (payload.error) {
+        throw new Error(payload.message ?? payload.error);
+      }
+      setBadgeResult(payload);
+    } catch (caught) {
+      setBadgeError(caught instanceof Error ? caught.message : "Badge generation failed.");
+    } finally {
+      setGeneratingBadge(false);
     }
   }
 
@@ -1113,6 +1168,67 @@ export default function Home() {
               <span>{formatScore(healingScore)}</span>
             </div>
           </div>
+        </section>
+
+        <section className={styles.panel}>
+          <h2>Badge Generator</h2>
+          <p className={styles.hint}>Generate embeddable badges that reflect repository execution health.</p>
+          <label htmlFor="badge-mode" className={styles.label}>Badge mode</label>
+          <select
+            id="badge-mode"
+            value={badgeMode}
+            onChange={(event) => setBadgeMode(event.target.value)}
+            className={styles.input}
+          >
+            <option value="auto">Auto</option>
+            <option value="wasm">Wasm</option>
+            <option value="docker">Docker</option>
+          </select>
+          <label htmlFor="badge-visibility" className={styles.label}>Visibility</label>
+          <select
+            id="badge-visibility"
+            value={badgeVisibility}
+            onChange={(event) => setBadgeVisibility(event.target.value)}
+            className={styles.input}
+          >
+            <option value="public">Public</option>
+            <option value="private">Private</option>
+          </select>
+          <div className={styles.actions}>
+            <button
+              type="button"
+              onClick={handleGenerateBadge}
+              disabled={!parsedRepo || generatingBadge}
+              className={styles.primaryButton}
+            >
+              {generatingBadge ? "Generating..." : "Generate badge"}
+            </button>
+          </div>
+          {badgeError ? (
+            <section className={styles.errorPanel} role="alert">
+              {badgeError}
+            </section>
+          ) : null}
+          {badgeResult ? (
+            <div className={styles.grid}>
+              <div className={styles.tile}>
+                <strong>Badge URL</strong>
+                <code>{badgeResult.badge_url ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Seed URL</strong>
+                <code>{badgeResult.seed_url ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>Markdown snippet</strong>
+                <code>{badgeResult.embed_snippets?.markdown ?? "n/a"}</code>
+              </div>
+              <div className={styles.tile}>
+                <strong>HTML snippet</strong>
+                <code>{badgeResult.embed_snippets?.html ?? "n/a"}</code>
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <section className={styles.panel}>
