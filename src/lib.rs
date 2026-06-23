@@ -8151,6 +8151,20 @@ fn workspace_ports_from_manifest_or_framework(repo_root: &Path, framework: Frame
         .collect()
 }
 
+fn runtime_label_for_context(
+    context: Option<&ExecutionContext>,
+    manifest: Option<&RuntimeManifestLaunchConfig>,
+) -> String {
+    context
+        .map(|ctx| {
+            manifest
+                .and_then(|manifest| manifest.node_version.as_deref())
+                .map(|version| format!("node{version}"))
+                .unwrap_or_else(|| ctx.runtime_spec.language.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn parse_package_dependency_names(root: &Path) -> HashSet<String> {
     let package_json = fs::read_to_string(root.join("package.json")).unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(&package_json).unwrap_or(Value::Null);
@@ -14270,17 +14284,8 @@ impl WorkspaceManager {
         let manifest_config = record.execution_context.as_ref().and_then(|ctx| {
             load_runtime_manifest_launch_config(Path::new(&ctx.repo_path))
         });
-        let runtime_label = record
-            .execution_context
-            .as_ref()
-            .map(|ctx| {
-                manifest_config
-                    .as_ref()
-                    .and_then(|manifest| manifest.node_version.as_deref())
-                    .map(|version| format!("node{version}"))
-                    .unwrap_or_else(|| ctx.runtime_spec.language.clone())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        let runtime_label =
+            runtime_label_for_context(record.execution_context.as_ref(), manifest_config.as_ref());
         let healthy = runtime.process_alive && runtime.http_ready;
         let execution_handle = Some(ExecutionHandle {
             workspace_id: runtime.workspace_id.clone(),
