@@ -8013,6 +8013,17 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
     keys
 }
 
+fn normalize_health_check_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct RuntimeManifestLaunchConfig {
     node_version: Option<String>,
@@ -8108,20 +8119,19 @@ fn load_execution_manifest_preferred_ports(repo_root: &Path) -> Vec<u16> {
 }
 
 fn load_execution_manifest_health_check(repo_root: &Path) -> String {
-    let path = load_runtime_manifest_launch_config(repo_root)
+    normalize_health_check_path(
+        &load_runtime_manifest_launch_config(repo_root)
         .and_then(|manifest| manifest.health_check)
-        .unwrap_or_else(|| "/".to_string());
-    if path.starts_with('/') {
-        path
-    } else {
-        format!("/{path}")
-    }
+        .unwrap_or_else(|| "/".to_string()),
+    )
 }
 
+#[cfg(test)]
 fn load_execution_manifest_node_version(repo_root: &Path) -> Option<String> {
     load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.node_version)
 }
 
+#[cfg(test)]
 fn load_execution_manifest_package_manager(repo_root: &Path) -> Option<String> {
     load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.package_manager)
 }
@@ -12923,11 +12933,7 @@ impl WorkspaceManager {
             .write_all(
                 format!(
                     "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    if health_check.starts_with('/') {
-                        health_check.to_string()
-                    } else {
-                        format!("/{health_check}")
-                    }
+                    normalize_health_check_path(health_check)
                 )
                 .as_bytes(),
             )
@@ -13639,6 +13645,7 @@ impl WorkspaceManager {
         let run_cmd = Self::resolved_run_command(ctx, overrides)
             .ok_or_else(|| RuntimeError::CommandFailed("no run command resolved".to_string()))?;
         let repo_path = Path::new(&ctx.repo_path);
+        let manifest_config = load_runtime_manifest_launch_config(repo_path);
         let is_python = matches!(
             ctx.analysis.framework,
             Framework::Python
@@ -13651,7 +13658,10 @@ impl WorkspaceManager {
 
         let (requested_port, prebound_port_listener) =
             Self::reserve_prebound_port_with_preferences(
-                &load_execution_manifest_preferred_ports(repo_path),
+                manifest_config
+                    .as_ref()
+                    .map(|manifest| manifest.preferred_ports.as_slice())
+                    .unwrap_or(&[]),
             )
             .ok_or_else(|| {
                 RuntimeError::CommandFailed(
@@ -13708,10 +13718,16 @@ impl WorkspaceManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PORT", requested_port.to_string());
-        if let Some(node_version) = load_execution_manifest_node_version(repo_path) {
+        if let Some(node_version) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.node_version.as_deref())
+        {
             cmd.env("NODE_VERSION", node_version);
         }
-        if let Some(package_manager) = load_execution_manifest_package_manager(repo_path) {
+        if let Some(package_manager) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.package_manager.as_deref())
+        {
             cmd.env("PACKAGE_MANAGER", package_manager);
         }
         Self::apply_process_overrides(&mut cmd, overrides);
@@ -13839,6 +13855,7 @@ impl WorkspaceManager {
             None => return (None, None, provider_selected),
         };
         let repo_path = std::path::Path::new(&ctx.repo_path);
+        let manifest_config = load_runtime_manifest_launch_config(repo_path);
         let is_python = matches!(
             ctx.analysis.framework,
             Framework::Python
@@ -13956,7 +13973,10 @@ impl WorkspaceManager {
                 .output();
         }
 
-        let preferred_ports = load_execution_manifest_preferred_ports(repo_path);
+        let preferred_ports = manifest_config
+            .as_ref()
+            .map(|manifest| manifest.preferred_ports.clone())
+            .unwrap_or_default();
         let (assigned_port, prebound_port_listener) =
             match Self::reserve_prebound_port_with_preferences(&preferred_ports) {
             Some((port, listener)) => (Some(port), Some(listener)),
@@ -14022,10 +14042,16 @@ impl WorkspaceManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(stderr_stdio);
-        if let Some(node_version) = load_execution_manifest_node_version(repo_path) {
+        if let Some(node_version) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.node_version.as_deref())
+        {
             cmd.env("NODE_VERSION", node_version);
         }
-        if let Some(package_manager) = load_execution_manifest_package_manager(repo_path) {
+        if let Some(package_manager) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.package_manager.as_deref())
+        {
             cmd.env("PACKAGE_MANAGER", package_manager);
         }
         // Always set PORT env var for frameworks that read it (Node.js etc.)
@@ -14241,11 +14267,16 @@ impl WorkspaceManager {
         } else {
             None
         };
+        let manifest_config = record.execution_context.as_ref().and_then(|ctx| {
+            load_runtime_manifest_launch_config(Path::new(&ctx.repo_path))
+        });
         let runtime_label = record
             .execution_context
             .as_ref()
             .map(|ctx| {
-                load_execution_manifest_node_version(Path::new(&ctx.repo_path))
+                manifest_config
+                    .as_ref()
+                    .and_then(|manifest| manifest.node_version.as_deref())
                     .map(|version| format!("node{version}"))
                     .unwrap_or_else(|| ctx.runtime_spec.language.clone())
             })
