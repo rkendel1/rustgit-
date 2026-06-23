@@ -20,13 +20,13 @@ This document maps issue requirements to implementation locations.
 - Analyze handler no longer launches workspace providers; it directly inspects repository files in `/home/runner/work/rustgit/rustgit/src/bin/server.rs`.
 
 ## Phase 6 — Progressive enhancement
-- Analyze response returns core runtime/manifest/blueprint payload immediately; blocking workspace operations removed from portal analyze flow in `/home/runner/work/rustgit/rustgit/portal/src/app/page.tsx`.
+- Analyze response returns runtime manifest metadata immediately, and execution planning/provider intelligence is generated in background jobs from `/home/runner/work/rustgit/rustgit/src/bin/server.rs` and `/home/runner/work/rustgit/rustgit/src/analyze/analyzer.rs`.
 
 ## Phase 7 — Cache
-- Commit-keyed analyze cache (`repo/branch/commit`) in `/home/runner/work/rustgit/rustgit/src/analyze/cache.rs`.
+- Commit-keyed deterministic analyze cache (`sha256(repo_url + branch + resolved_commit + analyze_version)`) in `/home/runner/work/rustgit/rustgit/src/analyze/cache.rs`.
 
 ## Phase 8 — Provider decoupling
-- Analyze response includes execution blueprint only; provider execution remains downstream (`src/analyze/blueprint_builder.rs`).
+- Analyze response is provider-independent (`execution.provider = local`) while provider scoring/blueprint artifacts are generated asynchronously (`src/analyze/blueprint_builder.rs`, `src/analyze/analyzer.rs`).
 
 ## Phase 9 — Deterministic runtime registry
 - Runtime registry for framework/lockfile mapping in `/home/runner/work/rustgit/rustgit/src/analyze/registry.rs`.

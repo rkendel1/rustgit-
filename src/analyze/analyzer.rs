@@ -15,6 +15,7 @@ use super::runtime_detector::detect_runtime;
 const STAGE_TIMEOUT_MS: u128 = 250;
 const MAX_CONFIDENCE: u8 = 99;
 const FRAMEWORKS_REQUIRING_BROWSER_APIS: [&str; 5] = ["vite", "react", "nextjs", "svelte", "nuxt"];
+pub const ANALYSIS_VERSION: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeEngineRequest {
@@ -113,24 +114,10 @@ impl AnalyzeEngine {
             runtime.dev.as_deref(),
             compute_confidence(&framework.framework, &runtime.runtime),
         );
-        let execution_plan = build_execution_plan(&runtime.runtime, &framework.framework);
-        let requires_docker = manifest.workspace.requires_docker;
-        let requires_python = runtime.runtime == "python" || framework.language == "python";
-        let requires_secrets = manifest.workspace.requires_secrets;
-        let requires_browser_apis =
-            FRAMEWORKS_REQUIRING_BROWSER_APIS.contains(&framework.framework.as_str());
         let stage_start = Instant::now();
-        let blueprint = build_blueprint(
-            &runtime.runtime,
-            &framework.framework,
-            requires_docker,
-            requires_python,
-            requires_secrets,
-            requires_browser_apis,
-        );
         traceability.push(stage_trace(
-            "execution_blueprint",
-            &[blueprint.preferred_provider.clone()],
+            "manifest_synthesis",
+            &[manifest.framework.clone()],
             stage_start,
         ));
 
@@ -143,27 +130,17 @@ impl AnalyzeEngine {
             &runtime.runtime,
             runtime.package_manager.as_deref(),
             runtime.dev.as_deref(),
-            &blueprint.preferred_provider,
-            &blueprint.fallback,
             confidence,
         );
         validate_runtime_manifest(&runtime_manifest)?;
         Self::write_json_file(root.join("runtime-manifest.json"), &runtime_manifest)?;
-        Self::write_execution_strategy_artifacts(
-            root,
-            &execution_plan,
-            request,
-            &blueprint.preferred_provider,
-            &blueprint.fallback,
-            &blueprint.selected_because,
-        )?;
-        let preferred_provider = blueprint.preferred_provider.clone();
-        let selected_because = blueprint.selected_because.clone();
-        let fallback = blueprint.fallback.clone();
         let framework_name = manifest.framework.clone();
 
         let duration_ms = total_start.elapsed().as_millis() as u64;
         let response = json!({
+            "status": "ready",
+            "analysis_version": ANALYSIS_VERSION,
+            "background_processing": true,
             "repo": request.repo,
             "repo_url": request.repo,
             "runtime": {
@@ -171,17 +148,8 @@ impl AnalyzeEngine {
                 "packageManager": runtime.package_manager,
                 "framework": manifest.framework
             },
-            "execution": blueprint,
-            "execution_plan": execution_plan,
-            "runtime_capabilities": {
-                "providers": capability_registry()
-            },
-            "execution_trace": {
-                "provider": preferred_provider,
-                "selectedBecause": selected_because,
-                "fallbacks": fallback,
-                "actualStartup": "0ms",
-                "successful": true
+            "execution": {
+                "provider": "local"
             },
             "manifest": {
                 "version": 2,
@@ -202,7 +170,7 @@ impl AnalyzeEngine {
                 "phase4_staged_analyzer": true,
                 "phase5_workspace_independent": true,
                 "phase6_progressive_enhancement_non_blocking": true,
-                "phase7_commit_cache_key": format!("{}/{}/{}", request.repo, request.branch, request.commit),
+                "phase7_commit_cache_key": true,
                 "phase8_provider_decoupled": true,
                 "phase9_runtime_registry": true,
                 "phase10_response_contract": true,
@@ -211,6 +179,57 @@ impl AnalyzeEngine {
         });
 
         Ok(AnalyzeEngineResult { payload: response })
+    }
+
+    pub fn analyze_background(root: &Path, request: &AnalyzeEngineRequest) -> Result<()> {
+        let framework = detect_framework(root);
+        let runtime = detect_runtime(root, Some(&framework.framework));
+        let execution_intelligence = AnalyzeManifest::synthesize(
+            root,
+            &framework.framework,
+            &runtime.runtime,
+            runtime.package_manager.as_deref(),
+            runtime.build.as_deref(),
+            runtime.start.as_deref(),
+            runtime.dev.as_deref(),
+            compute_confidence(&framework.framework, &runtime.runtime),
+        );
+        let execution_plan = build_execution_plan(&runtime.runtime, &framework.framework);
+        let requires_docker = execution_intelligence.workspace.requires_docker;
+        let requires_python = runtime.runtime == "python" || framework.language == "python";
+        let requires_secrets = execution_intelligence.workspace.requires_secrets;
+        let requires_browser_apis =
+            FRAMEWORKS_REQUIRING_BROWSER_APIS.contains(&framework.framework.as_str());
+        let blueprint = build_blueprint(
+            &runtime.runtime,
+            &framework.framework,
+            requires_docker,
+            requires_python,
+            requires_secrets,
+            requires_browser_apis,
+        );
+        Self::write_execution_strategy_artifacts(
+            root,
+            &execution_plan,
+            request,
+            &blueprint.preferred_provider,
+            &blueprint.fallback,
+            &blueprint.selected_because,
+        )?;
+        Self::write_json_file(
+            root.join("execution-intelligence.json"),
+            &execution_intelligence,
+        )?;
+        let summary = json!({
+            "repo": request.repo,
+            "branch": request.branch,
+            "commit": request.commit,
+            "framework": framework.framework,
+            "language": framework.language,
+            "runtime": runtime.runtime
+        });
+        Self::write_json_file(root.join("repository-summary.json"), &summary)?;
+        Ok(())
     }
 
     fn write_execution_strategy_artifacts(
@@ -286,8 +305,6 @@ fn build_runtime_manifest(
     runtime: &str,
     runtime_package_manager: Option<&str>,
     runtime_dev_command: Option<&str>,
-    preferred_provider: &str,
-    fallback_providers: &[String],
     confidence: u8,
 ) -> RuntimeManifestV2 {
     let package_manager = manifest
@@ -304,13 +321,7 @@ fn build_runtime_manifest(
         .to_string();
     let install_command = install_command_for_package_manager(&package_manager);
     let mut compatible = vec!["local".to_string(), "cloud".to_string()];
-    let mut should_include_docker = manifest.workspace.requires_docker;
-    should_include_docker |= preferred_provider
-        .to_ascii_lowercase()
-        .contains("docker");
-    should_include_docker |= fallback_providers
-        .iter()
-        .any(|provider| provider.to_ascii_lowercase().contains("docker"));
+    let should_include_docker = manifest.workspace.requires_docker;
     if should_include_docker {
         compatible.push("docker".to_string());
     }
