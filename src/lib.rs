@@ -75,6 +75,7 @@ const MIN_SERVICES_FOR_TOPOLOGY: usize = 2;
 const MIN_COORDINATION_TIMEOUT_SECS: u64 = 1;
 const INSTALL_TIMEOUT_SECS: u64 = 180;
 const INSTALL_POLL_INTERVAL_MS: u64 = 250;
+const RUNTIME_REPAIR_MAX_ATTEMPTS_DEFAULT: usize = 4;
 static WASI_KERNEL_TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MIN_BILLABLE_DURATION_SECONDS: f64 = 1.0;
 const RETRY_PENALTY_UNITS: f64 = 0.25;
@@ -1304,6 +1305,12 @@ impl FailureClassifier {
         if message.contains("eaddrinuse") || message.contains("address already in use") {
             return FailureClass::PortConflict;
         }
+        if message.contains("readiness probe timed out")
+            || message.contains("health endpoint mismatch")
+            || message.contains("incorrect port")
+        {
+            return FailureClass::PortConflict;
+        }
 
         if failure.required_artifact.is_some()
             || message.contains("dist/")
@@ -1315,6 +1322,7 @@ impl FailureClassifier {
         if message.contains("missing script")
             || message.contains("command not found")
             || message.contains("invalid startup")
+            || message.contains("spawn failed")
         {
             return FailureClass::InvalidStartupCommand;
         }
@@ -1328,6 +1336,7 @@ impl FailureClassifier {
         if message.contains("service dependency")
             || message.contains("upstream")
             || message.contains("dependency failed")
+            || message.contains("proxy routing failure")
         {
             return FailureClass::ServiceDependencyFailure;
         }
@@ -8034,6 +8043,23 @@ struct RuntimeManifestLaunchConfig {
     health_check: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeRepairInput {
+    runtime_manifest: Option<Value>,
+    execution_artifact: Option<Value>,
+    launch_logs: Vec<String>,
+    failure_message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeRepairCandidate {
+    id: String,
+    confidence: f32,
+    reason: String,
+    manifest_patch: Option<Value>,
+    start_command_override: Option<String>,
+}
+
 fn load_runtime_manifest_launch_config(repo_root: &Path) -> Option<RuntimeManifestLaunchConfig> {
     let runtime_manifest_path = repo_root.join("runtime-manifest.json");
     if let Ok(payload) = fs::read_to_string(runtime_manifest_path) {
@@ -8134,6 +8160,174 @@ fn load_execution_manifest_node_version(repo_root: &Path) -> Option<String> {
 #[cfg(test)]
 fn load_execution_manifest_package_manager(repo_root: &Path) -> Option<String> {
     load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.package_manager)
+}
+
+fn runtime_repair_attempt_limit() -> usize {
+    std::env::var("RUSTGIT_RUNTIME_RETRY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RUNTIME_REPAIR_MAX_ATTEMPTS_DEFAULT)
+}
+
+fn load_runtime_manifest_value(repo_root: &Path) -> Option<Value> {
+    let payload = fs::read_to_string(repo_root.join("runtime-manifest.json")).ok()?;
+    serde_json::from_str::<Value>(&payload).ok()
+}
+
+fn write_runtime_manifest_value(repo_root: &Path, value: &Value) -> Result<()> {
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|err| RuntimeError::CommandFailed(format!("runtime manifest serialization failed: {err}")))?;
+    fs::write(repo_root.join("runtime-manifest.json"), body)?;
+    Ok(())
+}
+
+fn replace_command_package_manager(command: &str, manager: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let mut parts = trimmed.split_whitespace();
+    let first = parts.next().unwrap_or_default();
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    if first == manager {
+        return trimmed.to_string();
+    }
+    if rest.is_empty() {
+        manager.to_string()
+    } else {
+        format!("{manager} {rest}")
+    }
+}
+
+fn build_runtime_repair_candidates(
+    input: &RuntimeRepairInput,
+    base_overrides: &LaunchOverrides,
+    fallback_command: &str,
+    fingerprint: &RepositoryFingerprint,
+) -> Vec<RuntimeRepairCandidate> {
+    let mut failure_signal = FailureSignal {
+        message: input.failure_message.clone(),
+        ..FailureSignal::default()
+    };
+    failure_signal.attempted_command = input
+        .execution_artifact
+        .as_ref()
+        .and_then(|artifact| {
+            artifact
+                .get("metadata")
+                .and_then(|metadata| metadata.get("launchCommand"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| base_overrides.start_command.clone())
+        .or_else(|| (!fallback_command.trim().is_empty()).then(|| fallback_command.to_string()));
+    failure_signal.expected_package_manager = input.runtime_manifest.as_ref().and_then(|manifest| {
+        manifest
+            .get("runtime")
+            .and_then(|runtime| runtime.get("packageManager"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    failure_signal.required_runtime = input.runtime_manifest.as_ref().and_then(|manifest| {
+        manifest
+            .get("runtime")
+            .and_then(|runtime| runtime.get("nodeVersion"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    failure_signal.detected_runtime = base_overrides.versions.get("NODE_VERSION").cloned();
+    if input
+        .launch_logs
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("module not found"))
+    {
+        failure_signal.required_artifact = Some("dependency-install".to_string());
+    }
+    let classifier = FailureClassifier;
+    let class = classifier.classify(&failure_signal, fingerprint);
+    let strategy = HealingCatalog::default().strategy_for(class, &failure_signal, fingerprint);
+    let reason = format!("{:?}", class).to_ascii_lowercase();
+
+    let mut candidates = Vec::new();
+    if let Some(mut manifest_patch) = input.runtime_manifest.clone() {
+        if manifest_patch
+            .get("runtime")
+            .is_none_or(|runtime| !runtime.is_object())
+        {
+            manifest_patch["runtime"] = json!({});
+        }
+        if manifest_patch
+            .get("network")
+            .is_none_or(|network| !network.is_object())
+        {
+            manifest_patch["network"] = json!({});
+        }
+        let start_command = failure_signal
+            .attempted_command
+            .clone()
+            .unwrap_or_else(|| fallback_command.to_string());
+        if !start_command.trim().is_empty() {
+            manifest_patch["runtime"]["startCommand"] = Value::String(
+                WorkspaceManager::auto_heal_runtime_command(&start_command),
+            );
+        }
+        if strategy.actions.contains(&RepairAction::SwitchPackageManager) {
+            if let Some(package_manager) = failure_signal.expected_package_manager.as_deref() {
+                manifest_patch["runtime"]["packageManager"] =
+                    Value::String(package_manager.to_string());
+                manifest_patch["runtime"]["installCommand"] =
+                    Value::String(format!("{package_manager} install"));
+                if let Some(current) = manifest_patch["runtime"]["startCommand"].as_str() {
+                    manifest_patch["runtime"]["startCommand"] =
+                        Value::String(replace_command_package_manager(current, package_manager));
+                }
+            }
+        }
+        if input.failure_message.to_ascii_lowercase().contains("readiness probe timed out")
+            || input.failure_message.to_ascii_lowercase().contains("health")
+        {
+            manifest_patch["network"]["healthCheck"] = Value::String("/".to_string());
+        }
+        candidates.push(RuntimeRepairCandidate {
+            id: "ai-patched-manifest".to_string(),
+            confidence: strategy.confidence,
+            reason: reason.clone(),
+            manifest_patch: Some(manifest_patch),
+            start_command_override: None,
+        });
+    }
+
+    let command_patch_source = failure_signal
+        .attempted_command
+        .clone()
+        .unwrap_or_else(|| fallback_command.to_string());
+    let command_patch = WorkspaceManager::auto_heal_runtime_command(&command_patch_source);
+    if !command_patch.trim().is_empty() && command_patch != command_patch_source {
+        candidates.push(RuntimeRepairCandidate {
+            id: "ai-patched-command".to_string(),
+            confidence: strategy.confidence.max(0.65),
+            reason: reason.clone(),
+            manifest_patch: None,
+            start_command_override: Some(command_patch),
+        });
+    }
+
+    let alternative_command = failure_signal
+        .expected_package_manager
+        .as_deref()
+        .map(|manager| replace_command_package_manager(&command_patch_source, manager))
+        .unwrap_or_else(|| command_patch_source.clone());
+    if !alternative_command.trim().is_empty() && alternative_command != command_patch_source {
+        candidates.push(RuntimeRepairCandidate {
+            id: "alternative-detected-runtime".to_string(),
+            confidence: (strategy.confidence * 0.75).max(0.50),
+            reason,
+            manifest_patch: None,
+            start_command_override: Some(alternative_command),
+        });
+    }
+    candidates
 }
 
 fn workspace_ports_from_manifest_or_framework(repo_root: &Path, framework: Framework) -> Vec<PortInfo> {
@@ -12600,6 +12794,18 @@ struct ExecutionArtifactEnvironmentSummary {
     version_overrides: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct RuntimeRepairTelemetry {
+    #[serde(rename = "repairReason", skip_serializing_if = "Option::is_none")]
+    repair_reason: Option<String>,
+    #[serde(rename = "repairConfidence", skip_serializing_if = "Option::is_none")]
+    repair_confidence: Option<f32>,
+    #[serde(rename = "successfulPatch", skip_serializing_if = "Option::is_none")]
+    successful_patch: Option<String>,
+    #[serde(rename = "finalRuntimeState")]
+    final_runtime_state: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ExecutionArtifactMetadata {
     #[serde(rename = "launchCommand")]
@@ -12618,6 +12824,8 @@ struct ExecutionArtifactMetadata {
     #[serde(rename = "environmentSummary")]
     environment_summary: ExecutionArtifactEnvironmentSummary,
     error: Option<String>,
+    #[serde(rename = "runtimeRepair", skip_serializing_if = "Option::is_none")]
+    runtime_repair: Option<RuntimeRepairTelemetry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -13398,6 +13606,7 @@ impl WorkspaceManager {
                 None,
                 None,
                 Some(message),
+                None,
             );
             return;
         }
@@ -13418,6 +13627,7 @@ impl WorkspaceManager {
                 None,
                 None,
                 Some(message),
+                None,
             );
             return;
         }
@@ -13436,6 +13646,7 @@ impl WorkspaceManager {
                     None,
                     None,
                     Some(message),
+                    None,
                 );
                 return;
             }
@@ -13478,92 +13689,195 @@ impl WorkspaceManager {
             workspace_ports_from_manifest_or_framework(Path::new(&ctx.repo_path), ctx.analysis.framework);
         workspace.network_policy = ctx.network.clone();
         workspace.resource_quotas = ctx.resources.clone();
-
-        self.set_workspace_state(id, WorkspaceState::Installing);
-        if let Err(err) = Self::run_dependency_install(&ctx, &overrides, &self.workspaces, id) {
-            let message = format!("install failed: {err}");
-            self.fail_workspace(id, message.clone());
-            self.emit_execution_artifact(
-                id,
-                launch_started.elapsed().as_millis() as u64,
-                None,
-                None,
-                Some(planned_command.clone()),
-                Some(message),
-            );
-            return;
-        }
-
-        self.set_workspace_state(id, WorkspaceState::Launching);
-        let (mut child, requested_port, provider_selected) =
-            match Self::spawn_supervised_process(&ctx, &overrides) {
-                Ok(value) => value,
-                Err(err) => {
-                    let message = format!("launch failed: {err}");
-                    self.fail_workspace(id, message.clone());
-                    self.emit_execution_artifact(
-                        id,
-                        launch_started.elapsed().as_millis() as u64,
-                        None,
-                        None,
-                        Some(planned_command.clone()),
-                        Some(message),
-                    );
-                    return;
-                }
-            };
-
-        let pid = child.id();
-        self.push_workspace_log(
-            id,
-            format!("spawned pid: {pid} on requested port {requested_port}"),
-        );
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let mut runtime = ExecutionTruth::new(id.to_string(), requested_port, pid);
-        runtime.provider_selected = provider_selected;
-        runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Launching));
-
         if let Ok(mut workspaces) = self.workspaces.lock() {
             if let Some(record) = workspaces.get_mut(id) {
                 record.workspace = workspace.clone();
                 record.execution_context = Some(ctx.clone());
-                record.child_process = Some(child);
-                record.runtime = Some(runtime);
                 record.launch_overrides = overrides.clone();
             }
         }
 
-        if let Some(stdout) = stdout {
-            Self::start_stream_reader(
-                Arc::clone(&self.workspaces),
-                id.to_string(),
-                "stdout",
-                stdout,
+        let original_manifest = load_runtime_manifest_value(&repository_root);
+        let mut current_overrides = overrides.clone();
+        let mut repair_candidates: VecDeque<RuntimeRepairCandidate> = VecDeque::new();
+        let mut retries = 0u32;
+        let mut failure_message: Option<String> = None;
+        let mut health_duration_ms: Option<u64> = None;
+        let mut repair_reason: Option<String> = None;
+        let mut repair_confidence: Option<f32> = None;
+        let mut successful_patch: Option<String> = None;
+
+        let max_attempts = runtime_repair_attempt_limit();
+        for attempt in 0..max_attempts {
+            self.set_workspace_state(id, WorkspaceState::Installing);
+            if let Err(err) = Self::run_dependency_install(&ctx, &current_overrides, &self.workspaces, id)
+            {
+                failure_message = Some(format!("install failed: {err}"));
+            } else {
+                self.set_workspace_state(id, WorkspaceState::Launching);
+                match Self::spawn_supervised_process(&ctx, &current_overrides) {
+                    Ok((mut child, requested_port, provider_selected)) => {
+                        let pid = child.id();
+                        self.push_workspace_log(
+                            id,
+                            format!("spawned pid: {pid} on requested port {requested_port}"),
+                        );
+
+                        let stdout = child.stdout.take();
+                        let stderr = child.stderr.take();
+                        let mut runtime = ExecutionTruth::new(id.to_string(), requested_port, pid);
+                        runtime.provider_selected = provider_selected;
+                        runtime
+                            .update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Launching));
+
+                        if let Ok(mut workspaces) = self.workspaces.lock() {
+                            if let Some(record) = workspaces.get_mut(id) {
+                                record.child_process = Some(child);
+                                record.runtime = Some(runtime);
+                                record.launch_overrides = current_overrides.clone();
+                            }
+                        }
+
+                        if let Some(stdout) = stdout {
+                            Self::start_stream_reader(
+                                Arc::clone(&self.workspaces),
+                                id.to_string(),
+                                "stdout",
+                                stdout,
+                            );
+                        }
+                        if let Some(stderr) = stderr {
+                            Self::start_stream_reader(
+                                Arc::clone(&self.workspaces),
+                                id.to_string(),
+                                "stderr",
+                                stderr,
+                            );
+                        }
+
+                        self.set_workspace_state(id, WorkspaceState::Initializing);
+                        let health_started = Instant::now();
+                        match self.wait_for_runtime_readiness(id) {
+                            Ok(()) => {
+                                health_duration_ms =
+                                    Some(health_started.elapsed().as_millis() as u64);
+                                failure_message = None;
+                                break;
+                            }
+                            Err(err) => {
+                                failure_message = Some(format!("runtime failed: {err}"));
+                                health_duration_ms =
+                                    Some(health_started.elapsed().as_millis() as u64);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        failure_message = Some(format!("launch failed: {err}"));
+                    }
+                }
+            }
+
+            let Some(current_failure) = failure_message.clone() else {
+                break;
+            };
+            self.fail_workspace(id, current_failure.clone());
+            self.emit_execution_artifact(
+                id,
+                launch_started.elapsed().as_millis() as u64,
+                health_duration_ms,
+                Some(retries),
+                Some(planned_command.clone()),
+                Some(current_failure.clone()),
+                Some(RuntimeRepairTelemetry {
+                    repair_reason: repair_reason.clone(),
+                    repair_confidence: repair_confidence,
+                    successful_patch: None,
+                    final_runtime_state: "failed".to_string(),
+                }),
             );
-        }
-        if let Some(stderr) = stderr {
-            Self::start_stream_reader(
-                Arc::clone(&self.workspaces),
-                id.to_string(),
-                "stderr",
-                stderr,
+
+            if let Ok(mut workspaces) = self.workspaces.lock() {
+                if let Some(record) = workspaces.get_mut(id) {
+                    if let Some(child) = record.child_process.as_mut() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    record.child_process = None;
+                    record.runtime = None;
+                }
+            }
+
+            if repair_candidates.is_empty() {
+                let execution_artifact = fs::read_to_string(workspace_root.join("execution-artifact.json"))
+                    .ok()
+                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok());
+                let launch_logs = self
+                    .workspaces
+                    .lock()
+                    .ok()
+                    .and_then(|workspaces| workspaces.get(id).map(|record| record.logs.clone()))
+                    .unwrap_or_default();
+                let input = RuntimeRepairInput {
+                    runtime_manifest: load_runtime_manifest_value(&repository_root),
+                    execution_artifact,
+                    launch_logs,
+                    failure_message: current_failure,
+                };
+                repair_candidates = build_runtime_repair_candidates(
+                    &input,
+                    &overrides,
+                    &planned_command,
+                    &ctx.analysis.fingerprint,
+                )
+                .into();
+                if let Some(first) = repair_candidates.front() {
+                    repair_reason = Some(first.reason.clone());
+                    repair_confidence = Some(first.confidence);
+                }
+            }
+
+            if attempt + 1 >= max_attempts {
+                break;
+            }
+            let Some(candidate) = repair_candidates.pop_front() else {
+                break;
+            };
+            if let Some(manifest_patch) = candidate.manifest_patch.as_ref() {
+                let _ = write_runtime_manifest_value(&repository_root, manifest_patch);
+            }
+            current_overrides = overrides.clone();
+            if let Some(start_command) = candidate.start_command_override.as_ref() {
+                current_overrides.start_command = Some(start_command.clone());
+            }
+            retries = retries.saturating_add(1);
+            successful_patch = Some(candidate.id.clone());
+            self.push_workspace_log(
+                id,
+                format!(
+                    "runtime repair retry {retries}: applying {} (confidence {:.2})",
+                    candidate.id, candidate.confidence
+                ),
             );
         }
 
-        self.set_workspace_state(id, WorkspaceState::Initializing);
-        let health_started = Instant::now();
-        if let Err(err) = self.wait_for_runtime_readiness(id) {
-            let message = format!("runtime failed: {err}");
+        if let Some(message) = failure_message {
+            if let Some(manifest) = original_manifest.as_ref() {
+                let _ = write_runtime_manifest_value(&repository_root, manifest);
+            }
             self.fail_workspace(id, message.clone());
             self.emit_execution_artifact(
                 id,
                 launch_started.elapsed().as_millis() as u64,
-                Some(health_started.elapsed().as_millis() as u64),
-                None,
-                Some(planned_command.clone()),
+                health_duration_ms,
+                Some(retries),
+                Some(planned_command),
                 Some(message),
+                Some(RuntimeRepairTelemetry {
+                    repair_reason,
+                    repair_confidence,
+                    successful_patch: None,
+                    final_runtime_state: "failed".to_string(),
+                }),
             );
             return;
         }
@@ -13571,8 +13885,7 @@ impl WorkspaceManager {
         if let Ok(mut workspaces) = self.workspaces.lock() {
             if let Some(record) = workspaces.get_mut(id) {
                 if let Some(runtime) = record.runtime.as_mut() {
-                    runtime
-                        .update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
+                    runtime.update_from_event(ExecutionTruthEvent::Lifecycle(WorkspaceState::Ready));
                     record.workspace.state = runtime.lifecycle_state;
                 }
                 Self::append_capped(&mut record.logs, "workspace ready".to_string());
@@ -13582,10 +13895,16 @@ impl WorkspaceManager {
         self.emit_execution_artifact(
             id,
             launch_started.elapsed().as_millis() as u64,
-            Some(health_started.elapsed().as_millis() as u64),
-            None,
+            health_duration_ms,
+            Some(retries),
             Some(planned_command),
             None,
+            Some(RuntimeRepairTelemetry {
+                repair_reason,
+                repair_confidence,
+                successful_patch: successful_patch.or_else(|| Some("original-manifest".to_string())),
+                final_runtime_state: "ready".to_string(),
+            }),
         );
         self.start_process_monitor(id);
     }
@@ -13996,6 +14315,7 @@ impl WorkspaceManager {
         retries: Option<u32>,
         launch_command: Option<String>,
         error: Option<String>,
+        runtime_repair: Option<RuntimeRepairTelemetry>,
     ) {
         let snapshot = {
             let Ok(workspaces) = self.workspaces.lock() else {
@@ -14109,6 +14429,7 @@ impl WorkspaceManager {
                 proxy_endpoint: proxy_url,
                 environment_summary,
                 error,
+                runtime_repair,
             },
         };
 
@@ -21356,6 +21677,45 @@ dependencies:
     }
 
     #[test]
+    fn runtime_repair_candidates_follow_manifest_command_runtime_order() {
+        let input = RuntimeRepairInput {
+            runtime_manifest: Some(json!({
+                "runtime": {
+                    "startCommand": "npm run dev",
+                    "packageManager": "pnpm",
+                    "installCommand": "npm install",
+                    "nodeVersion": "20"
+                },
+                "network": {
+                    "healthCheck": "/ready"
+                }
+            })),
+            execution_artifact: Some(json!({
+                "metadata": {
+                    "launchCommand": "npm run dev"
+                }
+            })),
+            launch_logs: vec!["proxy routing failure".to_string()],
+            failure_message: "readiness probe timed out".to_string(),
+        };
+        let candidates = build_runtime_repair_candidates(
+            &input,
+            &LaunchOverrides::default(),
+            "npm run dev",
+            &RepositoryFingerprint::default(),
+        );
+        let ids = candidates.iter().map(|candidate| candidate.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "ai-patched-manifest",
+                "ai-patched-command",
+                "alternative-detected-runtime"
+            ]
+        );
+    }
+
+    #[test]
     fn begin_launch_persists_preheal_overrides_for_retries() {
         let runtime_root = temp_dir("runtime-root-overrides");
         let manager = WorkspaceManager::new(&runtime_root);
@@ -21420,6 +21780,22 @@ dependencies:
             artifact["metadata"]["launchCommand"].as_str(),
             Some("python3 -m http.server {PORT}")
         );
+        let runtime_repair = artifact
+            .get("metadata")
+            .and_then(|metadata| metadata.get("runtimeRepair"))
+            .expect("runtime repair telemetry");
+        assert_eq!(
+            runtime_repair
+                .get("successfulPatch")
+                .and_then(Value::as_str),
+            Some("original-manifest")
+        );
+        assert_eq!(
+            runtime_repair
+                .get("finalRuntimeState")
+                .and_then(Value::as_str),
+            Some("ready")
+        );
         assert!(artifact["startupTimeMs"].as_u64().unwrap_or_default() > 0);
         manager.stop(&id).expect("stop workspace");
     }
@@ -21454,6 +21830,16 @@ dependencies:
             .as_str()
             .unwrap_or_default()
             .contains("launch failed"));
+        let runtime_repair = artifact
+            .get("metadata")
+            .and_then(|metadata| metadata.get("runtimeRepair"))
+            .expect("runtime repair telemetry");
+        assert_eq!(
+            runtime_repair
+                .get("finalRuntimeState")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
     }
 
     #[test]
