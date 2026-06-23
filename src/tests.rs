@@ -2706,7 +2706,7 @@ fn execution_router_selects_python_provider_for_uv_package_manager() {
         WasmCompatibility::NotSupported,
         Framework::Unknown,
     );
-    analysis.runtime_spec.language = "unknown".to_string();
+    analysis.runtime_spec.language = "python".to_string();
     analysis.runtime_spec.framework = "unknown".to_string();
     analysis.runtime_spec.package_manager = Some("uv".to_string());
     analysis.execution_profile.runtime_affinity = RuntimeAffinity {

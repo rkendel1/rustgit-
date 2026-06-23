@@ -219,6 +219,7 @@ pub enum RuntimeType {
     Rust,
     Go,
     Python,
+    Java,
     Static,
     Unknown,
 }
@@ -9877,6 +9878,7 @@ fn runtime_kind_label(runtime_kind: RuntimeKind) -> &'static str {
         RuntimeKind::Python => "python",
         RuntimeKind::Rust => "rust",
         RuntimeKind::Go => "go",
+        RuntimeKind::Java => "java",
         RuntimeKind::Wasm => "wasm",
         RuntimeKind::Static => "static",
         RuntimeKind::Unknown => "unknown",
@@ -15757,6 +15759,7 @@ fn runtime_kind_from_runtime_type(runtime: RuntimeType) -> RuntimeKind {
         RuntimeType::Rust => RuntimeKind::Rust,
         RuntimeType::Go => RuntimeKind::Go,
         RuntimeType::Python => RuntimeKind::Python,
+        RuntimeType::Java => RuntimeKind::Java,
         RuntimeType::Wasm => RuntimeKind::Wasm,
         RuntimeType::Static => RuntimeKind::Static,
         RuntimeType::Unknown => RuntimeKind::Unknown,
@@ -15929,6 +15932,10 @@ fn runtime_affinity_for_classification(
             preferred_provider: "PythonExecutionProvider".to_string(),
             fallback_providers: vec!["NodeRuntimeProvider".to_string()],
         },
+        RuntimeType::Java => RuntimeAffinity {
+            preferred_provider: "JavaExecutionProvider".to_string(),
+            fallback_providers: vec!["RustRuntimeProvider".to_string()],
+        },
         RuntimeType::Go => RuntimeAffinity {
             preferred_provider: "GoExecutionProvider".to_string(),
             fallback_providers: vec!["RustRuntimeProvider".to_string()],
@@ -15995,6 +16002,7 @@ fn framework_for_runtime(runtime: RuntimeType) -> Framework {
         RuntimeType::Rust => Framework::Rust,
         RuntimeType::Go => Framework::Go,
         RuntimeType::Python => Framework::Python,
+        RuntimeType::Java => Framework::Unknown,
         RuntimeType::Unknown => Framework::Unknown,
     }
 }
@@ -16005,7 +16013,10 @@ fn language_for_runtime(runtime: RuntimeType) -> Language {
         RuntimeType::Rust => Language::Rust,
         RuntimeType::Go => Language::Go,
         RuntimeType::Python => Language::Python,
-        RuntimeType::Wasm | RuntimeType::Static | RuntimeType::Unknown => Language::Unknown,
+        RuntimeType::Wasm
+        | RuntimeType::Java
+        | RuntimeType::Static
+        | RuntimeType::Unknown => Language::Unknown,
     }
 }
 
@@ -18009,7 +18020,7 @@ impl ExecutionProvider for JavaExecutionProvider {
     }
 
     fn runtime(&self) -> RuntimeType {
-        RuntimeType::Unknown
+        RuntimeType::Java
     }
 
     fn can_handle(&self, ctx: &ExecutionContext) -> bool {
@@ -18568,6 +18579,10 @@ fn cache_artifacts_for_image(image: &ExecutionImage) -> Vec<String> {
         RuntimeType::Go => {
             artifacts.push("go-mod-cache".to_string());
         }
+        RuntimeType::Java => {
+            artifacts.push("maven-cache".to_string());
+            artifacts.push("gradle-cache".to_string());
+        }
         RuntimeType::Static | RuntimeType::Unknown => {}
     }
     artifacts
@@ -19015,6 +19030,7 @@ fn runtime_type_to_agent_label(runtime: RuntimeType) -> &'static str {
         RuntimeType::Rust => "rust",
         RuntimeType::Go => "go",
         RuntimeType::Python => "python",
+        RuntimeType::Java => "java",
         RuntimeType::Static => "static",
         RuntimeType::Unknown => "unknown",
     }
@@ -19587,7 +19603,7 @@ fn service_role(service: &ServiceDefinition) -> ServiceRole {
                 ServiceRole::Backend
             }
         }
-        RuntimeType::Python | RuntimeType::Rust | RuntimeType::Go => {
+        RuntimeType::Python | RuntimeType::Rust | RuntimeType::Go | RuntimeType::Java => {
             if matches!(name.as_str(), "web" | "frontend" | "ui") {
                 ServiceRole::Frontend
             } else {
@@ -19620,6 +19636,12 @@ fn service_install_command(service: &ServiceDefinition) -> Option<String> {
         RuntimeType::Python => Some(format!(
             "cd {service_root} && python -m pip install -r requirements.txt"
         )),
+        RuntimeType::Java => Some(
+            match service.package_manager.as_deref().unwrap_or("maven") {
+                "gradle" => format!("cd {service_root} && ./gradlew dependencies"),
+                _ => format!("cd {service_root} && mvn dependency:resolve"),
+            },
+        ),
         _ => None,
     }
 }
@@ -19636,6 +19658,10 @@ fn service_build_command(service: &ServiceDefinition) -> String {
         RuntimeType::Rust => format!("cd {root} && cargo build"),
         RuntimeType::Go => format!("cd {root} && go build ./..."),
         RuntimeType::Python => format!("cd {root} && python -m compileall ."),
+        RuntimeType::Java => match service.package_manager.as_deref().unwrap_or("maven") {
+            "gradle" => format!("cd {root} && ./gradlew build"),
+            _ => format!("cd {root} && mvn package"),
+        },
         RuntimeType::Static => format!("cd {root}"),
         RuntimeType::Wasm | RuntimeType::Unknown => format!("cd {root}"),
     }
