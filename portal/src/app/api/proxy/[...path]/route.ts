@@ -226,7 +226,12 @@ async function proxyRequest(
     }
     try {
       upstreamResponse = await requestPath(legacyFallbackPath);
-    } catch {
+    } catch (fallbackError) {
+      console.warn("Proxy legacy fallback request failed after upstream error", {
+        path: joinedPath,
+        fallbackPath: legacyFallbackPath,
+        error: fallbackError,
+      });
       return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
     }
   }
@@ -234,6 +239,11 @@ async function proxyRequest(
     try {
       upstreamResponse = await requestPath(legacyFallbackPath);
     } catch (error) {
+      console.warn("Proxy legacy fallback request failed after 404 response", {
+        path: joinedPath,
+        fallbackPath: legacyFallbackPath,
+        error,
+      });
       return upstreamFailureResponse(error, joinedPath, originDecision.allowedOrigin);
     }
   }
