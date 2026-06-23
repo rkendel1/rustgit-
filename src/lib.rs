@@ -12288,6 +12288,10 @@ pub struct ExecutionTruth {
     pub started_at_unix_ms: u128,
     #[serde(skip_serializing)]
     pub process_alive: bool,
+    #[serde(skip_serializing)]
+    pub readiness_attempts: u32,
+    #[serde(skip_serializing)]
+    pub health_check_duration_ms: u64,
 }
 
 impl ExecutionTruth {
@@ -12312,6 +12316,8 @@ impl ExecutionTruth {
                 .unwrap_or_default()
                 .as_millis(),
             process_alive: true,
+            readiness_attempts: 0,
+            health_check_duration_ms: 0,
         }
     }
 
@@ -12582,6 +12588,59 @@ struct LocalWorkspaceRecord {
     child_process: Option<Child>,
     runtime: Option<ExecutionTruth>,
     launch_overrides: LaunchOverrides,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionArtifactEnvironmentSummary {
+    #[serde(rename = "overrideCount")]
+    override_count: usize,
+    #[serde(rename = "environmentVariables")]
+    environment_variables: Vec<String>,
+    #[serde(rename = "versionOverrides")]
+    version_overrides: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionArtifactMetadata {
+    #[serde(rename = "launchCommand")]
+    launch_command: Option<String>,
+    #[serde(rename = "startupDurationMs")]
+    startup_duration_ms: u64,
+    #[serde(rename = "healthCheckDurationMs")]
+    health_check_duration_ms: Option<u64>,
+    retries: u32,
+    #[serde(rename = "assignedRuntime")]
+    assigned_runtime: String,
+    #[serde(rename = "assignedProvider")]
+    assigned_provider: String,
+    #[serde(rename = "proxyEndpoint")]
+    proxy_endpoint: Option<String>,
+    #[serde(rename = "environmentSummary")]
+    environment_summary: ExecutionArtifactEnvironmentSummary,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionArtifactRecord {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    #[serde(rename = "executionId")]
+    execution_id: String,
+    provider: String,
+    runtime: String,
+    #[serde(rename = "packageManager")]
+    package_manager: Option<String>,
+    #[serde(rename = "assignedPort")]
+    assigned_port: Option<u16>,
+    #[serde(rename = "proxyUrl")]
+    proxy_url: Option<String>,
+    #[serde(rename = "startupTimeMs")]
+    startup_time_ms: u64,
+    #[serde(rename = "healthStatus")]
+    health_status: String,
+    #[serde(rename = "exitCode")]
+    exit_code: Option<i32>,
+    metadata: ExecutionArtifactMetadata,
 }
 
 pub struct ExecutionEngine {
@@ -13317,6 +13376,7 @@ impl WorkspaceManager {
         repo_url: &str,
         overrides: LaunchOverrides,
     ) {
+        let launch_started = Instant::now();
         let workspace_root = self.root.join("workspaces").join(id);
         let repository_root = workspace_root.join("repo");
 
@@ -13329,7 +13389,16 @@ impl WorkspaceManager {
         };
 
         if let Err(e) = fs::create_dir_all(&workspace_root) {
-            self.fail_workspace(id, format!("workspace failed: {e}"));
+            let message = format!("workspace failed: {e}");
+            self.fail_workspace(id, message.clone());
+            self.emit_execution_artifact(
+                id,
+                launch_started.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+                Some(message),
+            );
             return;
         }
 
@@ -13340,7 +13409,16 @@ impl WorkspaceManager {
         if let Err(e) =
             self.materialize_repository(repo_url, overrides.branch.as_deref(), &repository_root)
         {
-            self.fail_workspace(id, format!("workspace failed: {e}"));
+            let message = format!("workspace failed: {e}");
+            self.fail_workspace(id, message.clone());
+            self.emit_execution_artifact(
+                id,
+                launch_started.elapsed().as_millis() as u64,
+                None,
+                None,
+                None,
+                Some(message),
+            );
             return;
         }
         self.push_workspace_log(id, format!("materialized repository: {repo_url}"));
@@ -13349,7 +13427,16 @@ impl WorkspaceManager {
         let analysis = match analyze_repository(&repository_root) {
             Ok(a) => a,
             Err(e) => {
-                self.fail_workspace(id, format!("workspace failed: {e}"));
+                let message = format!("workspace failed: {e}");
+                self.fail_workspace(id, message.clone());
+                self.emit_execution_artifact(
+                    id,
+                    launch_started.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                    None,
+                    Some(message),
+                );
                 return;
             }
         };
@@ -13394,7 +13481,16 @@ impl WorkspaceManager {
 
         self.set_workspace_state(id, WorkspaceState::Installing);
         if let Err(err) = Self::run_dependency_install(&ctx, &overrides, &self.workspaces, id) {
-            self.fail_workspace(id, format!("install failed: {err}"));
+            let message = format!("install failed: {err}");
+            self.fail_workspace(id, message.clone());
+            self.emit_execution_artifact(
+                id,
+                launch_started.elapsed().as_millis() as u64,
+                None,
+                None,
+                Some(planned_command.clone()),
+                Some(message),
+            );
             return;
         }
 
@@ -13403,7 +13499,16 @@ impl WorkspaceManager {
             match Self::spawn_supervised_process(&ctx, &overrides) {
                 Ok(value) => value,
                 Err(err) => {
-                    self.fail_workspace(id, format!("launch failed: {err}"));
+                    let message = format!("launch failed: {err}");
+                    self.fail_workspace(id, message.clone());
+                    self.emit_execution_artifact(
+                        id,
+                        launch_started.elapsed().as_millis() as u64,
+                        None,
+                        None,
+                        Some(planned_command.clone()),
+                        Some(message),
+                    );
                     return;
                 }
             };
@@ -13448,8 +13553,18 @@ impl WorkspaceManager {
         }
 
         self.set_workspace_state(id, WorkspaceState::Initializing);
+        let health_started = Instant::now();
         if let Err(err) = self.wait_for_runtime_readiness(id) {
-            self.fail_workspace(id, format!("runtime failed: {err}"));
+            let message = format!("runtime failed: {err}");
+            self.fail_workspace(id, message.clone());
+            self.emit_execution_artifact(
+                id,
+                launch_started.elapsed().as_millis() as u64,
+                Some(health_started.elapsed().as_millis() as u64),
+                None,
+                Some(planned_command.clone()),
+                Some(message),
+            );
             return;
         }
 
@@ -13464,6 +13579,14 @@ impl WorkspaceManager {
             }
         }
 
+        self.emit_execution_artifact(
+            id,
+            launch_started.elapsed().as_millis() as u64,
+            Some(health_started.elapsed().as_millis() as u64),
+            None,
+            Some(planned_command),
+            None,
+        );
         self.start_process_monitor(id);
     }
 
@@ -13776,6 +13899,7 @@ impl WorkspaceManager {
         const READINESS_POLL_INTERVAL_MS: u64 = 500;
         const READINESS_TIMEOUT_MS: u64 = 30_000;
         const MAX_ATTEMPTS: usize = (READINESS_TIMEOUT_MS / READINESS_POLL_INTERVAL_MS) as usize;
+        let readiness_started = Instant::now();
         let health_check = self
             .workspaces
             .lock()
@@ -13788,7 +13912,7 @@ impl WorkspaceManager {
             })
             .unwrap_or_else(|| "/".to_string());
 
-        for _ in 0..MAX_ATTEMPTS {
+        for attempt in 0..MAX_ATTEMPTS {
             let mut exited_status = None;
             if let Ok(mut workspaces) = self.workspaces.lock() {
                 let Some(record) = workspaces.get_mut(id) else {
@@ -13800,6 +13924,7 @@ impl WorkspaceManager {
                     }
                 }
                 if let Some(runtime) = record.runtime.as_mut() {
+                    runtime.readiness_attempts = (attempt + 1) as u32;
                     runtime.update_from_event(ExecutionTruthEvent::ProcessAlive(
                         exited_status.is_none(),
                     ));
@@ -13809,6 +13934,8 @@ impl WorkspaceManager {
                         match Self::http_probe(port, &health_check) {
                             Ok(status) => {
                                 runtime.update_from_event(ExecutionTruthEvent::HttpProbeOk(status));
+                                runtime.health_check_duration_ms =
+                                    readiness_started.elapsed().as_millis() as u64;
                                 return Ok(());
                             }
                             Err(err) => {
@@ -13832,6 +13959,8 @@ impl WorkspaceManager {
                     if let Some(record) = workspaces.get_mut(id) {
                         if let Some(runtime) = record.runtime.as_mut() {
                             runtime.update_from_event(ExecutionTruthEvent::ProcessExited(code));
+                            runtime.health_check_duration_ms =
+                                readiness_started.elapsed().as_millis() as u64;
                         }
                         record.workspace.state = WorkspaceState::Failed;
                     }
@@ -13848,6 +13977,8 @@ impl WorkspaceManager {
             if let Some(record) = workspaces.get_mut(id) {
                 if let Some(runtime) = record.runtime.as_mut() {
                     runtime.update_from_event(ExecutionTruthEvent::ReadinessTimedOut);
+                    runtime.health_check_duration_ms =
+                        readiness_started.elapsed().as_millis() as u64;
                 }
                 record.workspace.state = WorkspaceState::Failed;
             }
@@ -13855,6 +13986,138 @@ impl WorkspaceManager {
         Err(RuntimeError::CommandFailed(
             "readiness probe timed out".to_string(),
         ))
+    }
+
+    fn emit_execution_artifact(
+        &self,
+        id: &str,
+        startup_duration_ms: u64,
+        health_check_duration_ms: Option<u64>,
+        retries: Option<u32>,
+        launch_command: Option<String>,
+        error: Option<String>,
+    ) {
+        let snapshot = {
+            let Ok(workspaces) = self.workspaces.lock() else {
+                return;
+            };
+            let Some(record) = workspaces.get(id) else {
+                return;
+            };
+            (
+                record.workspace.root.clone(),
+                record.workspace.state,
+                record.runtime.clone(),
+                record.execution_context.clone(),
+                record.launch_overrides.clone(),
+            )
+        };
+
+        let (workspace_root, workspace_state, runtime, context, launch_overrides) = snapshot;
+        let manifest_config =
+            context.as_ref().and_then(|ctx| load_runtime_manifest_launch_config(Path::new(&ctx.repo_path)));
+        let runtime_label = runtime_label_for_context(context.as_ref(), manifest_config.as_ref());
+        let package_manager = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.package_manager.clone());
+        let provider = runtime
+            .as_ref()
+            .map(|r| r.provider_selected.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let assigned_port = runtime
+            .as_ref()
+            .and_then(|r| r.actual_port.or(Some(r.requested_port)));
+        let proxy_url = assigned_port.map(|port| format!("http://127.0.0.1:{port}"));
+        let health_status = if workspace_state == WorkspaceState::Failed {
+            "failed".to_string()
+        } else if runtime.as_ref().map(|r| r.http_ready).unwrap_or(false) {
+            "healthy".to_string()
+        } else if runtime.as_ref().map(|r| r.process_alive).unwrap_or(false) {
+            "starting".to_string()
+        } else {
+            "unknown".to_string()
+        };
+        let exit_code = if let Some(code) = runtime.as_ref().and_then(|r| r.exit_code) {
+            Some(code)
+        } else if health_status == "healthy" {
+            Some(0)
+        } else if workspace_state == WorkspaceState::Failed {
+            Some(1)
+        } else {
+            None
+        };
+        let startup_time_ms = runtime
+            .as_ref()
+            .map(|r| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .saturating_sub(r.started_at_unix_ms) as u64
+            })
+            .unwrap_or(startup_duration_ms);
+        let runtime_health_check_duration_ms = runtime
+            .as_ref()
+            .map(|r| r.health_check_duration_ms)
+            .filter(|duration| *duration > 0);
+        let retry_count = retries.unwrap_or_else(|| {
+            runtime
+                .as_ref()
+                .map(|r| {
+                    if r.readiness_attempts > 0 {
+                        r.readiness_attempts - 1
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
+        });
+
+        let mut environment_variables = launch_overrides
+            .environment
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        environment_variables.sort();
+        let mut version_overrides = launch_overrides.versions.keys().cloned().collect::<Vec<_>>();
+        version_overrides.sort();
+        let environment_summary = ExecutionArtifactEnvironmentSummary {
+            override_count: environment_variables.len() + version_overrides.len(),
+            environment_variables,
+            version_overrides,
+        };
+
+        let artifact = ExecutionArtifactRecord {
+            schema_version: 1,
+            execution_id: id.to_string(),
+            provider: provider.clone(),
+            runtime: runtime_label.clone(),
+            package_manager,
+            assigned_port,
+            proxy_url: proxy_url.clone(),
+            startup_time_ms,
+            health_status,
+            exit_code,
+            metadata: ExecutionArtifactMetadata {
+                launch_command,
+                startup_duration_ms,
+                health_check_duration_ms: health_check_duration_ms
+                    .or(runtime_health_check_duration_ms),
+                retries: retry_count,
+                assigned_runtime: runtime_label,
+                assigned_provider: provider,
+                proxy_endpoint: proxy_url,
+                environment_summary,
+                error,
+            },
+        };
+
+        if fs::create_dir_all(&workspace_root).is_err() {
+            return;
+        }
+        if let Ok(body) = serde_json::to_string_pretty(&artifact) {
+            let _ = fs::write(workspace_root.join("execution-artifact.json"), body);
+        }
     }
 
     // Returns (child, assigned_port)
@@ -21126,6 +21389,71 @@ dependencies:
                 .map(String::as_str),
             Some("20")
         );
+    }
+
+    #[test]
+    fn complete_launch_writes_execution_artifact_for_successful_runs() {
+        let runtime_root = temp_dir("runtime-root-execution-artifact-success");
+        let local_repo = temp_dir("local-repo-execution-artifact-success");
+        fs::write(local_repo.join("index.html"), "<h1>hello</h1>").expect("write index.html");
+
+        let manager = WorkspaceManager::new(&runtime_root);
+        let overrides = LaunchOverrides {
+            branch: None,
+            start_command: Some("python3 -m http.server {PORT}".to_string()),
+            environment: BTreeMap::new(),
+            versions: BTreeMap::new(),
+        };
+        let id = manager.begin_launch_with_overrides(local_repo.to_string_lossy().as_ref(), overrides.clone());
+        manager.complete_launch_with_overrides(&id, local_repo.to_string_lossy().as_ref(), overrides);
+
+        let workspace = manager.get_workspace(&id).expect("workspace");
+        let artifact_path = workspace.root.join("execution-artifact.json");
+        assert!(artifact_path.exists(), "execution artifact should be written");
+        let payload = fs::read_to_string(&artifact_path).expect("read execution artifact");
+        let artifact: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse execution artifact");
+        assert_eq!(artifact["schemaVersion"].as_u64(), Some(1));
+        assert_eq!(artifact["executionId"].as_str(), Some(id.as_str()));
+        assert_eq!(artifact["healthStatus"].as_str(), Some("healthy"));
+        assert_eq!(
+            artifact["metadata"]["launchCommand"].as_str(),
+            Some("python3 -m http.server {PORT}")
+        );
+        assert!(artifact["startupTimeMs"].as_u64().unwrap_or_default() > 0);
+        manager.stop(&id).expect("stop workspace");
+    }
+
+    #[test]
+    fn complete_launch_writes_execution_artifact_for_failed_runs() {
+        let runtime_root = temp_dir("runtime-root-execution-artifact-failure");
+        let local_repo = temp_dir("local-repo-execution-artifact-failure");
+        fs::write(local_repo.join("index.html"), "<h1>hello</h1>").expect("write index.html");
+
+        let manager = WorkspaceManager::new(&runtime_root);
+        let overrides = LaunchOverrides {
+            branch: None,
+            start_command: Some("command-that-does-not-exist".to_string()),
+            environment: BTreeMap::new(),
+            versions: BTreeMap::new(),
+        };
+        let id = manager.begin_launch_with_overrides(local_repo.to_string_lossy().as_ref(), overrides.clone());
+        manager.complete_launch_with_overrides(&id, local_repo.to_string_lossy().as_ref(), overrides);
+
+        let workspace = manager.get_workspace(&id).expect("workspace");
+        assert_eq!(workspace.state, WorkspaceState::Failed);
+        let artifact_path = workspace.root.join("execution-artifact.json");
+        assert!(artifact_path.exists(), "execution artifact should be written");
+        let payload = fs::read_to_string(&artifact_path).expect("read execution artifact");
+        let artifact: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse execution artifact");
+        assert_eq!(artifact["executionId"].as_str(), Some(id.as_str()));
+        assert_eq!(artifact["healthStatus"].as_str(), Some("failed"));
+        assert_eq!(artifact["exitCode"].as_i64(), Some(1));
+        assert!(artifact["metadata"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("launch failed"));
     }
 
     #[test]
