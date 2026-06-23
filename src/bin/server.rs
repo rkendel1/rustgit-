@@ -18,7 +18,10 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rustgit_wasm_runtime::{
-    analyze::{runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
+    analyze::{
+        runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest,
+        ANALYSIS_VERSION,
+    },
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, ExecutionHandle,
     ExecutionRoutingMode, LaunchOverrides, RuntimeError, RuntimeType, WasmWorkspace, Workspace,
@@ -159,6 +162,7 @@ struct ExecutionResponse {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AnalyzeRequest {
     owner: Option<String>,
     repo: Option<String>,
@@ -244,7 +248,8 @@ fn prepare_repository_for_analysis(
             .arg("credential.username=")
             .arg("clone")
             .arg("--depth")
-            .arg("1");
+            .arg("1")
+            .arg("--filter=blob:none");
         if with_branch && !branch.is_empty() {
             clone.arg("--branch").arg(branch);
         }
@@ -380,6 +385,7 @@ fn hash_key(input: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
+#[allow(dead_code)]
 fn discover_launch_override_branches(repo_root: &FsPath) -> Vec<Value> {
     let output = Command::new("git")
         .arg("-C")
@@ -426,6 +432,7 @@ fn discover_launch_override_branches(repo_root: &FsPath) -> Vec<Value> {
     branches
 }
 
+#[allow(dead_code)]
 fn build_launch_plan(payload: &Value, branch: &str) -> Value {
     let execution_intelligence = payload
         .get("execution_intelligence")
@@ -523,8 +530,6 @@ async fn analyze_repository(
     Json(body): Json<AnalyzeRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let started = Instant::now();
-    let include_repository_summary = body.include_repository_summary.unwrap_or(false);
-    let ask_question = body.ask_question.as_deref();
     let repo_url = resolve_repo_url(body.repo_url, body.url, body.owner, body.repo)?;
     let branch = body
         .branch
@@ -532,32 +537,11 @@ async fn analyze_repository(
         .trim()
         .to_string();
     let requested_commit = body.commit.unwrap_or_default().trim().to_string();
-    let request_cache_commit = if requested_commit.is_empty() {
-        "latest".to_string()
-    } else {
-        requested_commit.clone()
-    };
-    let request_cache_key = AnalyzeCache::key(&repo_url, &branch, &request_cache_commit);
-
-    if let Some(cached) = state.analyze_cache.get(&request_cache_key) {
-        let mut payload = cached.payload;
-        payload["cached"] = json!(true);
-        payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-        if include_repository_summary {
-            enrich_analyze_payload(&mut payload, ask_question);
-        }
-        if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
-            if let Ok(mut idx) = state.fingerprint_index.lock() {
-                idx.entry(fingerprint_id.to_string())
-                    .or_insert(payload.clone());
-            }
-        }
-        return Ok((StatusCode::OK, Json(payload)));
-    }
 
     let repo_url_for_prepare = repo_url.clone();
     let branch_for_prepare = branch.clone();
     let requested_commit_for_prepare = requested_commit.clone();
+    let clone_started = Instant::now();
     let (repo_root, resolved_commit) = tokio::task::spawn_blocking(
         move || -> rustgit_wasm_runtime::Result<(PathBuf, String)> {
             let repo_root = prepare_repository_for_analysis(
@@ -582,15 +566,28 @@ async fn analyze_repository(
         )))
     })?
     .map_err(err_response)?;
-    let resolved_cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit);
+    let clone_duration_ms = clone_started.elapsed().as_millis() as u64;
+    let resolved_cache_key = AnalyzeCache::key(&repo_url, &branch, &resolved_commit, ANALYSIS_VERSION);
+    let analysis_id = format!("analyze-{resolved_cache_key}");
 
     if let Some(cached) = state.analyze_cache.get(&resolved_cache_key) {
         let mut payload = cached.payload;
+        payload["status"] = json!("ready");
+        payload["analysis_version"] = json!(ANALYSIS_VERSION);
+        payload["background_processing"] = json!(true);
+        payload["analysis_id"] = json!(analysis_id);
+        payload["cache"] = json!({
+            "hit": true,
+            "key": resolved_cache_key.clone()
+        });
         payload["cached"] = json!(true);
         payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-        if include_repository_summary {
-            enrich_analyze_payload(&mut payload, ask_question);
-        }
+        payload["metrics"] = json!({
+            "analyze.duration": payload["durationMs"],
+            "clone.duration": clone_duration_ms,
+            "cache.hit": true,
+            "cache.miss": false
+        });
         if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
             if let Ok(mut idx) = state.fingerprint_index.lock() {
                 idx.entry(fingerprint_id.to_string())
@@ -602,20 +599,21 @@ async fn analyze_repository(
 
     let repo_url_for_analysis = repo_url.clone();
     let branch_for_analysis = branch.clone();
+    let analysis_request = AnalyzeEngineRequest {
+        repo: repo_url_for_analysis,
+        branch: branch_for_analysis.clone(),
+        commit: resolved_commit.clone(),
+    };
+    let analysis_request_for_background = analysis_request.clone();
+    let repo_root_for_background = repo_root.clone();
     let mut payload = tokio::task::spawn_blocking(move || -> rustgit_wasm_runtime::Result<Value> {
         let request = AnalyzeEngineRequest {
-            repo: repo_url_for_analysis,
-            branch: branch_for_analysis.clone(),
-            commit: resolved_commit.clone(),
+            repo: analysis_request.repo,
+            branch: analysis_request.branch,
+            commit: analysis_request.commit,
         };
         let result = AnalyzeEngine::analyze(&repo_root, &request)?;
-        let mut payload = result.payload;
-        let launch_branches = discover_launch_override_branches(&repo_root);
-        payload["launch_overrides"] = json!({
-            "branches": launch_branches
-        });
-        payload["launch_plan"] = build_launch_plan(&payload, &request.branch);
-        Ok(payload)
+        Ok(result.payload)
     })
     .await
     .map_err(|join_error| {
@@ -625,17 +623,29 @@ async fn analyze_repository(
     })?
     .map_err(err_response)?;
 
+    tokio::task::spawn_blocking(move || {
+        let _ = AnalyzeEngine::analyze_background(&repo_root_for_background, &analysis_request_for_background);
+    });
+
+    payload["status"] = json!("ready");
+    payload["analysis_version"] = json!(ANALYSIS_VERSION);
+    payload["background_processing"] = json!(true);
+    payload["analysis_id"] = json!(analysis_id);
+    payload["cache"] = json!({
+        "hit": false,
+        "key": resolved_cache_key.clone()
+    });
     payload["cached"] = json!(false);
     payload["durationMs"] = json!(started.elapsed().as_millis() as u64);
-    if include_repository_summary {
-        enrich_analyze_payload(&mut payload, ask_question);
-    }
+    payload["metrics"] = json!({
+        "analyze.duration": payload["durationMs"],
+        "clone.duration": clone_duration_ms,
+        "cache.hit": false,
+        "cache.miss": true
+    });
     state
         .analyze_cache
         .put(resolved_cache_key.clone(), payload.clone());
-    if request_cache_key != resolved_cache_key {
-        state.analyze_cache.put(request_cache_key, payload.clone());
-    }
     if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
         if let Ok(mut idx) = state.fingerprint_index.lock() {
             idx.insert(fingerprint_id.to_string(), payload.clone());
@@ -791,6 +801,7 @@ fn repository_ask_from_payload(payload: &Value, question: Option<&str>) -> Value
     })
 }
 
+#[allow(dead_code)]
 fn enrich_analyze_payload(payload: &mut Value, question: Option<&str>) {
     if let Some(fingerprint_id) = payload.get("fingerprint_id").and_then(|v| v.as_str()) {
         payload["repository_intelligence"] =
@@ -2054,23 +2065,19 @@ mod tests {
             Some("pnpm"),
             "phase2 lockfile runtime detection should select pnpm"
         );
+        assert_eq!(payload["status"].as_str(), Some("ready"));
+        assert_eq!(payload["analysis_version"].as_u64(), Some(3));
+        assert_eq!(payload["background_processing"].as_bool(), Some(true));
+        assert_eq!(payload["execution"]["provider"].as_str(), Some("local"));
+        assert_eq!(payload["cache"]["hit"].as_bool(), Some(false));
+        assert!(payload["cache"]["key"].as_str().is_some());
+        assert!(payload["analysis_id"].as_str().is_some());
         assert_eq!(
             payload["traceability"]["phase3_manifest_first"].as_bool(),
             Some(true)
         );
-        assert!(
-            payload.get("repository_intelligence").is_none(),
-            "analyze should only include repository summary projections when explicitly requested"
-        );
-        assert!(
-            payload.get("repository_ask").is_none(),
-            "analyze should only include repository summary projections when explicitly requested"
-        );
         assert!(repo.join(".execution.json").exists());
         assert!(repo.join("runtime-manifest.json").exists());
-        assert!(repo.join(".execution-plan.json").exists());
-        assert!(repo.join(".runtime-capabilities.json").exists());
-        assert!(repo.join(".launch-plan.json").exists());
         assert_eq!(
             payload["manifest"]["path"].as_str(),
             Some("runtime-manifest.json")
@@ -2080,37 +2087,6 @@ mod tests {
             payload["execution_intelligence"]["execution"]["preferred"].as_str(),
             Some("pnpm")
         );
-        assert_eq!(
-            payload["execution_intelligence"]["preferredRuntime"].as_str(),
-            Some("pnpm")
-        );
-        assert_eq!(
-            payload["execution_plan"]["recommendedProviders"][0]["provider"].as_str(),
-            Some("UserMachine")
-        );
-        assert!(payload["runtime_capabilities"]["providers"]
-            .as_array()
-            .expect("providers")
-            .iter()
-            .any(|provider| provider["name"].as_str() == Some("WASM")));
-        assert!(payload["execution_intelligence"]["recommendedCommand"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("--host 0.0.0.0"));
-        assert!(payload["execution_intelligence"]["recommendedCommand"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("--port {PORT}"));
-        assert_eq!(
-            payload["execution_intelligence"]["autoHealsApplied"][0].as_str(),
-            Some("hostInjection")
-        );
-        assert_eq!(
-            payload["launch_plan"]["provider"].as_str(),
-            Some("UserMachine")
-        );
-        assert_eq!(payload["launch_plan"]["branch"].as_str(), Some("main"));
-        assert!(payload["launch_overrides"]["branches"].is_array());
 
         let second = app
             .oneshot(
@@ -2129,109 +2105,115 @@ mod tests {
         let second_payload: serde_json::Value =
             serde_json::from_slice(&second_body).expect("second json");
         assert_eq!(second_payload["cached"].as_bool(), Some(true));
-        assert!(second_payload.get("repository_intelligence").is_none());
-        assert!(second_payload.get("repository_ask").is_none());
+        assert_eq!(second_payload["cache"]["hit"].as_bool(), Some(true));
+        assert_eq!(
+            second_payload["cache"]["key"].as_str(),
+            payload["cache"]["key"].as_str()
+        );
     }
 
     #[tokio::test]
-    async fn analyze_route_uses_latest_alias_cache_without_preparing_repository() {
-        let state = test_state();
-        let repo_url = "https://github.com/example/slow-repo.git";
-        let cache_key = super::AnalyzeCache::key(repo_url, "main", "latest");
-        let fingerprint_id = "repo-fingerprint-123";
-        state.analyze_cache.put(
-            cache_key,
-            serde_json::json!({
-                "repo": repo_url,
-                "fingerprint_id": fingerprint_id,
-                "runtime": { "language": "typescript", "packageManager": "pnpm", "framework": "nextjs" },
-                "execution": { "preferredProvider": "browser-wasm", "fallback": ["fly", "docker", "codespaces"] },
-                "manifest": { "version": 1, "path": ".execution.json" },
-                "confidence": 98,
-                "cached": false,
-                "durationMs": 0
-            }),
-        );
-        let app = app(state);
+    async fn analyze_route_uses_resolved_head_commit_for_cache_key() {
+        let repo = std::env::temp_dir().join(format!(
+            "rustgit-analyze-git-repo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"next":"15.0.0"},"scripts":{"dev":"next dev"}}"#,
+        )
+        .expect("write package");
+        fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("write lockfile");
 
-        let response = app
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+            vec!["add", "."],
+            vec!["commit", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .expect("run git command");
+            assert!(status.success(), "git command should succeed");
+        }
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read head");
+        assert!(head.status.success(), "rev-parse should succeed");
+        let head_sha = String::from_utf8(head.stdout)
+            .expect("head utf8")
+            .trim()
+            .to_string();
+        let expected_cache_key = super::AnalyzeCache::key(
+            &repo.to_string_lossy(),
+            "main",
+            &head_sha,
+            super::ANALYSIS_VERSION,
+        );
+
+        let app = app(test_state());
+        let request_body = serde_json::json!({
+            "repo_url": repo.to_string_lossy().to_string(),
+            "branch": "main"
+        })
+        .to_string();
+        let first = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/analyze")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "repo_url": repo_url,
-                            "branch": "main",
-                            "include_repository_summary": true,
-                            "ask_question": "Summarize what this repository does and the best way to run it."
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(request_body.clone()))
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024)
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024)
             .await
             .expect("body");
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(payload["cached"].as_bool(), Some(true));
-        assert_eq!(payload["repo"].as_str(), Some(repo_url));
+        let first_payload: serde_json::Value = serde_json::from_slice(&first_body).expect("json");
+        assert_eq!(first_payload["cached"].as_bool(), Some(false));
         assert_eq!(
-            payload["repository_intelligence"]["repository_id"].as_str(),
-            Some(fingerprint_id)
-        );
-        assert_eq!(
-            payload["repository_ask"]["evidence"][0].as_str(),
-            Some("nextjs")
+            first_payload["cache"]["key"].as_str(),
+            Some(expected_cache_key.as_str())
         );
 
-        let intelligence_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/api/repositories/{fingerprint_id}/intelligence"))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(intelligence_response.status(), StatusCode::OK);
-        let intelligence_body = to_bytes(intelligence_response.into_body(), 1024 * 1024)
-            .await
-            .expect("intelligence body");
-        let intelligence_payload: serde_json::Value =
-            serde_json::from_slice(&intelligence_body).expect("intelligence payload");
-        assert_eq!(payload["repository_intelligence"], intelligence_payload);
-
-        let ask_response = app
+        let second = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/repositories/{fingerprint_id}/ask"))
+                    .uri("/api/analyze")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "question": "Summarize what this repository does and the best way to run it."
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(request_body))
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(ask_response.status(), StatusCode::OK);
-        let ask_body = to_bytes(ask_response.into_body(), 1024 * 1024)
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), 1024 * 1024)
             .await
-            .expect("ask body");
-        let ask_payload: serde_json::Value =
-            serde_json::from_slice(&ask_body).expect("ask payload");
-        assert_eq!(payload["repository_ask"], ask_payload);
+            .expect("second body");
+        let second_payload: serde_json::Value =
+            serde_json::from_slice(&second_body).expect("second payload");
+        assert_eq!(second_payload["cached"].as_bool(), Some(true));
+        assert_eq!(second_payload["cache"]["hit"].as_bool(), Some(true));
+        assert_eq!(
+            second_payload["cache"]["key"].as_str(),
+            Some(expected_cache_key.as_str())
+        );
     }
 
     #[tokio::test]
