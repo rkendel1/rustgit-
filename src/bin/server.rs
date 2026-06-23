@@ -7,21 +7,28 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Path, State},
+    extract::{
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        OriginalUri, Path, State,
+    },
     http::{header, Method, Request, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{any, get, post},
     Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use rustgit_wasm_runtime::{
     analyze::{runtime_capability_statuses, AnalyzeCache, AnalyzeEngine, AnalyzeEngineRequest},
     badge_generate_endpoint, badge_seed_launch_endpoint, badge_svg_endpoint,
     healed_badge_variant_endpoint, BadgeExecutionSnapshot, BadgeGenerateRequest, ExecutionHandle,
-    ExecutionRoutingMode, LaunchOverrides, RuntimeError, WasmWorkspace, Workspace,
-    WorkspaceManager, WorkspaceRuntimeStatus,
+    ExecutionRoutingMode, LaunchOverrides, RuntimeError, RuntimeType, WasmWorkspace, Workspace,
+    WorkspaceManager, WorkspaceProxyProtocol, WorkspaceQuota, WorkspaceRecord, WorkspaceRouter,
+    WorkspaceRuntimeBinding, WorkspaceRuntimeStatus, WorkspaceRuntimeType, WorkspaceVisibility,
+    stable_workspace_url,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tower_http::cors::{Any, CorsLayer};
 
 type SharedManager = Arc<WorkspaceManager>;
@@ -1009,6 +1016,200 @@ async fn workspace_app_proxy(
     })
 }
 
+async fn workspace_app_proxy_ws(
+    State(state): State<AppState>,
+    Path((id, path)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    ws: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let query = uri
+        .query()
+        .map(|value| format!("?{value}"))
+        .unwrap_or_default();
+    let route = resolve_workspace_proxy_route(state.manager, &id, WorkspaceProxyProtocol::WebSocket)
+        .await?;
+    let target = if path.is_empty() {
+        format!("{}{}", route.target.trim_end_matches('/'), query)
+    } else {
+        format!(
+            "{}/{}{}",
+            route.target.trim_end_matches('/'),
+            path.trim_start_matches('/'),
+            query
+        )
+    };
+    Ok(ws.on_upgrade(move |socket| proxy_websocket_traffic(socket, target)).into_response())
+}
+
+async fn resolve_workspace_proxy_route(
+    manager: SharedManager,
+    id: &str,
+    protocol: WorkspaceProxyProtocol,
+) -> Result<rustgit_wasm_runtime::WorkspaceRoute, (StatusCode, Json<Value>)> {
+    let workspace_id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        manager.sync_process_health(&workspace_id);
+        let runtime = manager.runtime_status(&workspace_id).map_err(err_response)?;
+        let handle = runtime.execution_handle.as_ref().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "execution handle unavailable",
+                    "workspace_id": workspace_id,
+                })),
+            )
+        })?;
+        let endpoint = handle
+            .endpoint
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| app_proxy_non_forwardable_conflict(&handle))?;
+
+        let target = normalize_proxy_endpoint(&endpoint, protocol)?;
+        let mut router = WorkspaceRouter::default();
+        router.registry.upsert(WorkspaceRecord {
+            workspace_id: workspace_id.clone(),
+            repository_id: String::new(),
+            org_id: String::new(),
+            created_by: String::new(),
+            visibility: WorkspaceVisibility::Private,
+            execution_id: handle.execution_id.clone(),
+            assigned_worker: Some(handle.provider_id.clone()),
+            assigned_runtime: runtime_type_for_workspace_router(&runtime),
+            assigned_url: stable_workspace_url(&workspace_id, true),
+            state: runtime.lifecycle_state,
+            created_at: 0,
+            updated_at: 0,
+            quota: WorkspaceQuota::default(),
+        });
+        router.bind_runtime(
+            &workspace_id,
+            WorkspaceRuntimeBinding {
+                runtime_type: workspace_runtime_type_for_status(&runtime),
+                runtime_instance_id: handle.provider_id.clone(),
+                endpoint: target.clone(),
+                lease_expires_at: 0,
+                runtime_heartbeat: 0,
+                last_request_time: 0,
+                execution_health: runtime.healthy,
+            },
+            0,
+        );
+        router
+            .route_workspace_request(&format!("/w/{workspace_id}"), 0)
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": format!("workspace {workspace_id} not found for proxy route")
+                    })),
+                )
+            })
+    })
+    .await
+    .expect("task panicked")
+}
+
+fn runtime_type_for_workspace_router(runtime: &WorkspaceRuntimeStatus) -> RuntimeType {
+    workspace_runtime_type_for_status(runtime).to_runtime_type()
+}
+
+fn workspace_runtime_type_for_status(runtime: &WorkspaceRuntimeStatus) -> WorkspaceRuntimeType {
+    match runtime.runtime.to_ascii_lowercase().as_str() {
+        "node" => WorkspaceRuntimeType::Dea,
+        "static" => WorkspaceRuntimeType::Cloud,
+        "wasm" => WorkspaceRuntimeType::Docker,
+        _ => WorkspaceRuntimeType::External,
+    }
+}
+
+fn normalize_proxy_endpoint(
+    endpoint: &str,
+    protocol: WorkspaceProxyProtocol,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    match protocol {
+        WorkspaceProxyProtocol::Http | WorkspaceProxyProtocol::Sse => Ok(endpoint.to_string()),
+        WorkspaceProxyProtocol::WebSocket => {
+            if let Some(rest) = endpoint.strip_prefix("http://") {
+                return Ok(format!("ws://{rest}"));
+            }
+            if let Some(rest) = endpoint.strip_prefix("https://") {
+                return Ok(format!("wss://{rest}"));
+            }
+            if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                return Ok(endpoint.to_string());
+            }
+            Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "execution owner has unsupported websocket endpoint scheme",
+                    "endpoint": endpoint,
+                })),
+            ))
+        }
+    }
+}
+
+async fn proxy_websocket_traffic(mut downstream: WebSocket, target: String) {
+    let Ok((upstream, _)) = connect_async(&target).await else {
+        let _ = downstream.send(AxumWsMessage::Close(None)).await;
+        return;
+    };
+
+    let (mut downstream_tx, mut downstream_rx) = downstream.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
+    let downstream_to_upstream = async {
+        while let Some(Ok(message)) = downstream_rx.next().await {
+            let Some(message) = axum_ws_to_tungstenite(message) else {
+                continue;
+            };
+            if upstream_tx.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = upstream_tx.close().await;
+    };
+
+    let upstream_to_downstream = async {
+        while let Some(Ok(message)) = upstream_rx.next().await {
+            let Some(message) = tungstenite_to_axum_ws(message) else {
+                continue;
+            };
+            if downstream_tx.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = downstream_tx.close().await;
+    };
+
+    tokio::select! {
+        _ = downstream_to_upstream => {}
+        _ = upstream_to_downstream => {}
+    }
+}
+
+fn axum_ws_to_tungstenite(message: AxumWsMessage) -> Option<TungsteniteMessage> {
+    match message {
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumWsMessage::Binary(bytes) => Some(TungsteniteMessage::Binary(bytes.into())),
+        AxumWsMessage::Ping(bytes) => Some(TungsteniteMessage::Ping(bytes.into())),
+        AxumWsMessage::Pong(bytes) => Some(TungsteniteMessage::Pong(bytes.into())),
+        AxumWsMessage::Close(_) => Some(TungsteniteMessage::Close(None)),
+    }
+}
+
+fn tungstenite_to_axum_ws(message: TungsteniteMessage) -> Option<AxumWsMessage> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(AxumWsMessage::Text(text.to_string())),
+        TungsteniteMessage::Binary(bytes) => Some(AxumWsMessage::Binary(bytes.to_vec())),
+        TungsteniteMessage::Ping(bytes) => Some(AxumWsMessage::Ping(bytes.to_vec())),
+        TungsteniteMessage::Pong(bytes) => Some(AxumWsMessage::Pong(bytes.to_vec())),
+        TungsteniteMessage::Close(_) => Some(AxumWsMessage::Close(None)),
+        TungsteniteMessage::Frame(_) => None,
+    }
+}
+
 fn app_proxy_non_forwardable_conflict(handle: &ExecutionHandle) -> (StatusCode, Json<Value>) {
     let (reason, retry_hint) = match handle.routing_mode {
         ExecutionRoutingMode::Wasm => (
@@ -1256,6 +1457,10 @@ fn with_workspace_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             any(workspace_app_proxy),
         )
         .route(
+            &format!("{prefix}/workspaces/:id/proxy/ws/*path"),
+            get(workspace_app_proxy_ws),
+        )
+        .route(
             &format!("{prefix}/workspaces/:id/files"),
             get(workspace_files),
         )
@@ -1462,6 +1667,29 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mirrored_workspace_ws_proxy_routes_are_registered() {
+        let app = app(test_state());
+
+        for uri in [
+            "/api/v1/workspaces/missing/proxy/ws/socket",
+            "/api/proxy/api/v1/workspaces/missing/proxy/ws/socket",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "GET {uri}");
         }
     }
 
