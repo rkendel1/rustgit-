@@ -8013,31 +8013,156 @@ fn discover_env_keys(root: &Path, env_files: &[String]) -> HashSet<String> {
     keys
 }
 
-fn load_execution_manifest_start_command(repo_root: &Path) -> Option<String> {
+fn normalize_health_check_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RuntimeManifestLaunchConfig {
+    node_version: Option<String>,
+    package_manager: Option<String>,
+    install_command: Option<String>,
+    start_command: Option<String>,
+    preferred_ports: Vec<u16>,
+    health_check: Option<String>,
+}
+
+fn load_runtime_manifest_launch_config(repo_root: &Path) -> Option<RuntimeManifestLaunchConfig> {
     let runtime_manifest_path = repo_root.join("runtime-manifest.json");
     if let Ok(payload) = fs::read_to_string(runtime_manifest_path) {
         if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-            if let Some(command) = value
-                .get("runtime")
-                .and_then(|runtime| runtime.get("startCommand"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                return Some(command.to_string());
-            }
+            let preferred_ports = value
+                .get("network")
+                .and_then(|network| network.get("preferredPorts"))
+                .and_then(Value::as_array)
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .filter_map(|port| port.as_u64().and_then(|value| u16::try_from(value).ok()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(RuntimeManifestLaunchConfig {
+                node_version: value
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("nodeVersion"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                package_manager: value
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("packageManager"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                install_command: value
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("installCommand"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                start_command: value
+                    .get("runtime")
+                    .and_then(|runtime| runtime.get("startCommand"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                preferred_ports,
+                health_check: value
+                    .get("network")
+                    .and_then(|network| network.get("healthCheck"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            });
         }
     }
 
     let legacy_manifest_path = repo_root.join(".execution.json");
     let payload = fs::read_to_string(legacy_manifest_path).ok()?;
     let value = serde_json::from_str::<Value>(&payload).ok()?;
-    value
-        .get("startCommand")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    Some(RuntimeManifestLaunchConfig {
+        start_command: value
+            .get("startCommand")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        ..RuntimeManifestLaunchConfig::default()
+    })
+}
+
+fn load_execution_manifest_start_command(repo_root: &Path) -> Option<String> {
+    load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.start_command)
+}
+
+fn load_execution_manifest_install_command(repo_root: &Path) -> Option<String> {
+    load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.install_command)
+}
+
+fn load_execution_manifest_preferred_ports(repo_root: &Path) -> Vec<u16> {
+    load_runtime_manifest_launch_config(repo_root)
+        .map(|manifest| manifest.preferred_ports)
+        .unwrap_or_default()
+}
+
+fn load_execution_manifest_health_check(repo_root: &Path) -> String {
+    normalize_health_check_path(
+        &load_runtime_manifest_launch_config(repo_root)
+        .and_then(|manifest| manifest.health_check)
+        .unwrap_or_else(|| "/".to_string()),
+    )
+}
+
+#[cfg(test)]
+fn load_execution_manifest_node_version(repo_root: &Path) -> Option<String> {
+    load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.node_version)
+}
+
+#[cfg(test)]
+fn load_execution_manifest_package_manager(repo_root: &Path) -> Option<String> {
+    load_runtime_manifest_launch_config(repo_root).and_then(|manifest| manifest.package_manager)
+}
+
+fn workspace_ports_from_manifest_or_framework(repo_root: &Path, framework: Framework) -> Vec<PortInfo> {
+    let preferred_ports = load_execution_manifest_preferred_ports(repo_root);
+    if preferred_ports.is_empty() {
+        return ports_for_framework(framework);
+    }
+    preferred_ports
+        .into_iter()
+        .map(|port| PortInfo {
+            port,
+            protocol: "http".to_string(),
+            route: "/".to_string(),
+        })
+        .collect()
+}
+
+fn runtime_label_for_context(
+    context: Option<&ExecutionContext>,
+    manifest: Option<&RuntimeManifestLaunchConfig>,
+) -> String {
+    context
+        .map(|ctx| {
+            manifest
+                .and_then(|manifest| manifest.node_version.as_deref())
+                .map(|version| format!("node{version}"))
+                .unwrap_or_else(|| ctx.runtime_spec.language.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn parse_package_dependency_names(root: &Path) -> HashSet<String> {
@@ -12327,6 +12452,8 @@ pub struct ExecutionHandle {
 pub struct WorkspaceRuntimeStatus {
     pub workspace_id: String,
     pub provider_selected: String,
+    pub provider: String,
+    pub runtime: String,
     pub pid: u32,
     pub alive: bool,
     pub process_state: ProcessStatus,
@@ -12334,6 +12461,11 @@ pub struct WorkspaceRuntimeStatus {
     pub framework: String,
     pub requested_port: u16,
     pub actual_port: Option<u16>,
+    #[serde(rename = "assignedPort")]
+    pub assigned_port: Option<u16>,
+    #[serde(rename = "proxyUrl")]
+    pub proxy_url: Option<String>,
+    pub healthy: bool,
     pub listening: bool,
     pub detected_start_signal: Option<String>,
     pub http_ready: bool,
@@ -12798,7 +12930,7 @@ impl WorkspaceManager {
         ports
     }
 
-    fn http_probe(port: u16) -> std::result::Result<u16, String> {
+    fn http_probe(port: u16, health_check: &str) -> std::result::Result<u16, String> {
         use std::io::{BufRead, Write};
         use std::net::TcpStream;
         let addr = format!("127.0.0.1:{port}");
@@ -12812,7 +12944,13 @@ impl WorkspaceManager {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!(
+                    "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    normalize_health_check_path(health_check)
+                )
+                .as_bytes(),
+            )
             .map_err(|err| err.to_string())?;
         let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
@@ -13249,7 +13387,8 @@ impl WorkspaceManager {
         }
 
         workspace.framework = ctx.analysis.framework;
-        workspace.ports = ports_for_framework(ctx.analysis.framework);
+        workspace.ports =
+            workspace_ports_from_manifest_or_framework(Path::new(&ctx.repo_path), ctx.analysis.framework);
         workspace.network_policy = ctx.network.clone();
         workspace.resource_quotas = ctx.resources.clone();
 
@@ -13328,7 +13467,14 @@ impl WorkspaceManager {
         self.start_process_monitor(id);
     }
 
-    fn reserve_prebound_port() -> Option<(u16, std::net::TcpListener)> {
+    fn reserve_prebound_port_with_preferences(
+        preferred_ports: &[u16],
+    ) -> Option<(u16, std::net::TcpListener)> {
+        for preferred in preferred_ports {
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", *preferred)) {
+                return Some((*preferred, listener));
+            }
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
         Some((port, listener))
@@ -13398,12 +13544,13 @@ impl WorkspaceManager {
         id: &str,
     ) -> Result<()> {
         let repo_path = Path::new(&ctx.repo_path);
-        let install_cmd = ctx
-            .execution_graph
-            .nodes
-            .iter()
-            .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
-            .and_then(|n| n.command.clone());
+        let install_cmd = load_execution_manifest_install_command(repo_path).or_else(|| {
+            ctx.execution_graph
+                .nodes
+                .iter()
+                .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+                .and_then(|n| n.command.clone())
+        });
         let Some(install_cmd) = install_cmd else {
             return Ok(());
         };
@@ -13512,6 +13659,7 @@ impl WorkspaceManager {
         let run_cmd = Self::resolved_run_command(ctx, overrides)
             .ok_or_else(|| RuntimeError::CommandFailed("no run command resolved".to_string()))?;
         let repo_path = Path::new(&ctx.repo_path);
+        let manifest_config = load_runtime_manifest_launch_config(repo_path);
         let is_python = matches!(
             ctx.analysis.framework,
             Framework::Python
@@ -13523,7 +13671,13 @@ impl WorkspaceManager {
         );
 
         let (requested_port, prebound_port_listener) =
-            Self::reserve_prebound_port().ok_or_else(|| {
+            Self::reserve_prebound_port_with_preferences(
+                manifest_config
+                    .as_ref()
+                    .map(|manifest| manifest.preferred_ports.as_slice())
+                    .unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
                 RuntimeError::CommandFailed(
                     "failed to reserve runtime port via bind(127.0.0.1:0)".to_string(),
                 )
@@ -13578,6 +13732,18 @@ impl WorkspaceManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PORT", requested_port.to_string());
+        if let Some(node_version) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.node_version.as_deref())
+        {
+            cmd.env("NODE_VERSION", node_version);
+        }
+        if let Some(package_manager) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.package_manager.as_deref())
+        {
+            cmd.env("PACKAGE_MANAGER", package_manager);
+        }
         Self::apply_process_overrides(&mut cmd, overrides);
         drop(prebound_port_listener);
         let child = cmd
@@ -13610,6 +13776,17 @@ impl WorkspaceManager {
         const READINESS_POLL_INTERVAL_MS: u64 = 500;
         const READINESS_TIMEOUT_MS: u64 = 30_000;
         const MAX_ATTEMPTS: usize = (READINESS_TIMEOUT_MS / READINESS_POLL_INTERVAL_MS) as usize;
+        let health_check = self
+            .workspaces
+            .lock()
+            .ok()
+            .and_then(|workspaces| {
+                workspaces
+                    .get(id)
+                    .and_then(|record| record.execution_context.as_ref())
+                    .map(|ctx| load_execution_manifest_health_check(Path::new(&ctx.repo_path)))
+            })
+            .unwrap_or_else(|| "/".to_string());
 
         for _ in 0..MAX_ATTEMPTS {
             let mut exited_status = None;
@@ -13629,7 +13806,7 @@ impl WorkspaceManager {
                     let observed_port = Self::parse_listening_ports(runtime.pid).into_iter().next();
                     runtime.update_from_event(ExecutionTruthEvent::ObservedPort(observed_port));
                     if let Some(port) = runtime.actual_port {
-                        match Self::http_probe(port) {
+                        match Self::http_probe(port, &health_check) {
                             Ok(status) => {
                                 runtime.update_from_event(ExecutionTruthEvent::HttpProbeOk(status));
                                 return Ok(());
@@ -13692,6 +13869,7 @@ impl WorkspaceManager {
             None => return (None, None, provider_selected),
         };
         let repo_path = std::path::Path::new(&ctx.repo_path);
+        let manifest_config = load_runtime_manifest_launch_config(repo_path);
         let is_python = matches!(
             ctx.analysis.framework,
             Framework::Python
@@ -13713,12 +13891,13 @@ impl WorkspaceManager {
                     .output();
             }
 
-            let install_cmd = ctx
-                .execution_graph
-                .nodes
-                .iter()
-                .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
-                .and_then(|n| n.command.clone());
+            let install_cmd = load_execution_manifest_install_command(repo_path).or_else(|| {
+                ctx.execution_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+                    .and_then(|n| n.command.clone())
+            });
             if let Some(install) = install_cmd {
                 let venv_pip = venv_path.join("bin").join("pip");
                 let pip_path = venv_pip.to_string_lossy().to_string();
@@ -13761,12 +13940,13 @@ impl WorkspaceManager {
             }
         } else {
             // JS/other: run install command as-is
-            let install_cmd = ctx
-                .execution_graph
-                .nodes
-                .iter()
-                .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
-                .and_then(|n| n.command.clone());
+            let install_cmd = load_execution_manifest_install_command(repo_path).or_else(|| {
+                ctx.execution_graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_type == ExecutionNodeType::InstallDependencies)
+                    .and_then(|n| n.command.clone())
+            });
             if let Some(install) = install_cmd {
                 let (install_cwd, install) = Self::extract_workdir_and_command(&install, repo_path);
                 if install.is_empty() {
@@ -13807,7 +13987,12 @@ impl WorkspaceManager {
                 .output();
         }
 
-        let (assigned_port, prebound_port_listener) = match Self::reserve_prebound_port() {
+        let preferred_ports = manifest_config
+            .as_ref()
+            .map(|manifest| manifest.preferred_ports.clone())
+            .unwrap_or_default();
+        let (assigned_port, prebound_port_listener) =
+            match Self::reserve_prebound_port_with_preferences(&preferred_ports) {
             Some((port, listener)) => (Some(port), Some(listener)),
             None => (None, None),
         };
@@ -13871,6 +14056,18 @@ impl WorkspaceManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(stderr_stdio);
+        if let Some(node_version) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.node_version.as_deref())
+        {
+            cmd.env("NODE_VERSION", node_version);
+        }
+        if let Some(package_manager) = manifest_config
+            .as_ref()
+            .and_then(|manifest| manifest.package_manager.as_deref())
+        {
+            cmd.env("PACKAGE_MANAGER", package_manager);
+        }
         // Always set PORT env var for frameworks that read it (Node.js etc.)
         if let Some(port) = assigned_port {
             cmd.env("PORT", port.to_string());
@@ -14084,6 +14281,12 @@ impl WorkspaceManager {
         } else {
             None
         };
+        let manifest_config = record.execution_context.as_ref().and_then(|ctx| {
+            load_runtime_manifest_launch_config(Path::new(&ctx.repo_path))
+        });
+        let runtime_label =
+            runtime_label_for_context(record.execution_context.as_ref(), manifest_config.as_ref());
+        let healthy = runtime.process_alive && runtime.http_ready;
         let execution_handle = Some(ExecutionHandle {
             workspace_id: runtime.workspace_id.clone(),
             provider_id: runtime.provider_selected.clone(),
@@ -14093,7 +14296,7 @@ impl WorkspaceManager {
                 .map(|handle| handle.pid_hint.clone())
                 .unwrap_or_else(|| format!("workspace-{}", runtime.workspace_id)),
             routing_mode,
-            endpoint,
+            endpoint: endpoint.clone(),
             stream_channel,
             readiness_state: runtime.readiness_state,
             authority_node: "workspace-manager".to_string(),
@@ -14101,6 +14304,8 @@ impl WorkspaceManager {
         Ok(WorkspaceRuntimeStatus {
             workspace_id: runtime.workspace_id.clone(),
             provider_selected: runtime.provider_selected.clone(),
+            provider: runtime.provider_selected.clone(),
+            runtime: runtime_label,
             pid: runtime.pid,
             alive: runtime.process_alive,
             process_state: runtime.process_state,
@@ -14108,6 +14313,9 @@ impl WorkspaceManager {
             framework: format!("{:?}", record.workspace.framework).to_lowercase(),
             requested_port: runtime.requested_port,
             actual_port: runtime.actual_port,
+            assigned_port: runtime.actual_port,
+            proxy_url: endpoint.clone(),
+            healthy,
             listening: runtime.actual_port.is_some(),
             detected_start_signal: runtime.detected_start_signal.clone(),
             http_ready: runtime.http_ready,
@@ -14247,7 +14455,10 @@ impl WasmWorkspace for WorkspaceManager {
 
             Self::transition_state(&mut workspace, WorkspaceState::Running)?;
             workspace.framework = ctx.analysis.framework;
-            workspace.ports = ports_for_framework(ctx.analysis.framework);
+            workspace.ports = workspace_ports_from_manifest_or_framework(
+                Path::new(&ctx.repo_path),
+                ctx.analysis.framework,
+            );
             workspace.network_policy = ctx.network.clone();
             workspace.resource_quotas = ctx.resources.clone();
 
@@ -20747,11 +20958,24 @@ dependencies:
 
     #[test]
     fn reserve_prebound_port_keeps_port_unavailable_until_released() {
-        let (port, listener) =
-            WorkspaceManager::reserve_prebound_port().expect("prebound port should allocate");
+        let (port, listener) = WorkspaceManager::reserve_prebound_port_with_preferences(&[])
+            .expect("prebound port should allocate");
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
         drop(listener);
         assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn reserve_prebound_port_with_preferences_uses_preferred_port_when_available() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let preferred_port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let (port, listener) = WorkspaceManager::reserve_prebound_port_with_preferences(&[
+            preferred_port,
+        ])
+        .expect("preferred prebound port should allocate");
+        assert_eq!(port, preferred_port);
+        drop(listener);
     }
 
     #[test]
@@ -20835,6 +21059,36 @@ dependencies:
         assert_eq!(
             load_execution_manifest_start_command(repo.as_path()),
             Some("pnpm dev".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_manifest_launch_config_exposes_install_ports_health_and_runtime_metadata() {
+        let repo = temp_dir("runtime-manifest-launch-config");
+        fs::write(
+            repo.join("runtime-manifest.json"),
+            r#"{"schemaVersion":2,"runtime":{"startCommand":"pnpm dev","packageManager":"pnpm","installCommand":"pnpm install","nodeVersion":"22"},"project":{"framework":"nextjs","language":"typescript"},"network":{"preferredPorts":[3000,3001],"healthCheck":"healthz"},"providers":{"compatible":["local"]},"confidence":{"overall":99,"framework":95,"runtime":95,"commands":95,"network":90,"providers":90}}"#,
+        )
+        .expect("write runtime manifest");
+        assert_eq!(
+            load_execution_manifest_install_command(repo.as_path()),
+            Some("pnpm install".to_string())
+        );
+        assert_eq!(
+            load_execution_manifest_preferred_ports(repo.as_path()),
+            vec![3000, 3001]
+        );
+        assert_eq!(
+            load_execution_manifest_health_check(repo.as_path()),
+            "/healthz".to_string()
+        );
+        assert_eq!(
+            load_execution_manifest_node_version(repo.as_path()),
+            Some("22".to_string())
+        );
+        assert_eq!(
+            load_execution_manifest_package_manager(repo.as_path()),
+            Some("pnpm".to_string())
         );
     }
 
