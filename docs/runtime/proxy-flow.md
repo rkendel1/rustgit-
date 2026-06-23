@@ -40,4 +40,4 @@
 ## Streaming / WebSocket support
 - Streamed log ingestion from child stdout/stderr is implemented (`src/lib.rs:12416-12437`).
 - `WorkspaceProxyProtocol` enum includes `WebSocket` and `Sse` (`src/lib.rs:11685-11690`).
-- Current Axum router wiring does not expose a dedicated WebSocket upgrade route in `src/bin/server.rs` (proxy transport enum support is metadata/model-level only).
+- Axum router wiring now exposes a dedicated WebSocket upgrade route at `workspaces/:id/proxy/ws/*path` (and mirrored API prefixes) in `src/bin/server.rs`.
